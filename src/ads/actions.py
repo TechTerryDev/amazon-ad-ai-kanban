@@ -144,14 +144,13 @@ def generate_search_term_actions(df_search_term: pd.DataFrame, cfg: StageConfig)
     # 2) 降价：高 ACoS
     high_acos = agg[(agg["orders"] > 0) & (agg["clicks"] >= cfg.min_clicks) & (agg["acos"] > cfg.target_acos)]
     for _, r in high_acos.sort_values(["acos", "spend"], ascending=False).head(200).iterrows():
-        pct = int(cfg.max_change_pct * 100)
         out.append(
             ActionCandidate(
                 shop=str(r[CAN.shop]),
                 ad_type=str(r[CAN.ad_type]),
                 level="search_term",
-                action_type="BID_DOWN",
-                action_value=f"-{pct}%",
+                action_type="REVIEW",
+                action_value="",
                 priority="P1",
                 object_name=str(r[CAN.search_term]),
                 campaign=str(r.get(CAN.campaign, "")),
@@ -159,7 +158,7 @@ def generate_search_term_actions(df_search_term: pd.DataFrame, cfg: StageConfig)
                 match_type=str(r.get(CAN.match_type, "")),
                 date_start=date_start,
                 date_end=date_end,
-                reason=f"ACoS>{cfg.target_acos:.0%} 且点击充足，建议小步降价观察（可回滚）",
+                reason=f"搜索词无法直接调价，建议回到对应投放词/关键词处理（ACoS>{cfg.target_acos:.0%} 且点击充足）",
                 evidence_json=json_dumps(
                     {
                         "clicks": r["clicks"],
@@ -176,14 +175,13 @@ def generate_search_term_actions(df_search_term: pd.DataFrame, cfg: StageConfig)
     # 3) 扩量：低 ACoS 且有单
     good = agg[(agg["orders"] >= 2) & (agg["clicks"] >= cfg.min_clicks) & (agg["acos"] > 0) & (agg["acos"] < cfg.target_acos * 0.7)]
     for _, r in good.sort_values(["orders", "sales"], ascending=False).head(200).iterrows():
-        pct = int(cfg.max_change_pct * 100)
         out.append(
             ActionCandidate(
                 shop=str(r[CAN.shop]),
                 ad_type=str(r[CAN.ad_type]),
                 level="search_term",
-                action_type="BID_UP",
-                action_value=f"+{pct}%",
+                action_type="REVIEW",
+                action_value="",
                 priority="P1",
                 object_name=str(r[CAN.search_term]),
                 campaign=str(r.get(CAN.campaign, "")),
@@ -191,7 +189,7 @@ def generate_search_term_actions(df_search_term: pd.DataFrame, cfg: StageConfig)
                 match_type=str(r.get(CAN.match_type, "")),
                 date_start=date_start,
                 date_end=date_end,
-                reason=f"ACoS显著低于目标且已出单，建议小步加价扩量（观察48-72h）",
+                reason=f"搜索词无法直接调价，建议回到对应投放词/关键词处理（低 ACoS 且已出单）",
                 evidence_json=json_dumps(
                     {
                         "clicks": r["clicks"],

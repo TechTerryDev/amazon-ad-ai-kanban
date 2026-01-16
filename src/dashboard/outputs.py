@@ -2980,8 +2980,8 @@ def build_asin_cockpit(
                 extra["focus_score"] = 0.0
                 extra["focus_reasons"] = ""
                 base = pd.concat([base, extra], ignore_index=True, sort=False)
-    except Exception:
-        pass
+    except Exception as _e:
+        raise
 
     out = base.copy()
     if not action_stats.empty:
@@ -3381,8 +3381,8 @@ def build_category_asin_compare(
         out2 = out[out["category_rank"] <= mc].copy()
         out2 = out2[out2["asin_rank_in_category"] <= k].copy()
         out = out2
-    except Exception:
-        pass
+    except Exception as _e:
+        raise
 
     cols = [
         "category_rank",
@@ -3583,7 +3583,8 @@ def _pick_phase_down_reasons(row: Dict[str, object], policy: Optional[OpsPolicy]
         if (orders_prev >= aov_min_orders_prev) and (delta_aov <= -abs(aov_min_drop_usd)) and (ratio_aov <= aov_drop_ratio):
             reasons.append("客单价下滑")
     except Exception:
-        pass
+        import traceback
+        traceback.print_exc()
 
     # 3.3.2) 毛利率偏低（gross_margin=profit/sales）
     # 说明：用于提示优先排查“提价/降成本/控量”，而不是只调广告结构。
@@ -3834,7 +3835,7 @@ def _pick_oos_with_ad_spend_reasons(row: Dict[str, object], policy: Optional[Ops
     except Exception:
         days = 0
     if days > 0:
-        reasons.append(f"近期断货仍烧钱({days}天)")
+        reasons.append(f"累计断货仍烧钱({days}天)")
     if days >= 3:
         reasons.append("断货天数多")
 
@@ -6754,6 +6755,8 @@ def score_action_board(
             f["focus_score"] = 0.0
         if "focus_reasons" not in f.columns:
             f["focus_reasons"] = ""
+        if "focus_reasons_history" not in f.columns:
+            f["focus_reasons_history"] = ""
         # 除 focus_score 外，再映射一些“产品侧 P0 维度”，便于运营在动作表里筛选/判断
         extra_cols = []
         for c in (
@@ -6797,11 +6800,14 @@ def score_action_board(
         ):
             if c in f.columns:
                 extra_cols.append(c)
-        fmap = f[["asin_hint", "focus_score", "focus_reasons"] + extra_cols].drop_duplicates("asin_hint", keep="first").copy()
+        fmap = f[["asin_hint", "focus_score", "focus_reasons", "focus_reasons_history"] + extra_cols].drop_duplicates(
+            "asin_hint", keep="first"
+        ).copy()
         fmap = fmap.rename(
             columns={
                 "focus_score": "asin_focus_score",
                 "focus_reasons": "asin_focus_reasons",
+                "focus_reasons_history": "asin_focus_reasons_history",
                 "sales_recent_7d": "asin_sales_recent_7d",
                 "orders_recent_7d": "asin_orders_recent_7d",
                 "sales_per_day_7d": "asin_sales_per_day_7d",
@@ -6842,6 +6848,7 @@ def score_action_board(
     except Exception:
         df["asin_focus_score"] = 0.0
         df["asin_focus_reasons"] = ""
+        df["asin_focus_reasons_history"] = ""
         df["asin_sales_recent_7d"] = 0.0
         df["asin_orders_recent_7d"] = 0.0
         df["asin_sales_per_day_7d"] = 0.0
@@ -7471,11 +7478,17 @@ def build_asin_focus(
     # 近7天速度：recent/prev 都在 compare_7d 里（这里仅挑“运营最常用”的 recent + 增量口径）
     keep_c7 = [
         "asin_norm",
+        "sales_prev",
         "sales_recent",
+        "orders_prev",
         "orders_recent",
         "sessions_prev",
         "sessions_recent",
+        "spend_prev",
         "spend_recent",
+        "oos_with_ad_spend_days_recent",
+        "oos_with_sessions_days_recent",
+        "presale_order_days_recent",
         "cvr_prev",
         "cvr_recent",
         "organic_sales_prev",
@@ -7498,10 +7511,13 @@ def build_asin_focus(
     try:
         c7_2 = c7_2.rename(
             columns={
+                "sales_prev": "sales_prev_7d",
                 "sales_recent": "sales_recent_7d",
+                "orders_prev": "orders_prev_7d",
                 "orders_recent": "orders_recent_7d",
                 "sessions_prev": "sessions_prev_7d",
                 "sessions_recent": "sessions_recent_7d",
+                "spend_prev": "ad_spend_prev_7d",
                 "spend_recent": "ad_spend_recent_7d",
                 "cvr_prev": "cvr_prev_7d",
                 "cvr_recent": "cvr_recent_7d",
@@ -7509,16 +7525,32 @@ def build_asin_focus(
                 "organic_sales_recent": "organic_sales_recent_7d",
                 "organic_sales_share_prev": "organic_sales_share_prev_7d",
                 "organic_sales_share_recent": "organic_sales_share_recent_7d",
+                "oos_with_ad_spend_days_recent": "oos_with_ad_spend_days_7d",
+                "oos_with_sessions_days_recent": "oos_with_sessions_days_7d",
+                "presale_order_days_recent": "presale_order_days_7d",
             }
         )
     except Exception:
         pass
 
     # 14/30 天：只取“最近窗口”字段（为速度/覆盖天数服务），避免 focus 表列爆炸
-    def _pick_recent(df: pd.DataFrame, days: int) -> pd.DataFrame:
+    def _pick_recent(df: pd.DataFrame, days: int, include_prev: bool = False, include_delta: bool = False) -> pd.DataFrame:
         if df is None or df.empty:
             return pd.DataFrame(columns=["asin_norm"])
-        keep = ["asin_norm", "sales_recent", "orders_recent", "sessions_recent", "spend_recent"]
+        keep = [
+            "asin_norm",
+            "sales_recent",
+            "orders_recent",
+            "sessions_recent",
+            "spend_recent",
+            "oos_with_ad_spend_days_recent",
+            "oos_with_sessions_days_recent",
+            "presale_order_days_recent",
+        ]
+        if include_prev:
+            keep += ["sales_prev", "orders_prev", "sessions_prev", "spend_prev"]
+        if include_delta:
+            keep += ["delta_sales", "delta_orders", "delta_sessions", "delta_spend"]
         keep = [c for c in keep if c in df.columns]
         out2 = df[keep].copy() if keep else pd.DataFrame(columns=["asin_norm"])
         try:
@@ -7528,13 +7560,24 @@ def build_asin_focus(
                     "orders_recent": f"orders_recent_{int(days)}d",
                     "sessions_recent": f"sessions_recent_{int(days)}d",
                     "spend_recent": f"ad_spend_recent_{int(days)}d",
+                    "oos_with_ad_spend_days_recent": f"oos_with_ad_spend_days_{int(days)}d",
+                    "oos_with_sessions_days_recent": f"oos_with_sessions_days_{int(days)}d",
+                    "presale_order_days_recent": f"presale_order_days_{int(days)}d",
+                    "sales_prev": f"sales_prev_{int(days)}d",
+                    "orders_prev": f"orders_prev_{int(days)}d",
+                    "sessions_prev": f"sessions_prev_{int(days)}d",
+                    "spend_prev": f"ad_spend_prev_{int(days)}d",
+                    "delta_sales": f"delta_sales_{int(days)}d",
+                    "delta_orders": f"delta_orders_{int(days)}d",
+                    "delta_sessions": f"delta_sessions_{int(days)}d",
+                    "delta_spend": f"delta_spend_{int(days)}d",
                 }
             )
         except Exception:
             pass
         return out2
 
-    c14_2 = _pick_recent(c14, 14)
+    c14_2 = _pick_recent(c14, 14, include_prev=True, include_delta=True)
     c30_2 = _pick_recent(c30, 30)
 
     out = (
@@ -7550,9 +7593,12 @@ def build_asin_focus(
         # 数值化（只处理我们新加的列，避免影响原有字符串列）
         for c in (
             "sales_recent_7d",
+            "sales_prev_7d",
             "orders_recent_7d",
+            "orders_prev_7d",
             "sessions_prev_7d",
             "sessions_recent_7d",
+            "ad_spend_prev_7d",
             "ad_spend_recent_7d",
             "cvr",
             "cvr_prev_7d",
@@ -7569,9 +7615,17 @@ def build_asin_focus(
             "delta_organic_sales",
             "delta_organic_sales_share",
             "sales_recent_14d",
+            "sales_prev_14d",
             "orders_recent_14d",
+            "orders_prev_14d",
             "sessions_recent_14d",
+            "sessions_prev_14d",
             "ad_spend_recent_14d",
+            "ad_spend_prev_14d",
+            "delta_sales_14d",
+            "delta_orders_14d",
+            "delta_sessions_14d",
+            "delta_spend_14d",
             "sales_recent_30d",
             "orders_recent_30d",
             "sessions_recent_30d",
@@ -7701,12 +7755,14 @@ def build_asin_focus(
     if fs is None:
         fs = FocusScoringPolicy()
 
-    # 生成“重点原因”标签（1~3 个）
+    # 生成“重点原因”标签（1~3 个）+ 历史诊断
     reasons: List[str] = []
+    history_reasons: List[str] = []
     scores: List[float] = []
 
     for _, r in out.iterrows():
-        tags: List[str] = []
+        recent_tags: List[str] = []
+        history_tags: List[str] = []
         score = 0.0
 
         ad_spend_roll = _safe_float(r.get("ad_spend_roll", 0.0))
@@ -7727,24 +7783,49 @@ def build_asin_focus(
 
         # 2) 库存风险
         if _safe_int(r.get("flag_oos", 0)) > 0:
-            tags.append("断货")
+            recent_tags.append("断货")
             score += float(fs.weight_flag_oos)
         if _safe_int(r.get("flag_low_inventory", 0)) > 0:
-            tags.append("低库存")
+            recent_tags.append("低库存")
             score += float(fs.weight_flag_low_inventory)
 
         # 断货异常（更高优先级）
+        oos_spend_days_7d = _safe_float(r.get("oos_with_ad_spend_days_7d", 0.0))
+        oos_spend_days_14d = _safe_float(r.get("oos_with_ad_spend_days_14d", 0.0))
         oos_spend_days = _safe_float(r.get("oos_with_ad_spend_days", 0.0))
-        if oos_spend_days > 0:
-            tags.append(f"近期断货仍烧钱({int(oos_spend_days)}天)")
+        oos_score_added = False
+        if oos_spend_days_7d > 0:
+            recent_tags.append(f"近7天断货仍烧钱({int(oos_spend_days_7d)}天)")
             score += float(fs.weight_oos_with_ad_spend_days)
+            oos_score_added = True
+        if oos_spend_days_14d > 0:
+            recent_tags.append(f"近14天断货仍烧钱({int(oos_spend_days_14d)}天)")
+            if not oos_score_added:
+                score += float(fs.weight_oos_with_ad_spend_days)
+                oos_score_added = True
+        if oos_spend_days > 0:
+            history_tags.append(f"累计断货仍烧钱({int(oos_spend_days)}天)")
+            if not oos_score_added:
+                score += float(fs.weight_oos_with_ad_spend_days)
+        oos_sessions_days_7d = _safe_float(r.get("oos_with_sessions_days_7d", 0.0))
+        oos_sessions_days_14d = _safe_float(r.get("oos_with_sessions_days_14d", 0.0))
         oos_sessions_days = _safe_float(r.get("oos_with_sessions_days", 0.0))
+        if oos_sessions_days_7d > 0:
+            recent_tags.append(f"近7天断货仍有流量({int(oos_sessions_days_7d)}天)")
+        if oos_sessions_days_14d > 0:
+            recent_tags.append(f"近14天断货仍有流量({int(oos_sessions_days_14d)}天)")
         if oos_sessions_days > 0:
-            tags.append(f"近期断货仍有流量({int(oos_sessions_days)}天)")
+            history_tags.append(f"累计断货仍有流量({int(oos_sessions_days)}天)")
             score += float(fs.weight_oos_with_sessions_days)
+        presale_days_7d = _safe_float(r.get("presale_order_days_7d", 0.0))
+        presale_days_14d = _safe_float(r.get("presale_order_days_14d", 0.0))
         presale_days = _safe_float(r.get("presale_order_days", 0.0))
+        if presale_days_7d > 0:
+            recent_tags.append(f"近7天未可售仍出单({int(presale_days_7d)}天)")
+        if presale_days_14d > 0:
+            recent_tags.append(f"近14天未可售仍出单({int(presale_days_14d)}天)")
         if presale_days > 0:
-            tags.append(f"近期未可售仍出单({int(presale_days)}天)")
+            history_tags.append(f"累计未可售仍出单({int(presale_days)}天)")
             score += float(fs.weight_presale_order_days)
 
         # 3) 增量效率（7天）
@@ -7752,20 +7833,20 @@ def build_asin_focus(
         delta_sales = _safe_float(r.get("delta_sales", 0.0))
         marginal_tacos = _safe_float(r.get("marginal_tacos", 0.0))
         if delta_spend > 0 and delta_sales <= 0:
-            tags.append("加花费但销量不增")
+            recent_tags.append("加花费但销量不增")
             score += float(fs.weight_spend_up_no_sales)
         if marginal_tacos > 0 and tacos_roll > 0 and marginal_tacos > max(0.01, tacos_roll * float(fs.marginal_tacos_worse_ratio)):
-            tags.append("增量效率变差")
+            recent_tags.append("增量效率变差")
             score += float(fs.weight_marginal_tacos_worse)
 
         # 4) 生命周期语境（衰退/不活跃仍花费）
         if phase in {"decline", "inactive"} and ad_spend_roll > 0:
-            tags.append("衰退期仍花费")
+            recent_tags.append("衰退期仍花费")
             score += float(fs.weight_decline_or_inactive_spend)
 
         # 4.1) 生命周期迁移信号（近14天阶段走弱）
         if phase_changed_recent_14d > 0 and phase_trend_14d == "down" and ad_spend_roll > 0:
-            tags.append("阶段下滑")
+            recent_tags.append("阶段下滑")
             score += float(getattr(fs, "weight_phase_down_recent", 0.0) or 0.0)
 
         # 4.2) 产品侧转化异常（Sessions↑但 CVR↓）：优先排查 listing/价格/评论/库存等“产品语境”
@@ -7788,7 +7869,7 @@ def build_asin_focus(
             and (delta_sessions >= min_delta_sess)
             and (delta_cvr <= -abs(min_cvr_drop))
         ):
-            tags.append("流量上升但转化下滑")
+            recent_tags.append("流量上升但转化下滑")
             score += float(getattr(fs, "weight_sessions_up_cvr_down", 8.0) or 0.0)
 
         # 4.3) 自然端回落（7d vs prev7d）：优先回到“Listing/价格/评价/变体/促销”等产品语境
@@ -7805,32 +7886,39 @@ def build_asin_focus(
         delta_organic_sales = _safe_float(r.get("delta_organic_sales", 0.0))
         ratio = (organic_recent_7d / organic_prev_7d) if organic_prev_7d > 0 else 1.0
         if (organic_prev_7d >= organic_min_prev) and (delta_organic_sales <= -abs(organic_min_drop)) and (ratio <= organic_drop_ratio):
-            tags.append("自然端回落")
+            recent_tags.append("自然端回落")
             score += float(getattr(fs, "weight_organic_down", 6.0) or 0.0)
 
         # 5) 广告依赖度（如果有）
         ad_sales_share = _safe_float(r.get("ad_sales_share", 0.0))
         if ad_sales_share >= float(fs.high_ad_dependency_threshold) and ad_spend_roll > 0:
-            tags.append("广告依赖高")
+            recent_tags.append("广告依赖高")
             score += float(fs.weight_high_ad_dependency)
 
         # 6) 兜底：库存数值本身（没有可售也需要注意）
         if inv <= 0 and ad_spend_roll > 0:
-            tags.append("库存=0仍投放")
+            recent_tags.append("库存=0仍投放")
             score += float(fs.weight_inventory_zero_still_spend)
 
         # 去重并截断到 3 个标签
-        uniq = []
-        for t in tags:
-            if t not in uniq:
-                uniq.append(t)
-        uniq = uniq[:3]
+        uniq_recent = []
+        for t in recent_tags:
+            if t not in uniq_recent:
+                uniq_recent.append(t)
+        uniq_recent = uniq_recent[:3]
+        uniq_history = []
+        for t in history_tags:
+            if t not in uniq_history:
+                uniq_history.append(t)
+        uniq_history = uniq_history[:3]
 
-        reasons.append(";".join(uniq))
+        reasons.append(";".join(uniq_recent))
+        history_reasons.append(";".join(uniq_history))
         scores.append(round(score, 2))
 
     out["focus_score"] = scores
     out["focus_reasons"] = reasons
+    out["focus_reasons_history"] = history_reasons
 
     # 输出列控制（更偏“仪表盘表格”）
     cols = [
@@ -7882,6 +7970,7 @@ def build_asin_focus(
         "profit_roll",
         "focus_score",
         "focus_reasons",
+        "focus_reasons_history",
         # 主窗口（累计口径）
         "sales",
         "orders",
@@ -8169,6 +8258,7 @@ def write_dashboard_md(
         lines.append("")
         lines.append(f"- 阶段: `{stage}`")
         lines.append(f"- 时间范围: `{date_start} ~ {date_end}`")
+        lines.append("- 口径说明: 未标注的累计指标=主窗口；标注 compare/Δ 的为近N天 vs 前N天（日期见表内 recent/prev）")
         lines.append("")
 
         # 预计算：Shop Alerts / 机会池（用于“本期结论”与后续章节复用）
@@ -9543,9 +9633,25 @@ def write_asin_drilldown_md(
                         "inventory": r.get("inventory", ""),
                         "focus_score": r.get("focus_score", ""),
                         "focus_reasons": str(r.get("focus_reasons", "") or ""),
+                        "focus_reasons_history": str(r.get("focus_reasons_history", "") or ""),
                     }
         except Exception:
             meta_map = {}
+
+        # ASIN Focus 明细（用于 Δ窗口校验）
+        focus_map: Dict[str, Dict[str, object]] = {}
+        try:
+            f2 = asin_focus_all.copy() if asin_focus_all is not None else pd.DataFrame()
+            if f2 is not None and not f2.empty and "asin" in f2.columns:
+                f2 = f2.copy()
+                f2["asin_norm"] = f2["asin"].astype(str).str.upper().str.strip()
+                for _, r in f2.iterrows():
+                    asin = str(r.get("asin_norm", "") or "").strip().upper()
+                    if not asin or asin in focus_map:
+                        continue
+                    focus_map[asin] = r.to_dict()
+        except Exception:
+            focus_map = {}
 
         # 选择要输出的 ASIN 列表（顺序：drivers -> action_board -> focus）
         asins: List[str] = []
@@ -9613,6 +9719,7 @@ def write_asin_drilldown_md(
         lines.append("")
         lines.append(f"- 阶段: `{stage}`")
         lines.append(f"- 时间范围: `{date_start} ~ {date_end}`")
+        lines.append("- 口径说明: 未标注的累计指标=主窗口；对比表为近7/14天 vs 前7/14天（日期见表内 recent/prev）")
         lines.append("")
         lines.append("提示：Action Board 的 `asin_hint` 属于弱关联，请结合 `asin_hint_confidence` 判断；不确定时优先回看原始报表与类目/生命周期语境。")
         lines.append("")
@@ -9659,6 +9766,7 @@ def write_asin_drilldown_md(
             inv = str(m.get("inventory", "") or "").strip()
             fscore = str(m.get("focus_score", "") or "").strip()
             freasons = str(m.get("focus_reasons", "") or "").strip()
+            fhistory = str(m.get("focus_reasons_history", "") or "").strip()
 
             lines.append(f'<a id="{aid}"></a>')
             lines.append(f"## {a}")
@@ -9670,8 +9778,12 @@ def write_asin_drilldown_md(
                 lines.append(f"- 生命周期: phase=`{phase}` | cycle_id=`{cycle_id}`")
             if inv:
                 lines.append(f"- 库存: `{inv}`")
-            if fscore or freasons:
-                lines.append(f"- focus_score: `{fscore}` | focus_reasons: `{freasons}`")
+            if fscore:
+                lines.append(f"- focus_score: `{fscore}`")
+            if freasons:
+                lines.append(f"- 近期诊断: `{freasons}`")
+            if fhistory:
+                lines.append(f"- 历史诊断: `{fhistory}`")
             lines.append("")
 
             # drivers
@@ -9689,6 +9801,17 @@ def write_asin_drilldown_md(
                             show[c] = pd.to_numeric(show[c], errors="coerce").fillna(0.0).round(2)
                     if "marginal_tacos" in show.columns:
                         show["marginal_tacos"] = pd.to_numeric(show["marginal_tacos"], errors="coerce").fillna(0.0).round(4)
+                    # 仅保留“驱动类型”的对应列，避免误读
+                    try:
+                        if "driver_type" in show.columns:
+                            for c in ("delta_sales", "delta_ad_spend"):
+                                if c in show.columns:
+                                    show[c] = show[c].astype(object)
+                            show["driver_type"] = show["driver_type"].astype(str)
+                            show.loc[show["driver_type"] == "delta_sales", "delta_ad_spend"] = ""
+                            show.loc[show["driver_type"] == "delta_ad_spend", "delta_sales"] = ""
+                    except Exception:
+                        pass
                     lines.append(
                         _df_to_md_table(
                             show,
@@ -9699,8 +9822,66 @@ def write_asin_drilldown_md(
                 lines.append("- （无）")
             lines.append("")
 
+            # Δ窗口校验（7/14天）
+            lines.append("### Δ窗口校验（7/14天：最近 vs 前段）")
+            lines.append("")
+            try:
+                r = focus_map.get(a, {})
+                rows = []
+                # 7d
+                if r:
+                    rows.append(
+                        {
+                            "window_days": 7,
+                            "sales_prev": r.get("sales_prev_7d", 0.0),
+                            "sales_recent": r.get("sales_recent_7d", 0.0),
+                            "delta_sales": r.get("delta_sales", 0.0),
+                            "spend_prev": r.get("ad_spend_prev_7d", 0.0),
+                            "spend_recent": r.get("ad_spend_recent_7d", 0.0),
+                            "delta_spend": r.get("delta_spend", 0.0),
+                        }
+                    )
+                    # 14d
+                    if (
+                        ("sales_prev_14d" in r)
+                        or ("sales_recent_14d" in r)
+                        or ("ad_spend_prev_14d" in r)
+                        or ("ad_spend_recent_14d" in r)
+                        or ("delta_sales_14d" in r)
+                        or ("delta_spend_14d" in r)
+                    ):
+                        rows.append(
+                            {
+                                "window_days": 14,
+                                "sales_prev": r.get("sales_prev_14d", 0.0),
+                                "sales_recent": r.get("sales_recent_14d", 0.0),
+                                "delta_sales": r.get("delta_sales_14d", 0.0),
+                                "spend_prev": r.get("ad_spend_prev_14d", 0.0),
+                                "spend_recent": r.get("ad_spend_recent_14d", 0.0),
+                                "delta_spend": r.get("delta_spend_14d", 0.0),
+                            }
+                        )
+                if not rows:
+                    lines.append("- （无）")
+                else:
+                    dfv = pd.DataFrame(rows)
+                    for c in ("sales_prev", "sales_recent", "delta_sales", "spend_prev", "spend_recent", "delta_spend"):
+                        if c in dfv.columns:
+                            dfv[c] = pd.to_numeric(dfv[c], errors="coerce").fillna(0.0).round(2)
+                    lines.append(
+                        _df_to_md_table(
+                            dfv,
+                            ["window_days", "sales_prev", "sales_recent", "delta_sales", "spend_prev", "spend_recent", "delta_spend"],
+                        )
+                    )
+            except Exception:
+                lines.append("- （无）")
+            lines.append("")
+
             # actions
             lines.append("### Top Actions（按 action_priority_score 排序，Top 10）")
+            lines.append("")
+            lines.append("- 说明：`merged_levels` 表示去重合并来源；`level` 为保留的主层级（search_term 优先，其次 targeting）。")
             lines.append("")
             try:
                 sub = ab_all[ab_all.get("asin_hint", "") == a].copy() if not ab_all.empty and "asin_hint" in ab_all.columns else pd.DataFrame()
@@ -9818,6 +9999,7 @@ def write_category_drilldown_md(
                 "",
                 f"- 阶段: `{stage}`",
                 f"- 时间范围: `{date_start} ~ {date_end}`",
+                "- 口径说明: 未标注的累计指标=主窗口；标注 compare/Δ 的为近N天 vs 前N天（日期见表内 recent/prev）",
                 "",
                 "- （无）",
                 "",
@@ -9876,6 +10058,7 @@ def write_category_drilldown_md(
         lines.append("")
         lines.append(f"- 阶段: `{stage}`")
         lines.append(f"- 时间范围: `{date_start} ~ {date_end}`")
+        lines.append("- 口径说明: 未标注的累计指标=主窗口；标注 compare/Δ 的为近N天 vs 前N天（日期见表内 recent/prev）")
         lines.append("")
         lines.append("提示：点击 ASIN 会跳到 `asin_drilldown.md`（动作与 drivers 摘要）。")
         lines.append(f"- 可筛选对比表：[`../dashboard/category_asin_compare.csv`](../dashboard/category_asin_compare.csv)")
@@ -10136,6 +10319,7 @@ def write_phase_drilldown_md(
                 "",
                 f"- 阶段: `{stage}`",
                 f"- 时间范围: `{date_start} ~ {date_end}`",
+                "- 口径说明: 未标注的累计指标=主窗口；标注 compare/Δ 的为近N天 vs 前N天（日期见表内 recent/prev）",
                 "",
                 "- （无）",
                 "",
@@ -10178,6 +10362,7 @@ def write_phase_drilldown_md(
         lines.append("")
         lines.append(f"- 阶段: `{stage}`")
         lines.append(f"- 时间范围: `{date_start} ~ {date_end}`")
+        lines.append("- 口径说明: 未标注的累计指标=主窗口；标注 compare/Δ 的为近N天 vs 前N天（日期见表内 recent/prev）")
         lines.append("")
         lines.append("提示：这里的 `delta_*` 默认来自 compare_7d（近7天 vs 前7天）。点击 ASIN 会跳到 `asin_drilldown.md`。")
         lines.append("")
@@ -10518,6 +10703,7 @@ def write_lifecycle_overview_md(
                 "",
                 f"- 阶段: `{stage}`",
                 f"- 时间范围: `{date_start} ~ {date_end}`",
+                "- 口径说明: 未标注的累计指标=主窗口；标注 compare/Δ 的为近N天 vs 前N天（日期见表内 recent/prev）",
                 "",
                 "- （无：缺少 lifecycle_segments；请确认 `reports/产品分析` 是否包含该店铺的按日数据）",
                 "",
@@ -10790,6 +10976,7 @@ def write_lifecycle_overview_md(
                 "",
                 f"- 阶段: `{stage}`",
                 f"- 时间范围: `{date_start} ~ {date_end}`",
+                "- 口径说明: 未标注的累计指标=主窗口；标注 compare/Δ 的为近N天 vs 前N天（日期见表内 recent/prev）",
                 "",
                 "- （无：本次未生成有效 lifecycle_segments；可能产品分析数据为空/缺列）",
                 "",
@@ -11380,6 +11567,7 @@ def write_lifecycle_overview_md(
         lines.append("")
         lines.append(f"- 阶段: `{stage}`")
         lines.append(f"- 时间范围: `{date_start} ~ {date_end}`")
+        lines.append("- 口径说明: 未标注的累计指标=主窗口；标注 compare/Δ 的为近N天 vs 前N天（日期见表内 recent/prev）")
         lines.append("")
         lines.append(
             "快速入口：[返回 Dashboard](./dashboard.md) | [近期重点](#highlights) | [阶段分布](#phase_dist) | [类目结构](#cat_struct) | [ASIN Drilldown](./asin_drilldown.md) | [Phase Drilldown](./phase_drilldown.md)"
@@ -11569,6 +11757,7 @@ def write_keyword_topics_drilldown_md(
         lines.append("")
         lines.append(f"- 阶段: `{stage}`")
         lines.append(f"- 时间范围: `{date_start} ~ {date_end}`")
+        lines.append("- 口径说明: 未标注的累计指标=主窗口；标注 compare/Δ 的为近N天 vs 前N天（日期见表内 recent/prev）")
         lines.append("")
         lines.append(
             "快速入口：[返回 Dashboard](./dashboard.md) | "
@@ -12656,6 +12845,69 @@ def write_dashboard_outputs(
                     pass
             except Exception:
                 dash_md_path = None
+    except Exception:
+        pass
+
+    # fallback：确保 dashboard.md/html 产物存在（避免异常路径导致 reports 缺失）
+    try:
+        if render_md:
+            reports_dir = shop_dir / "reports"
+            dash_md = reports_dir / "dashboard.md"
+            dash_html = reports_dir / "dashboard.html"
+            if not dash_md.exists():
+                reports_dir.mkdir(parents=True, exist_ok=True)
+
+                def _read_csv(p: Path) -> pd.DataFrame:
+                    try:
+                        return pd.read_csv(p, encoding="utf-8-sig")
+                    except Exception:
+                        return pd.DataFrame()
+
+                # 读回 dashboard 产物作为兜底输入
+                sc_path = dashboard_dir / "shop_scorecard.json" if "dashboard_dir" in locals() else None
+                scorecard = {}
+                try:
+                    if sc_path is not None and sc_path.exists():
+                        sc_json = json.loads(sc_path.read_text(encoding="utf-8"))
+                        if isinstance(sc_json, dict):
+                            scorecard = sc_json.get("scorecard", {}) if isinstance(sc_json.get("scorecard"), dict) else {}
+                except Exception:
+                    scorecard = {}
+
+                category_summary = _read_csv(dashboard_dir / "category_summary.csv") if "dashboard_dir" in locals() else pd.DataFrame()
+                category_cockpit = _read_csv(dashboard_dir / "category_cockpit.csv") if "dashboard_dir" in locals() else pd.DataFrame()
+                phase_cockpit = _read_csv(dashboard_dir / "phase_cockpit.csv") if "dashboard_dir" in locals() else pd.DataFrame()
+                asin_focus = _read_csv(dashboard_dir / "asin_focus.csv") if "dashboard_dir" in locals() else pd.DataFrame()
+                action_board = _read_csv(dashboard_dir / "action_board.csv") if "dashboard_dir" in locals() else pd.DataFrame()
+                drivers_top_asins = _read_csv(dashboard_dir / "drivers_top_asins.csv") if "dashboard_dir" in locals() else pd.DataFrame()
+                keyword_topics = _read_csv(dashboard_dir / "keyword_topics.csv") if "dashboard_dir" in locals() else pd.DataFrame()
+                asin_cockpit = _read_csv(dashboard_dir / "asin_cockpit.csv") if "dashboard_dir" in locals() else pd.DataFrame()
+                unlock_scale_tasks = _read_csv(dashboard_dir / "unlock_scale_tasks.csv") if "dashboard_dir" in locals() else pd.DataFrame()
+
+                write_dashboard_md(
+                    out_path=dash_md,
+                    shop=shop,
+                    stage=stage,
+                    date_start=date_start,
+                    date_end=date_end,
+                    scorecard=scorecard,
+                    category_summary=category_summary,
+                    category_cockpit=category_cockpit if not category_cockpit.empty else None,
+                    phase_cockpit=phase_cockpit if not phase_cockpit.empty else None,
+                    asin_focus=asin_focus if isinstance(asin_focus, pd.DataFrame) else pd.DataFrame(),
+                    action_board=action_board if isinstance(action_board, pd.DataFrame) else pd.DataFrame(),
+                    drivers_top_asins=drivers_top_asins if not drivers_top_asins.empty else None,
+                    keyword_topics=keyword_topics if not keyword_topics.empty else None,
+                    asin_cockpit=asin_cockpit if not asin_cockpit.empty else None,
+                    policy=policy,
+                    budget_transfer_plan={},
+                    unlock_scale_tasks=unlock_scale_tasks if not unlock_scale_tasks.empty else None,
+                    data_quality_hints=None,
+                    action_review=None,
+                )
+
+            if dash_md.exists() and not dash_html.exists():
+                write_report_html_from_md(md_path=dash_md, out_path=dash_html)
     except Exception:
         pass
 

@@ -133,7 +133,12 @@ def _coerce_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     # 常用列名（产品分析保持原表头；这里只做数值化）
     for col in ("销售额", "订单量", "Sessions", "广告花费", "广告销售额", "广告订单量", "毛利润", "退款率", "星级评分", "FBA可售"):
-        if col in df.columns:
+        if col not in df.columns:
+            continue
+        # FBA可售：保留 NaN（不要把空值强制变成 0，避免误判断货）
+        if col == "FBA可售":
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
             df[col] = df[col].apply(to_float)
     return df
 
@@ -233,7 +238,8 @@ def _sum_window(df: pd.DataFrame) -> Dict[str, float]:
 
     # 库存/断货天数（用于动态窗口解释）
     try:
-        fba = pd.to_numeric(df.get("FBA可售", 0.0), errors="coerce").fillna(0.0)
+        # FBA可售 缺失时不计入断货天数（避免空值被当成 0）
+        fba = pd.to_numeric(df.get("FBA可售", 0.0), errors="coerce")
         in_stock_days = float((fba > 0).sum())
         oos_days = float((fba == 0).sum())
         sess = pd.to_numeric(df.get("Sessions", 0.0), errors="coerce").fillna(0.0)
@@ -241,7 +247,13 @@ def _sum_window(df: pd.DataFrame) -> Dict[str, float]:
         oos_with_sessions_days = float(((fba == 0) & (sess > 0)).sum())
         oos_with_ad_spend_days = float(((fba == 0) & (spend > 0)).sum())
         presale_order_days = float(
-            ((fba == 0) & ((pd.to_numeric(df.get("销售额", 0.0), errors="coerce").fillna(0.0) > 0) | (pd.to_numeric(df.get("订单量", 0.0), errors="coerce").fillna(0.0) > 0))).sum()
+            (
+                (fba == 0)
+                & (
+                    (pd.to_numeric(df.get("销售额", 0.0), errors="coerce").fillna(0.0) > 0)
+                    | (pd.to_numeric(df.get("订单量", 0.0), errors="coerce").fillna(0.0) > 0)
+                )
+            ).sum()
         )
     except Exception:
         in_stock_days = 0.0
@@ -332,6 +344,13 @@ def _compare_recent_prev(ts: pd.DataFrame, end_date: dt.date, window_days: int) 
         "organic_sales_share_recent": float(r.get("organic_sales_share", 0.0) or 0.0),
         "ad_clicks_prev": float(p["ad_clicks"]),
         "ad_clicks_recent": float(r["ad_clicks"]),
+        # 断货相关（用于“近N天”口径的标签）
+        "oos_with_ad_spend_days_prev": float(p.get("oos_with_ad_spend_days", 0.0) or 0.0),
+        "oos_with_ad_spend_days_recent": float(r.get("oos_with_ad_spend_days", 0.0) or 0.0),
+        "oos_with_sessions_days_prev": float(p.get("oos_with_sessions_days", 0.0) or 0.0),
+        "oos_with_sessions_days_recent": float(r.get("oos_with_sessions_days", 0.0) or 0.0),
+        "presale_order_days_prev": float(p.get("presale_order_days", 0.0) or 0.0),
+        "presale_order_days_recent": float(r.get("presale_order_days", 0.0) or 0.0),
         "delta_spend": float(delta_ad_spend),
         "delta_sales": float(delta_sales),
         "delta_orders": float(delta_orders),
@@ -376,7 +395,7 @@ def _assign_cycle_id_by_inventory(ts: pd.DataFrame, cfg: LifecycleConfig) -> Opt
         return None
 
     try:
-        in_stock = pd.to_numeric(ts["FBA可售"], errors="coerce").fillna(0.0) > 0
+        fba = pd.to_numeric(ts["FBA可售"], errors="coerce")
     except Exception:
         return None
 
@@ -388,8 +407,12 @@ def _assign_cycle_id_by_inventory(ts: pd.DataFrame, cfg: LifecycleConfig) -> Opt
     cur = 1
     oos_streak = 0
     seen_stock = False
-    for v in in_stock.tolist():
-        if bool(v):
+    for v in fba.tolist():
+        # 空值：不参与断货连续计数，避免误判新周期
+        if pd.isna(v):
+            cycle.append(cur)
+            continue
+        if float(v) > 0:
             if seen_stock and oos_streak >= n and len(cycle) > 0:
                 cur += 1
             seen_stock = True
@@ -424,12 +447,14 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
         return pd.DataFrame()
 
     ts = _ensure_daily_index(ts, dmin, dmax)
-    # 缺失填0（代表当天无数据/无行为）
-    for col in ("销售额", "订单量", "Sessions", "广告花费", "广告销售额", "广告订单量", "毛利润", "退款率", "星级评分", "FBA可售"):
+    # 缺失填0（代表当天无数据/无行为）；FBA可售保留 NaN，避免空值=断货
+    for col in ("销售额", "订单量", "Sessions", "广告花费", "广告销售额", "广告订单量", "毛利润", "退款率", "星级评分"):
         if col in ts.columns:
             ts[col] = pd.to_numeric(ts[col], errors="coerce").fillna(0.0)
         else:
             ts[col] = 0.0
+    if "FBA可售" in ts.columns:
+        ts["FBA可售"] = pd.to_numeric(ts["FBA可售"], errors="coerce")
 
     active = _active_flag(ts)
     ts["active"] = active.astype(int)
