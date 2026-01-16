@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+.docs/
+helloagents/
+AGENTS.md
+skills/
+tests/
+mydata/

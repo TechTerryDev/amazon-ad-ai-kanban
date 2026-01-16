@@ -1,0 +1,10 @@
+{
+  "//": "生命周期默认参数（可版本化）。CLI 参数会覆盖这里的值。",
+  "new_cycle_oos_days": 14,
+  "roll_days": 7,
+  "launch_days": 14,
+  "mature_ratio": 0.85,
+  "decline_ratio": 0.65,
+  "low_inventory": 20
+}
+

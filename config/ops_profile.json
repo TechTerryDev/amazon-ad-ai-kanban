@@ -1,0 +1,12 @@
+{
+  "_comment": "总选项（少数几个开关）：用来解决“ops_policy 参数太多，不知道怎么调”的问题。日常建议只改这里；需要更细调时，再去改 config/ops_policy.json。注意：本文件会在每次跑数时被复制到 output/<run>/config/ops_profile.json 便于追溯。",
+  "_comment_enabled": "是否启用 profile 覆盖（true=启用；false=完全按 ops_policy.json 的细节参数运行）。",
+  "enabled": true,
+  "_comment_preset": "整体风格：guardrail=更保守（更严格库存/放量窗口/弱关联惩罚） | balanced=默认（不额外覆盖） | growth=更积极（更容易给出放量线索，但仍保留库存阻断）。",
+  "preset": "balanced",
+  "_comment_density": "输出密度（只影响 TopN 与展示规模，不改变核心口径）：compact=更少（更聚焦） | normal=默认 | deep=更多（便于深挖）。",
+  "density": "normal",
+  "_comment_keyword_topics": "关键词主题（n-gram）深度：off=关闭 | standard=默认 | deep=深挖（更多代表词/更多 action hints）。",
+  "keyword_topics": "standard"
+}
+
