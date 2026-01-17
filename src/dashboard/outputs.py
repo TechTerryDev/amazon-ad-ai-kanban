@@ -27,7 +27,7 @@ import pandas as pd
 
 from ads.actions import ActionCandidate
 from core.config import StageConfig, get_stage_config
-from core.policy import ActionScoringPolicy, FocusScoringPolicy, OpsPolicy
+from core.policy import ActionScoringPolicy, FocusScoringPolicy, OpsPolicy, StageScoringPolicy
 from core.schema import CAN
 from core.utils import json_dumps
 from dashboard.keyword_topics import (
@@ -52,6 +52,78 @@ def _safe_int(x: object) -> int:
         return int(float(x))  # type: ignore[arg-type]
     except Exception:
         return 0
+
+
+def _is_percent_col(col_name: str) -> bool:
+    try:
+        s = str(col_name or "")
+        n = s.lower()
+        if any(k in n for k in ("ctr", "cvr", "tacos", "acos", "share", "ratio", "margin", "rate", "pct", "percent")):
+            return True
+        if any(k in s for k in ("率", "占比", "比例", "毛利率")):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _is_int_col(col_name: str) -> bool:
+    try:
+        s = str(col_name or "")
+        n = s.lower()
+        if any(
+            k in n
+            for k in (
+                "orders",
+                "order",
+                "sessions",
+                "impressions",
+                "clicks",
+                "days",
+                "day",
+                "count",
+                "qty",
+                "inventory",
+                "rank",
+                "asin_count",
+                "cycle_id",
+                "segment_id",
+                "num",
+            )
+        ):
+            return True
+        if any(k in s for k in ("订单", "点击", "曝光", "天数", "次数", "库存", "数量", "排名", "排行", "ASIN数", "店铺数", "类目数")):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _format_number_for_md(col_name: str, value: float) -> str:
+    try:
+        if _is_percent_col(col_name):
+            return f"{float(value) * 100:.2f}%"
+        if _is_int_col(col_name):
+            if abs(float(value) - round(float(value))) < 1e-6:
+                return str(int(round(float(value))))
+            return f"{float(value):.2f}"
+        return f"{float(value):.2f}"
+    except Exception:
+        return str(value)
+
+
+def _format_md_cell(col_name: str, value: object) -> str:
+    try:
+        if value is None:
+            return ""
+        num = pd.to_numeric(value, errors="coerce")
+        if pd.notna(num):
+            s = _format_number_for_md(col_name, float(num))
+        else:
+            s = str(value)
+    except Exception:
+        s = str(value)
+    return s.replace("\n", " ").replace("|", "｜")
 
 
 def _norm_product_category(x: object) -> str:
@@ -1814,21 +1886,33 @@ function _buildDashboardHero(){
   }catch(e){}
 
   // 4) 收集 “本周行动” 与 “Shop Alerts” 两个区块（heading + cards）
-  function findH3ByTextOrId(id, text){
+  function findH3ByTextOrId(root, id, text){
+    if(!root) return null;
     try{
-      const byId=sec.querySelector('h3#'+id);
-      if(byId) return byId;
+      const byId=root.querySelector('#'+id);
+      if(byId){
+        const tag=String(byId.tagName||'');
+        if(tag.match(/^H[2-4]$/)) return byId;
+        const next=byId.nextElementSibling;
+        if(next && String(next.tagName||'').match(/^H[2-4]$/)) return next;
+      }
     }catch(e){}
     try{
-      const hs=Array.from(sec.querySelectorAll('h3'));
+      const hs=Array.from(root.querySelectorAll('h2,h3,h4'));
       return hs.find(x=>String(x.textContent||'').includes(text)) || null;
     }catch(e){
       return null;
     }
   }
-  function pickBlock(h3){
+  function pickBlock(h3, anchorId){
     const items=[];
     if(!h3) return items;
+    try{
+      const prev=h3.previousElementSibling;
+      if(prev && anchorId && String(prev.id||'')===anchorId){
+        items.push(prev);
+      }
+    }catch(e){}
     items.push(h3);
     let el=h3.nextElementSibling;
     while(el){
@@ -1838,10 +1922,10 @@ function _buildDashboardHero(){
     }
     return items;
   }
-  const weeklyH3=findH3ByTextOrId('weekly','本周行动');
-  const alertsH3=findH3ByTextOrId('alerts','Shop Alerts');
-  const weeklyBlock=pickBlock(weeklyH3);
-  const alertsBlock=pickBlock(alertsH3);
+  const weeklyH3=findH3ByTextOrId(sec,'weekly','本周行动') || findH3ByTextOrId(content,'weekly','本周行动');
+  const alertsH3=findH3ByTextOrId(sec,'alerts','Shop Alerts') || findH3ByTextOrId(content,'alerts','Shop Alerts');
+  const weeklyBlock=pickBlock(weeklyH3, 'weekly');
+  const alertsBlock=pickBlock(alertsH3, 'alerts');
 
   // 5) 构建 hero 三栏并插入到“概览 cards”原位置（避免打乱“快速入口”段落）
   const hero=document.createElement('div');
@@ -7800,6 +7884,10 @@ def build_asin_focus(
         "ad_spend",
         "ad_sales",
         "ad_orders",
+        "ad_impressions",
+        "ad_clicks",
+        "ad_ctr",
+        "ad_cvr",
         "organic_sales",
         "organic_orders",
         "organic_sales_share",
@@ -7828,6 +7916,20 @@ def build_asin_focus(
         "sessions_recent",
         "spend_prev",
         "spend_recent",
+        "ad_orders_prev",
+        "ad_orders_recent",
+        "ad_sales_prev",
+        "ad_sales_recent",
+        "ad_impressions_prev",
+        "ad_impressions_recent",
+        "ad_clicks_prev",
+        "ad_clicks_recent",
+        "ad_ctr_prev",
+        "ad_ctr_recent",
+        "ad_cvr_prev",
+        "ad_cvr_recent",
+        "ad_sales_share_prev",
+        "ad_sales_share_recent",
         "oos_with_ad_spend_days_recent",
         "oos_with_sessions_days_recent",
         "presale_order_days_recent",
@@ -7839,11 +7941,17 @@ def build_asin_focus(
         "organic_sales_share_recent",
         "delta_spend",
         "delta_sales",
+        "delta_ad_sales",
+        "delta_ad_orders",
         "delta_orders",
         "delta_sessions",
         "delta_cvr",
+        "delta_ad_ctr",
+        "delta_ad_cvr",
+        "delta_ad_impressions",
         "delta_organic_sales",
         "delta_organic_sales_share",
+        "delta_ad_sales_share",
         "marginal_tacos",
         "marginal_ad_acos",
     ]
@@ -7861,6 +7969,20 @@ def build_asin_focus(
                 "sessions_recent": "sessions_recent_7d",
                 "spend_prev": "ad_spend_prev_7d",
                 "spend_recent": "ad_spend_recent_7d",
+                "ad_orders_prev": "ad_orders_prev_7d",
+                "ad_orders_recent": "ad_orders_recent_7d",
+                "ad_sales_prev": "ad_sales_prev_7d",
+                "ad_sales_recent": "ad_sales_recent_7d",
+                "ad_impressions_prev": "ad_impressions_prev_7d",
+                "ad_impressions_recent": "ad_impressions_recent_7d",
+                "ad_clicks_prev": "ad_clicks_prev_7d",
+                "ad_clicks_recent": "ad_clicks_recent_7d",
+                "ad_ctr_prev": "ad_ctr_prev_7d",
+                "ad_ctr_recent": "ad_ctr_recent_7d",
+                "ad_cvr_prev": "ad_cvr_prev_7d",
+                "ad_cvr_recent": "ad_cvr_recent_7d",
+                "ad_sales_share_prev": "ad_sales_share_prev_7d",
+                "ad_sales_share_recent": "ad_sales_share_recent_7d",
                 "cvr_prev": "cvr_prev_7d",
                 "cvr_recent": "cvr_recent_7d",
                 "organic_sales_prev": "organic_sales_prev_7d",
@@ -7885,14 +8007,44 @@ def build_asin_focus(
             "orders_recent",
             "sessions_recent",
             "spend_recent",
+            "ad_orders_recent",
+            "ad_sales_recent",
+            "ad_impressions_recent",
+            "ad_clicks_recent",
+            "ad_ctr_recent",
+            "ad_cvr_recent",
+            "ad_sales_share_recent",
             "oos_with_ad_spend_days_recent",
             "oos_with_sessions_days_recent",
             "presale_order_days_recent",
         ]
         if include_prev:
-            keep += ["sales_prev", "orders_prev", "sessions_prev", "spend_prev"]
+            keep += [
+                "sales_prev",
+                "orders_prev",
+                "sessions_prev",
+                "spend_prev",
+                "ad_orders_prev",
+                "ad_sales_prev",
+                "ad_impressions_prev",
+                "ad_clicks_prev",
+                "ad_ctr_prev",
+                "ad_cvr_prev",
+                "ad_sales_share_prev",
+            ]
         if include_delta:
-            keep += ["delta_sales", "delta_orders", "delta_sessions", "delta_spend"]
+            keep += [
+                "delta_sales",
+                "delta_orders",
+                "delta_sessions",
+                "delta_spend",
+                "delta_ad_sales",
+                "delta_ad_orders",
+                "delta_ad_impressions",
+                "delta_ad_ctr",
+                "delta_ad_cvr",
+                "delta_ad_sales_share",
+            ]
         keep = [c for c in keep if c in df.columns]
         out2 = df[keep].copy() if keep else pd.DataFrame(columns=["asin_norm"])
         try:
@@ -7900,21 +8052,41 @@ def build_asin_focus(
                 columns={
                     "sales_recent": f"sales_recent_{int(days)}d",
                     "orders_recent": f"orders_recent_{int(days)}d",
-                    "sessions_recent": f"sessions_recent_{int(days)}d",
-                    "spend_recent": f"ad_spend_recent_{int(days)}d",
-                    "oos_with_ad_spend_days_recent": f"oos_with_ad_spend_days_{int(days)}d",
-                    "oos_with_sessions_days_recent": f"oos_with_sessions_days_{int(days)}d",
-                    "presale_order_days_recent": f"presale_order_days_{int(days)}d",
-                    "sales_prev": f"sales_prev_{int(days)}d",
-                    "orders_prev": f"orders_prev_{int(days)}d",
-                    "sessions_prev": f"sessions_prev_{int(days)}d",
-                    "spend_prev": f"ad_spend_prev_{int(days)}d",
-                    "delta_sales": f"delta_sales_{int(days)}d",
-                    "delta_orders": f"delta_orders_{int(days)}d",
-                    "delta_sessions": f"delta_sessions_{int(days)}d",
-                    "delta_spend": f"delta_spend_{int(days)}d",
-                }
-            )
+                "sessions_recent": f"sessions_recent_{int(days)}d",
+                "spend_recent": f"ad_spend_recent_{int(days)}d",
+                "ad_orders_recent": f"ad_orders_recent_{int(days)}d",
+                "ad_sales_recent": f"ad_sales_recent_{int(days)}d",
+                "ad_impressions_recent": f"ad_impressions_recent_{int(days)}d",
+                "ad_clicks_recent": f"ad_clicks_recent_{int(days)}d",
+                "ad_ctr_recent": f"ad_ctr_recent_{int(days)}d",
+                "ad_cvr_recent": f"ad_cvr_recent_{int(days)}d",
+                "ad_sales_share_recent": f"ad_sales_share_recent_{int(days)}d",
+                "oos_with_ad_spend_days_recent": f"oos_with_ad_spend_days_{int(days)}d",
+                "oos_with_sessions_days_recent": f"oos_with_sessions_days_{int(days)}d",
+                "presale_order_days_recent": f"presale_order_days_{int(days)}d",
+                "sales_prev": f"sales_prev_{int(days)}d",
+                "orders_prev": f"orders_prev_{int(days)}d",
+                "sessions_prev": f"sessions_prev_{int(days)}d",
+                "spend_prev": f"ad_spend_prev_{int(days)}d",
+                "ad_orders_prev": f"ad_orders_prev_{int(days)}d",
+                "ad_sales_prev": f"ad_sales_prev_{int(days)}d",
+                "ad_impressions_prev": f"ad_impressions_prev_{int(days)}d",
+                "ad_clicks_prev": f"ad_clicks_prev_{int(days)}d",
+                "ad_ctr_prev": f"ad_ctr_prev_{int(days)}d",
+                "ad_cvr_prev": f"ad_cvr_prev_{int(days)}d",
+                "ad_sales_share_prev": f"ad_sales_share_prev_{int(days)}d",
+                "delta_sales": f"delta_sales_{int(days)}d",
+                "delta_orders": f"delta_orders_{int(days)}d",
+                "delta_sessions": f"delta_sessions_{int(days)}d",
+                "delta_spend": f"delta_spend_{int(days)}d",
+                "delta_ad_sales": f"delta_ad_sales_{int(days)}d",
+                "delta_ad_orders": f"delta_ad_orders_{int(days)}d",
+                "delta_ad_impressions": f"delta_ad_impressions_{int(days)}d",
+                "delta_ad_ctr": f"delta_ad_ctr_{int(days)}d",
+                "delta_ad_cvr": f"delta_ad_cvr_{int(days)}d",
+                "delta_ad_sales_share": f"delta_ad_sales_share_{int(days)}d",
+            }
+        )
         except Exception:
             pass
         return out2
@@ -7942,6 +8114,20 @@ def build_asin_focus(
             "sessions_recent_7d",
             "ad_spend_prev_7d",
             "ad_spend_recent_7d",
+            "ad_orders_prev_7d",
+            "ad_orders_recent_7d",
+            "ad_sales_prev_7d",
+            "ad_sales_recent_7d",
+            "ad_impressions_prev_7d",
+            "ad_impressions_recent_7d",
+            "ad_clicks_prev_7d",
+            "ad_clicks_recent_7d",
+            "ad_ctr_prev_7d",
+            "ad_ctr_recent_7d",
+            "ad_cvr_prev_7d",
+            "ad_cvr_recent_7d",
+            "ad_sales_share_prev_7d",
+            "ad_sales_share_recent_7d",
             "cvr",
             "cvr_prev_7d",
             "cvr_recent_7d",
@@ -7956,6 +8142,12 @@ def build_asin_focus(
             "delta_sessions",
             "delta_organic_sales",
             "delta_organic_sales_share",
+            "delta_ad_sales",
+            "delta_ad_orders",
+            "delta_ad_impressions",
+            "delta_ad_ctr",
+            "delta_ad_cvr",
+            "delta_ad_sales_share",
             "sales_recent_14d",
             "sales_prev_14d",
             "orders_recent_14d",
@@ -7964,20 +8156,51 @@ def build_asin_focus(
             "sessions_prev_14d",
             "ad_spend_recent_14d",
             "ad_spend_prev_14d",
+            "ad_orders_recent_14d",
+            "ad_orders_prev_14d",
+            "ad_sales_recent_14d",
+            "ad_sales_prev_14d",
+            "ad_impressions_recent_14d",
+            "ad_impressions_prev_14d",
+            "ad_clicks_recent_14d",
+            "ad_clicks_prev_14d",
+            "ad_ctr_recent_14d",
+            "ad_ctr_prev_14d",
+            "ad_cvr_recent_14d",
+            "ad_cvr_prev_14d",
+            "ad_sales_share_recent_14d",
+            "ad_sales_share_prev_14d",
             "delta_sales_14d",
             "delta_orders_14d",
             "delta_sessions_14d",
             "delta_spend_14d",
+            "delta_ad_sales_14d",
+            "delta_ad_orders_14d",
+            "delta_ad_impressions_14d",
+            "delta_ad_ctr_14d",
+            "delta_ad_cvr_14d",
+            "delta_ad_sales_share_14d",
             "sales_recent_30d",
             "orders_recent_30d",
             "sessions_recent_30d",
             "ad_spend_recent_30d",
+            "ad_orders_recent_30d",
+            "ad_sales_recent_30d",
+            "ad_impressions_recent_30d",
+            "ad_clicks_recent_30d",
+            "ad_ctr_recent_30d",
+            "ad_cvr_recent_30d",
+            "ad_sales_share_recent_30d",
             "inventory",
             "sales",
             "orders",
             "profit",
             "ad_sales",
             "ad_orders",
+            "ad_impressions",
+            "ad_clicks",
+            "ad_ctr",
+            "ad_cvr",
             "organic_sales",
             "organic_orders",
             "organic_sales_share",
@@ -7986,6 +8209,16 @@ def build_asin_focus(
         ):
             if c in out.columns:
                 out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+
+        # 小工具：安全除法（避免 0/0）
+        def _safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
+            try:
+                out2 = pd.Series([0.0] * len(a), index=a.index)
+                mask = b > 0
+                out2.loc[mask] = (a.loc[mask] / b.loc[mask]).astype(float)
+                return out2.fillna(0.0)
+            except Exception:
+                return pd.Series([0.0] * len(a), index=a.index)
 
         # 1) 近7天“速度”（日均）
         if "sales_recent_7d" in out.columns:
@@ -7996,6 +8229,28 @@ def build_asin_focus(
             out["sessions_per_day_7d"] = (out["sessions_recent_7d"] / 7.0).fillna(0.0)
         if "ad_spend_recent_7d" in out.columns:
             out["ad_spend_per_day_7d"] = (out["ad_spend_recent_7d"] / 7.0).fillna(0.0)
+
+        # 1.1) 广告端效率（7d）：CTR/CVR/CPA/ACOS/广告占比
+        if ("ad_clicks_recent_7d" in out.columns) and ("ad_impressions_recent_7d" in out.columns):
+            out["ad_ctr_recent_7d"] = _safe_div(out["ad_clicks_recent_7d"], out["ad_impressions_recent_7d"])
+        if ("ad_clicks_prev_7d" in out.columns) and ("ad_impressions_prev_7d" in out.columns):
+            out["ad_ctr_prev_7d"] = _safe_div(out["ad_clicks_prev_7d"], out["ad_impressions_prev_7d"])
+        if ("ad_orders_recent_7d" in out.columns) and ("ad_clicks_recent_7d" in out.columns):
+            out["ad_cvr_recent_7d"] = _safe_div(out["ad_orders_recent_7d"], out["ad_clicks_recent_7d"])
+        if ("ad_orders_prev_7d" in out.columns) and ("ad_clicks_prev_7d" in out.columns):
+            out["ad_cvr_prev_7d"] = _safe_div(out["ad_orders_prev_7d"], out["ad_clicks_prev_7d"])
+        if ("ad_spend_recent_7d" in out.columns) and ("ad_orders_recent_7d" in out.columns):
+            out["ad_cpa_order_recent_7d"] = _safe_div(out["ad_spend_recent_7d"], out["ad_orders_recent_7d"])
+        if ("ad_spend_prev_7d" in out.columns) and ("ad_orders_prev_7d" in out.columns):
+            out["ad_cpa_order_prev_7d"] = _safe_div(out["ad_spend_prev_7d"], out["ad_orders_prev_7d"])
+        if ("ad_spend_recent_7d" in out.columns) and ("ad_sales_recent_7d" in out.columns):
+            out["ad_acos_recent_7d"] = _safe_div(out["ad_spend_recent_7d"], out["ad_sales_recent_7d"])
+        if ("ad_spend_prev_7d" in out.columns) and ("ad_sales_prev_7d" in out.columns):
+            out["ad_acos_prev_7d"] = _safe_div(out["ad_spend_prev_7d"], out["ad_sales_prev_7d"])
+        if ("ad_sales_recent_7d" in out.columns) and ("sales_recent_7d" in out.columns):
+            out["ad_sales_share_recent_7d"] = _safe_div(out["ad_sales_recent_7d"], out["sales_recent_7d"])
+        if ("ad_sales_prev_7d" in out.columns) and ("sales_prev_7d" in out.columns):
+            out["ad_sales_share_prev_7d"] = _safe_div(out["ad_sales_prev_7d"], out["sales_prev_7d"])
 
         # 2) 库存覆盖天数（粗粒度）：库存 / 日均订单
         if "inventory" in out.columns and "orders_per_day_7d" in out.columns:
@@ -8012,6 +8267,28 @@ def build_asin_focus(
             out["sessions_per_day_14d"] = (out["sessions_recent_14d"] / 14.0).fillna(0.0)
         if "ad_spend_recent_14d" in out.columns:
             out["ad_spend_per_day_14d"] = (out["ad_spend_recent_14d"] / 14.0).fillna(0.0)
+
+        # 1.2) 广告端效率（14d）：用于成熟期稳定性判断
+        if ("ad_clicks_recent_14d" in out.columns) and ("ad_impressions_recent_14d" in out.columns):
+            out["ad_ctr_recent_14d"] = _safe_div(out["ad_clicks_recent_14d"], out["ad_impressions_recent_14d"])
+        if ("ad_clicks_prev_14d" in out.columns) and ("ad_impressions_prev_14d" in out.columns):
+            out["ad_ctr_prev_14d"] = _safe_div(out["ad_clicks_prev_14d"], out["ad_impressions_prev_14d"])
+        if ("ad_orders_recent_14d" in out.columns) and ("ad_clicks_recent_14d" in out.columns):
+            out["ad_cvr_recent_14d"] = _safe_div(out["ad_orders_recent_14d"], out["ad_clicks_recent_14d"])
+        if ("ad_orders_prev_14d" in out.columns) and ("ad_clicks_prev_14d" in out.columns):
+            out["ad_cvr_prev_14d"] = _safe_div(out["ad_orders_prev_14d"], out["ad_clicks_prev_14d"])
+        if ("ad_spend_recent_14d" in out.columns) and ("ad_orders_recent_14d" in out.columns):
+            out["ad_cpa_order_recent_14d"] = _safe_div(out["ad_spend_recent_14d"], out["ad_orders_recent_14d"])
+        if ("ad_spend_prev_14d" in out.columns) and ("ad_orders_prev_14d" in out.columns):
+            out["ad_cpa_order_prev_14d"] = _safe_div(out["ad_spend_prev_14d"], out["ad_orders_prev_14d"])
+        if ("ad_spend_recent_14d" in out.columns) and ("ad_sales_recent_14d" in out.columns):
+            out["ad_acos_recent_14d"] = _safe_div(out["ad_spend_recent_14d"], out["ad_sales_recent_14d"])
+        if ("ad_spend_prev_14d" in out.columns) and ("ad_sales_prev_14d" in out.columns):
+            out["ad_acos_prev_14d"] = _safe_div(out["ad_spend_prev_14d"], out["ad_sales_prev_14d"])
+        if ("ad_sales_recent_14d" in out.columns) and ("sales_recent_14d" in out.columns):
+            out["ad_sales_share_recent_14d"] = _safe_div(out["ad_sales_recent_14d"], out["sales_recent_14d"])
+        if ("ad_sales_prev_14d" in out.columns) and ("sales_prev_14d" in out.columns):
+            out["ad_sales_share_prev_14d"] = _safe_div(out["ad_sales_prev_14d"], out["sales_prev_14d"])
 
         # 2.2) 库存覆盖天数（14d）
         if "inventory" in out.columns and "orders_per_day_14d" in out.columns:
@@ -8048,6 +8325,10 @@ def build_asin_focus(
             out["cvr"] = 0.0
             mask = pd.to_numeric(out["sessions"], errors="coerce").fillna(0.0) > 0
             out.loc[mask, "cvr"] = (pd.to_numeric(out.loc[mask, "orders"], errors="coerce").fillna(0.0) / pd.to_numeric(out.loc[mask, "sessions"], errors="coerce").fillna(0.0)).fillna(0.0)
+
+        # 4.1) 广告端成本指标（主窗口）：CPA(订单口径)
+        if ("ad_spend" in out.columns) and ("ad_orders" in out.columns):
+            out["ad_cpa_order"] = _safe_div(out["ad_spend"], out["ad_orders"])
 
         # 5) 经营侧“正常销售字段”补齐：客单价 AOV / 毛利率 gross_margin
         # 说明：
@@ -8088,6 +8369,94 @@ def build_asin_focus(
         # 防御性：任何新维度计算失败都不影响主流程
         pass
 
+    # 去碎片化：避免多次 insert/赋值导致 PerformanceWarning
+    try:
+        out = out.copy()
+    except Exception:
+        pass
+
+    # ===== 阶段化标签与中位数（用于新品/成熟期权重）=====
+    stage_policy = None
+    try:
+        stage_policy = getattr(policy, "dashboard_stage_scoring", None)
+    except Exception:
+        stage_policy = None
+    if stage_policy is None:
+        stage_policy = StageScoringPolicy()
+
+    def _norm_list(v: object, default: List[str]) -> List[str]:
+        try:
+            if not isinstance(v, list):
+                return list(default)
+            out2: List[str] = []
+            for x in v:
+                s = str(x or "").strip().lower()
+                if s:
+                    out2.append(s)
+            return out2 if out2 else list(default)
+        except Exception:
+            return list(default)
+
+    launch_phases = _norm_list(getattr(stage_policy, "launch_phases", None), [])
+    growth_phases = _norm_list(getattr(stage_policy, "growth_phases", None), [])
+    new_phases = _norm_list(getattr(stage_policy, "new_phases", None), [])
+    mature_phases = _norm_list(getattr(stage_policy, "mature_phases", None), [])
+    decline_phases = _norm_list(getattr(stage_policy, "decline_phases", None), [])
+
+    if not launch_phases and "launch" in new_phases:
+        launch_phases = ["launch"]
+    if not growth_phases and "growth" in new_phases:
+        growth_phases = ["growth"]
+    new_other = [p for p in new_phases if p not in launch_phases and p not in growth_phases]
+
+    def _stage_group(phase_value: object) -> str:
+        try:
+            p = str(phase_value or "").strip().lower()
+            if p in launch_phases:
+                return "launch"
+            if p in growth_phases:
+                return "growth"
+            if p in mature_phases:
+                return "mature"
+            if p in decline_phases:
+                return "decline"
+            if p in new_other:
+                return "new"
+            return "other"
+        except Exception:
+            return "other"
+
+    try:
+        if "current_phase" in out.columns:
+            out["stage_group"] = out["current_phase"].map(_stage_group)
+        else:
+            out["stage_group"] = "other"
+    except Exception:
+        out["stage_group"] = "other"
+
+    def _median_by_stage(df: pd.DataFrame, group_names: List[str], col: str) -> float:
+        try:
+            sub = df[df["stage_group"].isin(group_names)]
+            if sub is None or sub.empty or col not in sub.columns:
+                return 0.0
+            vals = pd.to_numeric(sub[col], errors="coerce").dropna()
+            vals = vals[vals > 0]
+            if len(vals) < int(stage_policy.median_min_samples or 0):
+                return 0.0
+            return float(vals.median())
+        except Exception:
+            return 0.0
+
+    stage_medians: Dict[Tuple[str, str], float] = {}
+    for grp in ("launch", "growth", "mature"):
+        stage_medians[(grp, "ad_ctr_recent_7d")] = _median_by_stage(out, [grp], "ad_ctr_recent_7d")
+        stage_medians[(grp, "ad_cvr_recent_7d")] = _median_by_stage(out, [grp], "ad_cvr_recent_7d")
+        stage_medians[(grp, "ad_cpa_order_recent_7d")] = _median_by_stage(out, [grp], "ad_cpa_order_recent_7d")
+        stage_medians[(grp, "ad_acos_recent_7d")] = _median_by_stage(out, [grp], "ad_acos_recent_7d")
+    stage_medians[("new", "ad_ctr_recent_7d")] = _median_by_stage(out, ["launch", "growth", "new"], "ad_ctr_recent_7d")
+    stage_medians[("new", "ad_cvr_recent_7d")] = _median_by_stage(out, ["launch", "growth", "new"], "ad_cvr_recent_7d")
+    stage_medians[("new", "ad_cpa_order_recent_7d")] = _median_by_stage(out, ["launch", "growth", "new"], "ad_cpa_order_recent_7d")
+
     # 评分策略（可从 config/ops_policy.json.dashboard.focus_scoring 调整）
     fs = None
     try:
@@ -8100,7 +8469,9 @@ def build_asin_focus(
     # 生成“重点原因”标签（1~3 个）+ 历史诊断
     reasons: List[str] = []
     history_reasons: List[str] = []
+    stage_reasons: List[str] = []
     scores: List[float] = []
+    stage_scores: List[float] = []
 
     for _, r in out.iterrows():
         recent_tags: List[str] = []
@@ -8131,44 +8502,36 @@ def build_asin_focus(
             recent_tags.append("低库存")
             score += float(fs.weight_flag_low_inventory)
 
-        # 断货异常（更高优先级）
+        # 断货/未可售历史诊断（不纳入近期行动优先级）
         oos_spend_days_7d = _safe_float(r.get("oos_with_ad_spend_days_7d", 0.0))
         oos_spend_days_14d = _safe_float(r.get("oos_with_ad_spend_days_14d", 0.0))
         oos_spend_days = _safe_float(r.get("oos_with_ad_spend_days", 0.0))
-        oos_score_added = False
         if oos_spend_days_7d > 0:
-            recent_tags.append(f"近7天断货仍烧钱({int(oos_spend_days_7d)}天)")
-            score += float(fs.weight_oos_with_ad_spend_days)
-            oos_score_added = True
+            history_tags.append(f"近7天断货仍烧钱({int(oos_spend_days_7d)}天)")
         if oos_spend_days_14d > 0:
-            recent_tags.append(f"近14天断货仍烧钱({int(oos_spend_days_14d)}天)")
-            if not oos_score_added:
-                score += float(fs.weight_oos_with_ad_spend_days)
-                oos_score_added = True
+            history_tags.append(f"近14天断货仍烧钱({int(oos_spend_days_14d)}天)")
         if oos_spend_days > 0:
             history_tags.append(f"累计断货仍烧钱({int(oos_spend_days)}天)")
-            if not oos_score_added:
-                score += float(fs.weight_oos_with_ad_spend_days)
+
         oos_sessions_days_7d = _safe_float(r.get("oos_with_sessions_days_7d", 0.0))
         oos_sessions_days_14d = _safe_float(r.get("oos_with_sessions_days_14d", 0.0))
         oos_sessions_days = _safe_float(r.get("oos_with_sessions_days", 0.0))
         if oos_sessions_days_7d > 0:
-            recent_tags.append(f"近7天断货仍有流量({int(oos_sessions_days_7d)}天)")
+            history_tags.append(f"近7天断货仍有流量({int(oos_sessions_days_7d)}天)")
         if oos_sessions_days_14d > 0:
-            recent_tags.append(f"近14天断货仍有流量({int(oos_sessions_days_14d)}天)")
+            history_tags.append(f"近14天断货仍有流量({int(oos_sessions_days_14d)}天)")
         if oos_sessions_days > 0:
             history_tags.append(f"累计断货仍有流量({int(oos_sessions_days)}天)")
-            score += float(fs.weight_oos_with_sessions_days)
+
         presale_days_7d = _safe_float(r.get("presale_order_days_7d", 0.0))
         presale_days_14d = _safe_float(r.get("presale_order_days_14d", 0.0))
         presale_days = _safe_float(r.get("presale_order_days", 0.0))
         if presale_days_7d > 0:
-            recent_tags.append(f"近7天未可售仍出单({int(presale_days_7d)}天)")
+            history_tags.append(f"近7天未可售仍出单({int(presale_days_7d)}天)")
         if presale_days_14d > 0:
-            recent_tags.append(f"近14天未可售仍出单({int(presale_days_14d)}天)")
+            history_tags.append(f"近14天未可售仍出单({int(presale_days_14d)}天)")
         if presale_days > 0:
             history_tags.append(f"累计未可售仍出单({int(presale_days)}天)")
-            score += float(fs.weight_presale_order_days)
 
         # 3) 增量效率（7天）
         delta_spend = _safe_float(r.get("delta_spend", 0.0))
@@ -8242,6 +8605,83 @@ def build_asin_focus(
             recent_tags.append("库存=0仍投放")
             score += float(fs.weight_inventory_zero_still_spend)
 
+        # 6.1) 阶段化指标（新品/成熟期）
+        stage_tags: List[str] = []
+        stage_score = 0.0
+        stage_group = str(r.get("stage_group", "") or "").strip().lower()
+        max_stage_tags = int(getattr(stage_policy, "max_stage_tags", 3) or 3)
+
+        try:
+            if stage_group in {"launch", "growth", "new"}:
+                ctr = _safe_float(r.get("ad_ctr_recent_7d", 0.0))
+                cvr = _safe_float(r.get("ad_cvr_recent_7d", 0.0))
+                cpa = _safe_float(r.get("ad_cpa_order_recent_7d", 0.0))
+                impr = _safe_float(r.get("ad_impressions_recent_7d", 0.0))
+                clicks = _safe_float(r.get("ad_clicks_recent_7d", 0.0))
+                orders = _safe_float(r.get("ad_orders_recent_7d", 0.0))
+
+                median_ctr = stage_medians.get((stage_group, "ad_ctr_recent_7d"), 0.0)
+                if median_ctr <= 0:
+                    median_ctr = stage_medians.get(("new", "ad_ctr_recent_7d"), 0.0)
+                median_cvr = stage_medians.get((stage_group, "ad_cvr_recent_7d"), 0.0)
+                if median_cvr <= 0:
+                    median_cvr = stage_medians.get(("new", "ad_cvr_recent_7d"), 0.0)
+                median_cpa = stage_medians.get((stage_group, "ad_cpa_order_recent_7d"), 0.0)
+                if median_cpa <= 0:
+                    median_cpa = stage_medians.get(("new", "ad_cpa_order_recent_7d"), 0.0)
+
+                if (impr >= float(stage_policy.min_impressions_7d)) and (median_ctr > 0) and (ctr > 0) and (ctr < median_ctr * float(stage_policy.new_ctr_low_ratio)):
+                    stage_tags.append("新品CTR偏低")
+                    stage_score += float(stage_policy.weight_new_low_ctr)
+                if (clicks >= float(stage_policy.min_clicks_7d)) and (median_cvr > 0) and (cvr > 0) and (cvr < median_cvr * float(stage_policy.new_cvr_low_ratio)):
+                    stage_tags.append("新品转化偏低")
+                    stage_score += float(stage_policy.weight_new_low_cvr)
+                if (orders >= float(stage_policy.min_orders_7d)) and (median_cpa > 0) and (cpa > median_cpa * float(stage_policy.new_cpa_high_ratio)):
+                    stage_tags.append("新品CPA偏高")
+                    stage_score += float(stage_policy.weight_new_high_cpa)
+
+            elif stage_group == "mature":
+                cpa = _safe_float(r.get("ad_cpa_order_recent_7d", 0.0))
+                acos = _safe_float(r.get("ad_acos_recent_7d", 0.0))
+                orders = _safe_float(r.get("ad_orders_recent_7d", 0.0))
+                sales_recent = _safe_float(r.get("sales_recent_7d", 0.0))
+                ad_share_recent = _safe_float(r.get("ad_sales_share_recent_7d", 0.0))
+                ad_share_prev = _safe_float(r.get("ad_sales_share_prev_7d", 0.0))
+                spend_prev = _safe_float(r.get("ad_spend_prev_7d", 0.0))
+                spend_recent = _safe_float(r.get("ad_spend_recent_7d", 0.0))
+
+                median_cpa = stage_medians.get(("mature", "ad_cpa_order_recent_7d"), 0.0)
+                median_acos = stage_medians.get(("mature", "ad_acos_recent_7d"), 0.0)
+
+                if (orders >= float(stage_policy.min_orders_7d_mature)) and (median_cpa > 0) and (cpa > median_cpa * float(stage_policy.mature_cpa_high_ratio)):
+                    stage_tags.append("成熟CPA偏高")
+                    stage_score += float(stage_policy.weight_mature_high_cpa)
+                if (sales_recent >= float(stage_policy.min_sales_7d)) and (median_acos > 0) and (acos > median_acos * float(stage_policy.mature_acos_high_ratio)):
+                    stage_tags.append("成熟ACOS偏高")
+                    stage_score += float(stage_policy.weight_mature_high_acos)
+
+                if (sales_recent >= float(stage_policy.min_sales_7d)) and (abs(ad_share_recent - ad_share_prev) >= float(stage_policy.mature_ad_share_shift_abs)):
+                    stage_tags.append("广告占比波动")
+                    stage_score += float(stage_policy.weight_mature_ad_share_shift)
+
+                if (spend_prev > 0) and (abs(spend_recent - spend_prev) / max(spend_prev, 1e-9) >= float(stage_policy.mature_spend_shift_ratio)):
+                    stage_tags.append("广告投入波动")
+                    stage_score += float(stage_policy.weight_mature_spend_shift)
+        except Exception:
+            stage_tags = []
+            stage_score = 0.0
+
+        # 控制阶段标签数量
+        if stage_tags:
+            stage_tags = stage_tags[: max_stage_tags if max_stage_tags > 0 else 3]
+            score += float(stage_score)
+
+        # 把阶段标签补到“近期原因”里（最多 3 条）
+        if stage_tags:
+            for t in stage_tags:
+                if t not in recent_tags and len(recent_tags) < 3:
+                    recent_tags.append(t)
+
         # 去重并截断到 3 个标签
         uniq_recent = []
         for t in recent_tags:
@@ -8256,11 +8696,15 @@ def build_asin_focus(
 
         reasons.append(";".join(uniq_recent))
         history_reasons.append(";".join(uniq_history))
+        stage_reasons.append(";".join(stage_tags))
         scores.append(round(score, 2))
+        stage_scores.append(round(float(stage_score), 2))
 
     out["focus_score"] = scores
     out["focus_reasons"] = reasons
     out["focus_reasons_history"] = history_reasons
+    out["stage_focus_score"] = stage_scores
+    out["stage_focus_reasons"] = stage_reasons
 
     # 输出列控制（更偏“仪表盘表格”）
     cols = [
@@ -8270,6 +8714,7 @@ def build_asin_focus(
         "product_category",
         "cycle_id",
         "current_phase",
+        "stage_group",
         "prev_phase",
         "phase_change",
         "phase_change_days_ago",
@@ -8289,6 +8734,11 @@ def build_asin_focus(
         "sessions_recent_7d",
         "cvr_prev_7d",
         "cvr_recent_7d",
+        "ad_ctr_recent_7d",
+        "ad_cvr_recent_7d",
+        "ad_cpa_order_recent_7d",
+        "ad_acos_recent_7d",
+        "ad_sales_share_recent_7d",
         "organic_sales_prev_7d",
         "organic_sales_recent_7d",
         "organic_sales_share_prev_7d",
@@ -8313,6 +8763,8 @@ def build_asin_focus(
         "focus_score",
         "focus_reasons",
         "focus_reasons_history",
+        "stage_focus_score",
+        "stage_focus_reasons",
         # 主窗口（累计口径）
         "sales",
         "orders",
@@ -8323,6 +8775,9 @@ def build_asin_focus(
         "ad_spend",
         "ad_sales",
         "ad_orders",
+        "ad_ctr",
+        "ad_cvr",
+        "ad_cpa_order",
         "organic_sales",
         "organic_orders",
         "organic_sales_share",
@@ -8588,7 +9043,7 @@ def write_dashboard_md(
                 view = view[cols2].copy()
                 # 统一把换行/管道符清理掉，避免破坏表格
                 for c in cols2:
-                    view[c] = view[c].map(lambda x: str(x).replace("\n", " ").replace("|", "｜"))
+                    view[c] = view[c].map(lambda x, _c=c: _format_md_cell(_c, x))
                 header = "| " + " | ".join(cols2) + " |"
                 sep = "| " + " | ".join(["---"] * len(cols2)) + " |"
                 body = ["| " + " | ".join(row) + " |" for row in view.values.tolist()]
@@ -9129,6 +9584,105 @@ def write_dashboard_md(
         else:
             # 防御性兜底：至少给一个“下一步”
             lines.append("- （暂无显著告警；建议先看 Shop Alerts/Watchlists/Drivers）")
+
+        # ===== 阶段化指标区块（新品期 / 成熟期）=====
+        lines.append("")
+        lines.append("## 2) 阶段化指标（启动/成长/成熟）")
+        lines.append("")
+        lines.append("- 启动期/成长期：优先看 CTR/CVR/CPA（订单口径）与流量")
+        lines.append("- 成熟期：优先看 CPA/ACOS 与广告占比、花费稳定性")
+        lines.append("")
+
+        try:
+            af = asin_focus.copy() if isinstance(asin_focus, pd.DataFrame) else pd.DataFrame()
+            if not af.empty and "stage_group" in af.columns:
+                # 只取需要展示的少量列，避免第一屏信息过载
+                stage_map = {
+                    "asin": "ASIN",
+                    "product_name": "商品名",
+                    "product_category": "类目",
+                    "sessions_recent_7d": "Sessions(7d)",
+                    "ad_ctr_recent_7d": "广告CTR(7d)",
+                    "ad_cvr_recent_7d": "广告CVR(7d)",
+                    "ad_cpa_order_recent_7d": "CPA(订单,7d)",
+                    "ad_sales_share_recent_7d": "广告占比(7d)",
+                    "ad_acos_recent_7d": "广告ACOS(7d)",
+                    "ad_spend_recent_7d": "广告花费(7d)",
+                    "stage_focus_reasons": "阶段提示",
+                }
+
+                def _stage_table(df: pd.DataFrame, group_name: str, cols: List[str]) -> str:
+                    sub = df[df["stage_group"] == group_name].copy()
+                    if sub.empty:
+                        return ""
+                    # 排序：阶段分>focus_score（更贴近“阶段问题”）
+                    if "stage_focus_score" in sub.columns:
+                        sub = sub.sort_values(["stage_focus_score", "focus_score"], ascending=[False, False])
+                    elif "focus_score" in sub.columns:
+                        sub = sub.sort_values(["focus_score"], ascending=[False])
+                    sub = sub.head(5).copy()
+                    return _display_table(sub, cols, stage_map)
+
+                # 新品期 Top
+                lines.append("### 启动期 Top（launch）")
+                lines.append("")
+                launch_cols = [
+                    "asin",
+                    "product_name",
+                    "product_category",
+                    "sessions_recent_7d",
+                    "ad_ctr_recent_7d",
+                    "ad_cvr_recent_7d",
+                    "ad_cpa_order_recent_7d",
+                    "stage_focus_reasons",
+                ]
+                t_launch = _stage_table(af, "launch", launch_cols)
+                if t_launch:
+                    lines.append(t_launch)
+                else:
+                    lines.append("- （暂无）")
+
+                lines.append("")
+                lines.append("### 成长期 Top（growth）")
+                lines.append("")
+                growth_cols = [
+                    "asin",
+                    "product_name",
+                    "product_category",
+                    "sessions_recent_7d",
+                    "ad_ctr_recent_7d",
+                    "ad_cvr_recent_7d",
+                    "ad_cpa_order_recent_7d",
+                    "stage_focus_reasons",
+                ]
+                t_growth = _stage_table(af, "growth", growth_cols)
+                if t_growth:
+                    lines.append(t_growth)
+                else:
+                    lines.append("- （暂无）")
+
+                lines.append("")
+                lines.append("### 成熟期 Top（mature + stable）")
+                lines.append("")
+                mature_cols = [
+                    "asin",
+                    "product_name",
+                    "product_category",
+                    "ad_sales_share_recent_7d",
+                    "ad_acos_recent_7d",
+                    "ad_cpa_order_recent_7d",
+                    "ad_spend_recent_7d",
+                    "stage_focus_reasons",
+                ]
+                t_mature = _stage_table(af, "mature", mature_cols)
+                if t_mature:
+                    lines.append(t_mature)
+                else:
+                    lines.append("- （暂无）")
+            else:
+                lines.append("- （暂无阶段化指标数据）")
+        except Exception:
+            lines.append("- （阶段化指标生成失败）")
 
         # 本周行动清单：Top 3（每条必须包含：责任归属 + 关键证据 + 跳转链接）
         lines.append("")
@@ -10137,7 +10691,7 @@ def write_asin_drilldown_md(
                     cols2 = list(view.columns)[:8]
                 view = view[cols2].copy()
                 for c in cols2:
-                    view[c] = view[c].map(lambda x: str(x).replace("\n", " ").replace("|", "｜"))
+                    view[c] = view[c].map(lambda x, _c=c: _format_md_cell(_c, x))
                 header = "| " + " | ".join(cols2) + " |"
                 sep = "| " + " | ".join(["---"] * len(cols2)) + " |"
                 body = ["| " + " | ".join(row) + " |" for row in view.values.tolist()]
@@ -10510,7 +11064,7 @@ def write_category_drilldown_md(
                     cols2 = list(view.columns)[:8]
                 view = view[cols2].copy()
                 for c in cols2:
-                    view[c] = view[c].map(lambda x: str(x).replace("\n", " ").replace("|", "｜"))
+                    view[c] = view[c].map(lambda x, _c=c: _format_md_cell(_c, x))
                 header = "| " + " | ".join(cols2) + " |"
                 sep = "| " + " | ".join(["---"] * len(cols2)) + " |"
                 body = ["| " + " | ".join(row) + " |" for row in view.values.tolist()]
@@ -10830,7 +11384,7 @@ def write_phase_drilldown_md(
                     cols2 = list(view.columns)[:8]
                 view = view[cols2].copy()
                 for c in cols2:
-                    view[c] = view[c].map(lambda x: str(x).replace("\n", " ").replace("|", "｜"))
+                    view[c] = view[c].map(lambda x, _c=c: _format_md_cell(_c, x))
                 header = "| " + " | ".join(cols2) + " |"
                 sep = "| " + " | ".join(["---"] * len(cols2)) + " |"
                 body = ["| " + " | ".join(row) + " |" for row in view.values.tolist()]
@@ -11214,7 +11768,7 @@ def write_lifecycle_overview_md(
                     cols2 = list(view.columns)[:8]
                 view = view[cols2].copy()
                 for c in cols2:
-                    view[c] = view[c].map(lambda x: str(x).replace("\n", " ").replace("|", "｜"))
+                    view[c] = view[c].map(lambda x, _c=c: _format_md_cell(_c, x))
                 header = "| " + " | ".join(cols2) + " |"
                 sep = "| " + " | ".join(["---"] * len(cols2)) + " |"
                 body = ["| " + " | ".join(row) + " |" for row in view.values.tolist()]
@@ -12250,7 +12804,7 @@ def write_keyword_topics_drilldown_md(
                     cols2 = list(view.columns)[:8]
                 view = view[cols2].copy()
                 for c in cols2:
-                    view[c] = view[c].map(lambda x: str(x).replace("\n", " ").replace("|", "｜"))
+                    view[c] = view[c].map(lambda x, _c=c: _format_md_cell(_c, x))
                 header = "| " + " | ".join(cols2) + " |"
                 sep = "| " + " | ".join(["---"] * len(cols2)) + " |"
                 body = ["| " + " | ".join(row) + " |" for row in view.values.tolist()]

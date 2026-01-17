@@ -313,12 +313,17 @@ def _compare_recent_prev(ts: pd.DataFrame, end_date: dt.date, window_days: int) 
     delta_sales = float(r["sales"]) - float(p["sales"])
     delta_ad_spend = float(r["ad_spend"]) - float(p["ad_spend"])
     delta_ad_sales = float(r["ad_sales"]) - float(p["ad_sales"])
+    delta_ad_orders = float(r["ad_orders"]) - float(p["ad_orders"])
     delta_orders = float(r["orders"]) - float(p["orders"])
     delta_sessions = float(r["sessions"]) - float(p["sessions"])
     delta_ad_clicks = float(r["ad_clicks"]) - float(p["ad_clicks"])
+    delta_ad_impr = float(r["ad_impressions"]) - float(p["ad_impressions"])
     delta_cvr = float(r.get("cvr", 0.0) or 0.0) - float(p.get("cvr", 0.0) or 0.0)
+    delta_ad_ctr = float(r.get("ad_ctr", 0.0) or 0.0) - float(p.get("ad_ctr", 0.0) or 0.0)
+    delta_ad_cvr = float(r.get("ad_cvr", 0.0) or 0.0) - float(p.get("ad_cvr", 0.0) or 0.0)
     delta_organic_sales = float(r.get("organic_sales", 0.0) or 0.0) - float(p.get("organic_sales", 0.0) or 0.0)
     delta_organic_sales_share = float(r.get("organic_sales_share", 0.0) or 0.0) - float(p.get("organic_sales_share", 0.0) or 0.0)
+    delta_ad_sales_share = float(r.get("ad_sales_share", 0.0) or 0.0) - float(p.get("ad_sales_share", 0.0) or 0.0)
 
     return {
         "window_days": int(n),
@@ -344,6 +349,18 @@ def _compare_recent_prev(ts: pd.DataFrame, end_date: dt.date, window_days: int) 
         "organic_sales_share_recent": float(r.get("organic_sales_share", 0.0) or 0.0),
         "ad_clicks_prev": float(p["ad_clicks"]),
         "ad_clicks_recent": float(r["ad_clicks"]),
+        "ad_impressions_prev": float(p["ad_impressions"]),
+        "ad_impressions_recent": float(r["ad_impressions"]),
+        "ad_orders_prev": float(p["ad_orders"]),
+        "ad_orders_recent": float(r["ad_orders"]),
+        "ad_sales_prev": float(p["ad_sales"]),
+        "ad_sales_recent": float(r["ad_sales"]),
+        "ad_ctr_prev": float(p.get("ad_ctr", 0.0) or 0.0),
+        "ad_ctr_recent": float(r.get("ad_ctr", 0.0) or 0.0),
+        "ad_cvr_prev": float(p.get("ad_cvr", 0.0) or 0.0),
+        "ad_cvr_recent": float(r.get("ad_cvr", 0.0) or 0.0),
+        "ad_sales_share_prev": float(p.get("ad_sales_share", 0.0) or 0.0),
+        "ad_sales_share_recent": float(r.get("ad_sales_share", 0.0) or 0.0),
         # 断货相关（用于“近N天”口径的标签）
         "oos_with_ad_spend_days_prev": float(p.get("oos_with_ad_spend_days", 0.0) or 0.0),
         "oos_with_ad_spend_days_recent": float(r.get("oos_with_ad_spend_days", 0.0) or 0.0),
@@ -353,12 +370,18 @@ def _compare_recent_prev(ts: pd.DataFrame, end_date: dt.date, window_days: int) 
         "presale_order_days_recent": float(r.get("presale_order_days", 0.0) or 0.0),
         "delta_spend": float(delta_ad_spend),
         "delta_sales": float(delta_sales),
+        "delta_ad_sales": float(delta_ad_sales),
+        "delta_ad_orders": float(delta_ad_orders),
         "delta_orders": float(delta_orders),
         "delta_sessions": float(delta_sessions),
         "delta_ad_clicks": float(delta_ad_clicks),
+        "delta_ad_impressions": float(delta_ad_impr),
         "delta_cvr": float(delta_cvr),
+        "delta_ad_ctr": float(delta_ad_ctr),
+        "delta_ad_cvr": float(delta_ad_cvr),
         "delta_organic_sales": float(delta_organic_sales),
         "delta_organic_sales_share": float(delta_organic_sales_share),
+        "delta_ad_sales_share": float(delta_ad_sales_share),
         # 增量效率：给 2 个口径（总销售额口径 / 广告销售额口径），你后续可选用更合适的
         "marginal_tacos": safe_div(delta_ad_spend, delta_sales) if delta_sales != 0 else 0.0,
         "marginal_ad_acos": safe_div(delta_ad_spend, delta_ad_sales) if delta_ad_sales != 0 else 0.0,

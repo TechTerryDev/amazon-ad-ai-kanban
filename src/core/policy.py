@@ -128,6 +128,62 @@ class FocusScoringPolicy:
 
 
 @dataclass(frozen=True)
+class StageScoringPolicy:
+    """
+    阶段化指标与权重（新品期/成熟期/衰退期）。
+
+    说明：
+    - 用于把“指标关注点”按阶段拆开（新品重流量效率；成熟重稳定与成本）。
+    - 以“阶段内中位数”做相对判断，减少绝对阈值误判。
+    """
+
+    # 阶段划分（可配置）
+    # 说明：launch/growth 可单独拆分；未配置时会回退到 new_phases 兼容旧配置。
+    launch_phases: List[str] = field(default_factory=lambda: ["launch"])
+    growth_phases: List[str] = field(default_factory=lambda: ["growth"])
+    new_phases: List[str] = field(default_factory=lambda: ["launch", "growth"])
+    mature_phases: List[str] = field(default_factory=lambda: ["mature", "stable"])
+    decline_phases: List[str] = field(default_factory=lambda: ["decline", "inactive"])
+
+    # 中位数计算最小样本（过小则不触发阶段对比）
+    median_min_samples: int = 8
+
+    # 新品期样本量门槛（避免小样本噪声）
+    min_impressions_7d: float = 200.0
+    min_clicks_7d: float = 30.0
+    min_orders_7d: float = 3.0
+
+    # 成熟期样本量门槛
+    min_sales_7d: float = 50.0
+    min_orders_7d_mature: float = 5.0
+
+    # 新品期相对阈值（相对阶段中位数）
+    new_ctr_low_ratio: float = 0.7
+    new_cvr_low_ratio: float = 0.7
+    new_cpa_high_ratio: float = 1.3
+
+    # 成熟期相对阈值
+    mature_cpa_high_ratio: float = 1.2
+    mature_acos_high_ratio: float = 1.2
+
+    # 成熟期稳定性阈值（绝对变化）
+    mature_ad_share_shift_abs: float = 0.15
+    mature_spend_shift_ratio: float = 0.3
+
+    # 权重（用于阶段化加分）
+    weight_new_low_ctr: float = 6.0
+    weight_new_low_cvr: float = 6.0
+    weight_new_high_cpa: float = 8.0
+    weight_mature_high_cpa: float = 6.0
+    weight_mature_high_acos: float = 6.0
+    weight_mature_ad_share_shift: float = 5.0
+    weight_mature_spend_shift: float = 5.0
+
+    # 展示上最多保留多少条阶段标签
+    max_stage_tags: int = 3
+
+
+@dataclass(frozen=True)
 class ActionScoringPolicy:
     """
     Action Board 的优先级打分规则（可配置）。
@@ -322,6 +378,7 @@ class OpsPolicy:
     dashboard_top_actions: int = 60
     dashboard_scale_window: ScaleWindowPolicy = field(default_factory=ScaleWindowPolicy)
     dashboard_focus_scoring: FocusScoringPolicy = field(default_factory=FocusScoringPolicy)
+    dashboard_stage_scoring: StageScoringPolicy = field(default_factory=StageScoringPolicy)
     dashboard_action_scoring: ActionScoringPolicy = field(default_factory=ActionScoringPolicy)
     dashboard_budget_transfer_opportunity: BudgetTransferOpportunityPolicy = field(default_factory=BudgetTransferOpportunityPolicy)
     dashboard_unlock_tasks: UnlockTasksPolicy = field(default_factory=UnlockTasksPolicy)
@@ -567,6 +624,97 @@ def load_ops_policy(path: Path) -> OpsPolicy:
             ),
         )
 
+        # 阶段化指标权重（可配置；没有则用默认）
+        ss_base = base.dashboard_stage_scoring
+        ss_data = dash.get("stage_scoring") if isinstance(dash.get("stage_scoring"), dict) else {}
+
+        def _parse_phase_list(v: object, default: List[str]) -> List[str]:
+            try:
+                if not isinstance(v, list):
+                    return list(default)
+                out: List[str] = []
+                for x in v:
+                    s = str(x or "").strip().lower()
+                    if s:
+                        out.append(s)
+                return out if out else list(default)
+            except Exception:
+                return list(default)
+
+        stage_scoring = StageScoringPolicy(
+            launch_phases=_parse_phase_list(ss_data.get("launch_phases"), ss_base.launch_phases),
+            growth_phases=_parse_phase_list(ss_data.get("growth_phases"), ss_base.growth_phases),
+            new_phases=_parse_phase_list(ss_data.get("new_phases"), ss_base.new_phases),
+            mature_phases=_parse_phase_list(ss_data.get("mature_phases"), ss_base.mature_phases),
+            decline_phases=_parse_phase_list(ss_data.get("decline_phases"), ss_base.decline_phases),
+            median_min_samples=max(
+                1,
+                _to_int(ss_data.get("median_min_samples"), ss_base.median_min_samples),
+            ),
+            min_impressions_7d=max(
+                0.0,
+                _to_float(ss_data.get("min_impressions_7d"), ss_base.min_impressions_7d),
+            ),
+            min_clicks_7d=max(
+                0.0,
+                _to_float(ss_data.get("min_clicks_7d"), ss_base.min_clicks_7d),
+            ),
+            min_orders_7d=max(
+                0.0,
+                _to_float(ss_data.get("min_orders_7d"), ss_base.min_orders_7d),
+            ),
+            min_sales_7d=max(
+                0.0,
+                _to_float(ss_data.get("min_sales_7d"), ss_base.min_sales_7d),
+            ),
+            min_orders_7d_mature=max(
+                0.0,
+                _to_float(ss_data.get("min_orders_7d_mature"), ss_base.min_orders_7d_mature),
+            ),
+            new_ctr_low_ratio=max(
+                0.0,
+                _to_float(ss_data.get("new_ctr_low_ratio"), ss_base.new_ctr_low_ratio),
+            ),
+            new_cvr_low_ratio=max(
+                0.0,
+                _to_float(ss_data.get("new_cvr_low_ratio"), ss_base.new_cvr_low_ratio),
+            ),
+            new_cpa_high_ratio=max(
+                0.0,
+                _to_float(ss_data.get("new_cpa_high_ratio"), ss_base.new_cpa_high_ratio),
+            ),
+            mature_cpa_high_ratio=max(
+                0.0,
+                _to_float(ss_data.get("mature_cpa_high_ratio"), ss_base.mature_cpa_high_ratio),
+            ),
+            mature_acos_high_ratio=max(
+                0.0,
+                _to_float(ss_data.get("mature_acos_high_ratio"), ss_base.mature_acos_high_ratio),
+            ),
+            mature_ad_share_shift_abs=max(
+                0.0,
+                _to_float(ss_data.get("mature_ad_share_shift_abs"), ss_base.mature_ad_share_shift_abs),
+            ),
+            mature_spend_shift_ratio=max(
+                0.0,
+                _to_float(ss_data.get("mature_spend_shift_ratio"), ss_base.mature_spend_shift_ratio),
+            ),
+            weight_new_low_ctr=_to_float(ss_data.get("weight_new_low_ctr"), ss_base.weight_new_low_ctr),
+            weight_new_low_cvr=_to_float(ss_data.get("weight_new_low_cvr"), ss_base.weight_new_low_cvr),
+            weight_new_high_cpa=_to_float(ss_data.get("weight_new_high_cpa"), ss_base.weight_new_high_cpa),
+            weight_mature_high_cpa=_to_float(ss_data.get("weight_mature_high_cpa"), ss_base.weight_mature_high_cpa),
+            weight_mature_high_acos=_to_float(ss_data.get("weight_mature_high_acos"), ss_base.weight_mature_high_acos),
+            weight_mature_ad_share_shift=_to_float(
+                ss_data.get("weight_mature_ad_share_shift"),
+                ss_base.weight_mature_ad_share_shift,
+            ),
+            weight_mature_spend_shift=_to_float(
+                ss_data.get("weight_mature_spend_shift"),
+                ss_base.weight_mature_spend_shift,
+            ),
+            max_stage_tags=max(1, _to_int(ss_data.get("max_stage_tags"), ss_base.max_stage_tags)),
+        )
+
         # Action Board 优先级（可配置；没有则用默认）
         as_base = base.dashboard_action_scoring
         as_data = dash.get("action_scoring") if isinstance(dash.get("action_scoring"), dict) else {}
@@ -754,6 +902,7 @@ def load_ops_policy(path: Path) -> OpsPolicy:
             dashboard_top_actions=dash_top_actions,
             dashboard_scale_window=scale_window,
             dashboard_focus_scoring=fs,
+            dashboard_stage_scoring=stage_scoring,
             dashboard_action_scoring=action_scoring,
             dashboard_budget_transfer_opportunity=budget_transfer_opportunity,
             dashboard_unlock_tasks=unlock_tasks_policy,
@@ -925,6 +1074,7 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
             "top_actions",
             "scale_window",
             "focus_scoring",
+            "stage_scoring",
             "action_scoring",
             "budget_transfer_opportunity",
             "unlock_tasks",
@@ -976,6 +1126,28 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
         min_v=-1.0,
         max_v=1.0,
     )
+
+    # ===== dashboard.stage_scoring =====
+    ss = dash.get("stage_scoring")
+    if ss is not None and not isinstance(ss, dict):
+        warnings.append("类型不匹配：`dashboard.stage_scoring` 期望为 object/dict；将使用默认策略。")
+        ss = {}
+    ss = ss if isinstance(ss, dict) else {}
+    warn_unknown_keys(ss, {f.name for f in fields(StageScoringPolicy)}, "dashboard.stage_scoring")
+    check_int(ss, "median_min_samples", base.dashboard_stage_scoring.median_min_samples, "dashboard.stage_scoring", min_v=1)
+    check_float(ss, "min_impressions_7d", base.dashboard_stage_scoring.min_impressions_7d, "dashboard.stage_scoring", min_v=0.0)
+    check_float(ss, "min_clicks_7d", base.dashboard_stage_scoring.min_clicks_7d, "dashboard.stage_scoring", min_v=0.0)
+    check_float(ss, "min_orders_7d", base.dashboard_stage_scoring.min_orders_7d, "dashboard.stage_scoring", min_v=0.0)
+    check_float(ss, "min_sales_7d", base.dashboard_stage_scoring.min_sales_7d, "dashboard.stage_scoring", min_v=0.0)
+    check_float(ss, "min_orders_7d_mature", base.dashboard_stage_scoring.min_orders_7d_mature, "dashboard.stage_scoring", min_v=0.0)
+    check_float(ss, "new_ctr_low_ratio", base.dashboard_stage_scoring.new_ctr_low_ratio, "dashboard.stage_scoring", min_v=0.0)
+    check_float(ss, "new_cvr_low_ratio", base.dashboard_stage_scoring.new_cvr_low_ratio, "dashboard.stage_scoring", min_v=0.0)
+    check_float(ss, "new_cpa_high_ratio", base.dashboard_stage_scoring.new_cpa_high_ratio, "dashboard.stage_scoring", min_v=0.0)
+    check_float(ss, "mature_cpa_high_ratio", base.dashboard_stage_scoring.mature_cpa_high_ratio, "dashboard.stage_scoring", min_v=0.0)
+    check_float(ss, "mature_acos_high_ratio", base.dashboard_stage_scoring.mature_acos_high_ratio, "dashboard.stage_scoring", min_v=0.0)
+    check_float(ss, "mature_ad_share_shift_abs", base.dashboard_stage_scoring.mature_ad_share_shift_abs, "dashboard.stage_scoring", min_v=0.0, max_v=1.0)
+    check_float(ss, "mature_spend_shift_ratio", base.dashboard_stage_scoring.mature_spend_shift_ratio, "dashboard.stage_scoring", min_v=0.0)
+    check_int(ss, "max_stage_tags", base.dashboard_stage_scoring.max_stage_tags, "dashboard.stage_scoring", min_v=1, max_v=10)
 
     # ===== dashboard.action_scoring =====
     ac = dash.get("action_scoring")
@@ -1104,6 +1276,7 @@ def ops_policy_effective_to_dict(policy: OpsPolicy) -> Dict[str, object]:
                 "top_actions": int(policy.dashboard_top_actions),
                 "scale_window": asdict(policy.dashboard_scale_window),
                 "focus_scoring": asdict(policy.dashboard_focus_scoring),
+                "stage_scoring": asdict(policy.dashboard_stage_scoring),
                 "action_scoring": asdict(policy.dashboard_action_scoring),
                 "budget_transfer_opportunity": asdict(policy.dashboard_budget_transfer_opportunity),
                 "unlock_tasks": asdict(policy.dashboard_unlock_tasks),
@@ -1534,6 +1707,97 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
             ),
         )
 
+        # 阶段化指标权重（可配置；没有则用默认）
+        ss_base = base.dashboard_stage_scoring
+        ss_data = dash.get("stage_scoring") if isinstance(dash.get("stage_scoring"), dict) else {}
+
+        def _parse_phase_list(v: object, default: List[str]) -> List[str]:
+            try:
+                if not isinstance(v, list):
+                    return list(default)
+                out: List[str] = []
+                for x in v:
+                    s = str(x or "").strip().lower()
+                    if s:
+                        out.append(s)
+                return out if out else list(default)
+            except Exception:
+                return list(default)
+
+        stage_scoring = StageScoringPolicy(
+            launch_phases=_parse_phase_list(ss_data.get("launch_phases"), ss_base.launch_phases),
+            growth_phases=_parse_phase_list(ss_data.get("growth_phases"), ss_base.growth_phases),
+            new_phases=_parse_phase_list(ss_data.get("new_phases"), ss_base.new_phases),
+            mature_phases=_parse_phase_list(ss_data.get("mature_phases"), ss_base.mature_phases),
+            decline_phases=_parse_phase_list(ss_data.get("decline_phases"), ss_base.decline_phases),
+            median_min_samples=max(
+                1,
+                _to_int(ss_data.get("median_min_samples"), ss_base.median_min_samples),
+            ),
+            min_impressions_7d=max(
+                0.0,
+                _to_float(ss_data.get("min_impressions_7d"), ss_base.min_impressions_7d),
+            ),
+            min_clicks_7d=max(
+                0.0,
+                _to_float(ss_data.get("min_clicks_7d"), ss_base.min_clicks_7d),
+            ),
+            min_orders_7d=max(
+                0.0,
+                _to_float(ss_data.get("min_orders_7d"), ss_base.min_orders_7d),
+            ),
+            min_sales_7d=max(
+                0.0,
+                _to_float(ss_data.get("min_sales_7d"), ss_base.min_sales_7d),
+            ),
+            min_orders_7d_mature=max(
+                0.0,
+                _to_float(ss_data.get("min_orders_7d_mature"), ss_base.min_orders_7d_mature),
+            ),
+            new_ctr_low_ratio=max(
+                0.0,
+                _to_float(ss_data.get("new_ctr_low_ratio"), ss_base.new_ctr_low_ratio),
+            ),
+            new_cvr_low_ratio=max(
+                0.0,
+                _to_float(ss_data.get("new_cvr_low_ratio"), ss_base.new_cvr_low_ratio),
+            ),
+            new_cpa_high_ratio=max(
+                0.0,
+                _to_float(ss_data.get("new_cpa_high_ratio"), ss_base.new_cpa_high_ratio),
+            ),
+            mature_cpa_high_ratio=max(
+                0.0,
+                _to_float(ss_data.get("mature_cpa_high_ratio"), ss_base.mature_cpa_high_ratio),
+            ),
+            mature_acos_high_ratio=max(
+                0.0,
+                _to_float(ss_data.get("mature_acos_high_ratio"), ss_base.mature_acos_high_ratio),
+            ),
+            mature_ad_share_shift_abs=max(
+                0.0,
+                _to_float(ss_data.get("mature_ad_share_shift_abs"), ss_base.mature_ad_share_shift_abs),
+            ),
+            mature_spend_shift_ratio=max(
+                0.0,
+                _to_float(ss_data.get("mature_spend_shift_ratio"), ss_base.mature_spend_shift_ratio),
+            ),
+            weight_new_low_ctr=_to_float(ss_data.get("weight_new_low_ctr"), ss_base.weight_new_low_ctr),
+            weight_new_low_cvr=_to_float(ss_data.get("weight_new_low_cvr"), ss_base.weight_new_low_cvr),
+            weight_new_high_cpa=_to_float(ss_data.get("weight_new_high_cpa"), ss_base.weight_new_high_cpa),
+            weight_mature_high_cpa=_to_float(ss_data.get("weight_mature_high_cpa"), ss_base.weight_mature_high_cpa),
+            weight_mature_high_acos=_to_float(ss_data.get("weight_mature_high_acos"), ss_base.weight_mature_high_acos),
+            weight_mature_ad_share_shift=_to_float(
+                ss_data.get("weight_mature_ad_share_shift"),
+                ss_base.weight_mature_ad_share_shift,
+            ),
+            weight_mature_spend_shift=_to_float(
+                ss_data.get("weight_mature_spend_shift"),
+                ss_base.weight_mature_spend_shift,
+            ),
+            max_stage_tags=max(1, _to_int(ss_data.get("max_stage_tags"), ss_base.max_stage_tags)),
+        )
+
         # Action Board 优先级（可配置；没有则用默认）
         as_base = base.dashboard_action_scoring
         as_data = dash.get("action_scoring") if isinstance(dash.get("action_scoring"), dict) else {}
@@ -1721,6 +1985,7 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
             dashboard_top_actions=dash_top_actions,
             dashboard_scale_window=scale_window,
             dashboard_focus_scoring=fs,
+            dashboard_stage_scoring=stage_scoring,
             dashboard_action_scoring=action_scoring,
             dashboard_budget_transfer_opportunity=budget_transfer_opportunity,
             dashboard_unlock_tasks=unlock_tasks_policy,
