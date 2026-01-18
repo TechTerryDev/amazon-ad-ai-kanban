@@ -128,6 +128,36 @@ class FocusScoringPolicy:
 
 
 @dataclass(frozen=True)
+class InventorySigmoidPolicy:
+    """
+    库存调速（Sigmoid）建议：仅用于“建议/提示”，不直接改价与不影响排序。
+    """
+
+    enabled: bool = True
+    # DoS 口径：默认使用 inventory_cover_days_7d
+    optimal_cover_days: float = 45.0
+    steepness: float = 0.1
+    min_modifier: float = 0.5
+    max_modifier: float = 1.5
+    # 只有当 |modifier-1| >= 该值时才输出建议
+    min_change_ratio: float = 0.1
+    # 只对仍在投放（有花费）者给出建议
+    min_ad_spend_roll: float = 10.0
+
+
+@dataclass(frozen=True)
+class ProfitGuardPolicy:
+    """
+    利润护栏（Break-even）：基于毛利率与目标净利率计算安全 ACOS/CPC。
+    """
+
+    enabled: bool = True
+    target_net_margin: float = 0.05
+    min_sales_7d: float = 50.0
+    min_ad_spend_roll: float = 10.0
+
+
+@dataclass(frozen=True)
 class StageScoringPolicy:
     """
     阶段化指标与权重（新品期/成熟期/衰退期）。
@@ -376,10 +406,14 @@ class OpsPolicy:
     # dashboard（聚焦层）
     dashboard_top_asins: int = 50
     dashboard_top_actions: int = 60
+    # compare 窗口忽略最近 N 天（默认 0=不忽略）
+    dashboard_compare_ignore_last_days: int = 0
     dashboard_scale_window: ScaleWindowPolicy = field(default_factory=ScaleWindowPolicy)
     dashboard_focus_scoring: FocusScoringPolicy = field(default_factory=FocusScoringPolicy)
     dashboard_stage_scoring: StageScoringPolicy = field(default_factory=StageScoringPolicy)
     dashboard_action_scoring: ActionScoringPolicy = field(default_factory=ActionScoringPolicy)
+    dashboard_inventory_sigmoid: InventorySigmoidPolicy = field(default_factory=InventorySigmoidPolicy)
+    dashboard_profit_guard: ProfitGuardPolicy = field(default_factory=ProfitGuardPolicy)
     dashboard_budget_transfer_opportunity: BudgetTransferOpportunityPolicy = field(default_factory=BudgetTransferOpportunityPolicy)
     dashboard_unlock_tasks: UnlockTasksPolicy = field(default_factory=UnlockTasksPolicy)
     dashboard_shop_alerts: ShopAlertsPolicy = field(default_factory=ShopAlertsPolicy)
@@ -486,6 +520,8 @@ def load_ops_policy(path: Path) -> OpsPolicy:
 
         dash_top_asins = max(1, _to_int(dash.get("top_asins"), base.dashboard_top_asins))
         dash_top_actions = max(1, _to_int(dash.get("top_actions"), base.dashboard_top_actions))
+        dash_ignore_last_days = max(0, _to_int(dash.get("compare_ignore_last_days"), base.dashboard_compare_ignore_last_days))
+        dash_ignore_last_days = max(0, _to_int(dash.get("compare_ignore_last_days"), base.dashboard_compare_ignore_last_days))
 
         # “可放量窗口”阈值（可配置；没有则用默认）
         sw_base = base.dashboard_scale_window
@@ -755,6 +791,62 @@ def load_ops_policy(path: Path) -> OpsPolicy:
             ),
         )
 
+        # 库存调速（Sigmoid）建议（只用于提示）
+        sig_base = base.dashboard_inventory_sigmoid
+        sig_data = dash.get("inventory_sigmoid") if isinstance(dash.get("inventory_sigmoid"), dict) else {}
+        sig_min = max(0.0, _to_float(sig_data.get("min_modifier"), sig_base.min_modifier))
+        sig_max = max(sig_min, _to_float(sig_data.get("max_modifier"), sig_base.max_modifier))
+        inventory_sigmoid = InventorySigmoidPolicy(
+            enabled=_to_bool(sig_data.get("enabled"), sig_base.enabled),
+            optimal_cover_days=max(0.0, _to_float(sig_data.get("optimal_cover_days"), sig_base.optimal_cover_days)),
+            steepness=max(0.0, _to_float(sig_data.get("steepness"), sig_base.steepness)),
+            min_modifier=sig_min,
+            max_modifier=sig_max,
+            min_change_ratio=max(0.0, _to_float(sig_data.get("min_change_ratio"), sig_base.min_change_ratio)),
+            min_ad_spend_roll=max(0.0, _to_float(sig_data.get("min_ad_spend_roll"), sig_base.min_ad_spend_roll)),
+        )
+
+        # 利润护栏（Break-even）
+        pg_base = base.dashboard_profit_guard
+        pg_data = dash.get("profit_guard") if isinstance(dash.get("profit_guard"), dict) else {}
+        profit_guard = ProfitGuardPolicy(
+            enabled=_to_bool(pg_data.get("enabled"), pg_base.enabled),
+            target_net_margin=max(
+                -1.0,
+                min(1.0, _to_float(pg_data.get("target_net_margin"), pg_base.target_net_margin)),
+            ),
+            min_sales_7d=max(0.0, _to_float(pg_data.get("min_sales_7d"), pg_base.min_sales_7d)),
+            min_ad_spend_roll=max(0.0, _to_float(pg_data.get("min_ad_spend_roll"), pg_base.min_ad_spend_roll)),
+        )
+
+        # 库存调速（Sigmoid）建议（只用于提示）
+        sig_base = base.dashboard_inventory_sigmoid
+        sig_data = dash.get("inventory_sigmoid") if isinstance(dash.get("inventory_sigmoid"), dict) else {}
+        sig_min = max(0.0, _to_float(sig_data.get("min_modifier"), sig_base.min_modifier))
+        sig_max = max(sig_min, _to_float(sig_data.get("max_modifier"), sig_base.max_modifier))
+        inventory_sigmoid = InventorySigmoidPolicy(
+            enabled=_to_bool(sig_data.get("enabled"), sig_base.enabled),
+            optimal_cover_days=max(0.0, _to_float(sig_data.get("optimal_cover_days"), sig_base.optimal_cover_days)),
+            steepness=max(0.0, _to_float(sig_data.get("steepness"), sig_base.steepness)),
+            min_modifier=sig_min,
+            max_modifier=sig_max,
+            min_change_ratio=max(0.0, _to_float(sig_data.get("min_change_ratio"), sig_base.min_change_ratio)),
+            min_ad_spend_roll=max(0.0, _to_float(sig_data.get("min_ad_spend_roll"), sig_base.min_ad_spend_roll)),
+        )
+
+        # 利润护栏（Break-even）
+        pg_base = base.dashboard_profit_guard
+        pg_data = dash.get("profit_guard") if isinstance(dash.get("profit_guard"), dict) else {}
+        profit_guard = ProfitGuardPolicy(
+            enabled=_to_bool(pg_data.get("enabled"), pg_base.enabled),
+            target_net_margin=max(
+                -1.0,
+                min(1.0, _to_float(pg_data.get("target_net_margin"), pg_base.target_net_margin)),
+            ),
+            min_sales_7d=max(0.0, _to_float(pg_data.get("min_sales_7d"), pg_base.min_sales_7d)),
+            min_ad_spend_roll=max(0.0, _to_float(pg_data.get("min_ad_spend_roll"), pg_base.min_ad_spend_roll)),
+        )
+
         # 机会池 -> 预算迁移（可配置；没有则用默认）
         bto_base = base.dashboard_budget_transfer_opportunity
         bto_data = dash.get("budget_transfer_opportunity") if isinstance(dash.get("budget_transfer_opportunity"), dict) else {}
@@ -900,10 +992,13 @@ def load_ops_policy(path: Path) -> OpsPolicy:
             phase_acos_multiplier=mult2,
             dashboard_top_asins=dash_top_asins,
             dashboard_top_actions=dash_top_actions,
+            dashboard_compare_ignore_last_days=dash_ignore_last_days,
             dashboard_scale_window=scale_window,
             dashboard_focus_scoring=fs,
             dashboard_stage_scoring=stage_scoring,
             dashboard_action_scoring=action_scoring,
+            dashboard_inventory_sigmoid=inventory_sigmoid,
+            dashboard_profit_guard=profit_guard,
             dashboard_budget_transfer_opportunity=budget_transfer_opportunity,
             dashboard_unlock_tasks=unlock_tasks_policy,
             dashboard_shop_alerts=shop_alerts_policy,
@@ -1072,10 +1167,13 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
         {
             "top_asins",
             "top_actions",
+            "compare_ignore_last_days",
             "scale_window",
             "focus_scoring",
             "stage_scoring",
             "action_scoring",
+            "inventory_sigmoid",
+            "profit_guard",
             "budget_transfer_opportunity",
             "unlock_tasks",
             "shop_alerts",
@@ -1085,6 +1183,7 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
     )
     check_int(dash, "top_asins", base.dashboard_top_asins, "dashboard", min_v=1)
     check_int(dash, "top_actions", base.dashboard_top_actions, "dashboard", min_v=1)
+    check_int(dash, "compare_ignore_last_days", base.dashboard_compare_ignore_last_days, "dashboard", min_v=0, max_v=14)
 
     # ===== dashboard.scale_window =====
     sw = dash.get("scale_window")
@@ -1148,6 +1247,33 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
     check_float(ss, "mature_ad_share_shift_abs", base.dashboard_stage_scoring.mature_ad_share_shift_abs, "dashboard.stage_scoring", min_v=0.0, max_v=1.0)
     check_float(ss, "mature_spend_shift_ratio", base.dashboard_stage_scoring.mature_spend_shift_ratio, "dashboard.stage_scoring", min_v=0.0)
     check_int(ss, "max_stage_tags", base.dashboard_stage_scoring.max_stage_tags, "dashboard.stage_scoring", min_v=1, max_v=10)
+
+    # ===== dashboard.inventory_sigmoid =====
+    sig = dash.get("inventory_sigmoid")
+    if sig is not None and not isinstance(sig, dict):
+        warnings.append("类型不匹配：`dashboard.inventory_sigmoid` 期望为 object/dict；将使用默认策略。")
+        sig = {}
+    sig = sig if isinstance(sig, dict) else {}
+    warn_unknown_keys(sig, {f.name for f in fields(InventorySigmoidPolicy)}, "dashboard.inventory_sigmoid")
+    check_bool(sig, "enabled", base.dashboard_inventory_sigmoid.enabled, "dashboard.inventory_sigmoid")
+    check_float(sig, "optimal_cover_days", base.dashboard_inventory_sigmoid.optimal_cover_days, "dashboard.inventory_sigmoid", min_v=0.0)
+    check_float(sig, "steepness", base.dashboard_inventory_sigmoid.steepness, "dashboard.inventory_sigmoid", min_v=0.0)
+    check_float(sig, "min_modifier", base.dashboard_inventory_sigmoid.min_modifier, "dashboard.inventory_sigmoid", min_v=0.0)
+    check_float(sig, "max_modifier", base.dashboard_inventory_sigmoid.max_modifier, "dashboard.inventory_sigmoid", min_v=0.0)
+    check_float(sig, "min_change_ratio", base.dashboard_inventory_sigmoid.min_change_ratio, "dashboard.inventory_sigmoid", min_v=0.0)
+    check_float(sig, "min_ad_spend_roll", base.dashboard_inventory_sigmoid.min_ad_spend_roll, "dashboard.inventory_sigmoid", min_v=0.0)
+
+    # ===== dashboard.profit_guard =====
+    pg = dash.get("profit_guard")
+    if pg is not None and not isinstance(pg, dict):
+        warnings.append("类型不匹配：`dashboard.profit_guard` 期望为 object/dict；将使用默认策略。")
+        pg = {}
+    pg = pg if isinstance(pg, dict) else {}
+    warn_unknown_keys(pg, {f.name for f in fields(ProfitGuardPolicy)}, "dashboard.profit_guard")
+    check_bool(pg, "enabled", base.dashboard_profit_guard.enabled, "dashboard.profit_guard")
+    check_float(pg, "target_net_margin", base.dashboard_profit_guard.target_net_margin, "dashboard.profit_guard", min_v=-1.0, max_v=1.0)
+    check_float(pg, "min_sales_7d", base.dashboard_profit_guard.min_sales_7d, "dashboard.profit_guard", min_v=0.0)
+    check_float(pg, "min_ad_spend_roll", base.dashboard_profit_guard.min_ad_spend_roll, "dashboard.profit_guard", min_v=0.0)
 
     # ===== dashboard.action_scoring =====
     ac = dash.get("action_scoring")
@@ -1274,10 +1400,13 @@ def ops_policy_effective_to_dict(policy: OpsPolicy) -> Dict[str, object]:
             "dashboard": {
                 "top_asins": int(policy.dashboard_top_asins),
                 "top_actions": int(policy.dashboard_top_actions),
+                "compare_ignore_last_days": int(policy.dashboard_compare_ignore_last_days),
                 "scale_window": asdict(policy.dashboard_scale_window),
                 "focus_scoring": asdict(policy.dashboard_focus_scoring),
                 "stage_scoring": asdict(policy.dashboard_stage_scoring),
                 "action_scoring": asdict(policy.dashboard_action_scoring),
+                "inventory_sigmoid": asdict(policy.dashboard_inventory_sigmoid),
+                "profit_guard": asdict(policy.dashboard_profit_guard),
                 "budget_transfer_opportunity": asdict(policy.dashboard_budget_transfer_opportunity),
                 "unlock_tasks": asdict(policy.dashboard_unlock_tasks),
                 "shop_alerts": {

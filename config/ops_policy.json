@@ -30,6 +30,8 @@
     "_comment": "仪表盘聚焦层参数：决定 dashboard/*.csv 与 reports/dashboard.md 的“抓重点”口径。建议优先调：scale_window（机会池）+ action_scoring（动作排序）+ focus_scoring（ASIN优先级）。",
     "top_asins": 50,
     "top_actions": 60,
+    "_comment_compare_ignore_last_days": "compare 窗口忽略最近 N 天（默认 0=不忽略，建议 1~2 用于规避归因延迟噪声）。",
+    "compare_ignore_last_days": 1,
     "budget_transfer_opportunity": {
       "_comment": "机会池→预算迁移联动：当本期 profit-based 预算迁移没有 scale 侧（预算只能回收/RESERVE）时，用机会池把回收预算迁移到“更可能承接机会ASIN”的 Campaign。金额为估算值（基于本期花费 proxy），执行时请结合实际预算/花费节奏校准。",
       "enabled": true,
@@ -197,6 +199,25 @@
       "weight_mature_ad_share_shift": 5.0,
       "weight_mature_spend_shift": 5.0,
       "max_stage_tags": 3
+    },
+    "inventory_sigmoid": {
+      "_comment": "库存调速建议（Sigmoid）：只给建议，不影响排序/不自动执行。DoS 使用 inventory_cover_days_7d。",
+      "enabled": true,
+      "optimal_cover_days": 45.0,
+      "steepness": 0.1,
+      "min_modifier": 0.5,
+      "max_modifier": 1.5,
+      "_comment_min_change_ratio": "只有 |modifier-1|>=该值 才输出建议，避免频繁小幅提示。",
+      "min_change_ratio": 0.1,
+      "_comment_min_ad_spend_roll": "只对仍在投放（ad_spend_roll>=阈值）的 ASIN 输出建议。",
+      "min_ad_spend_roll": 10.0
+    },
+    "profit_guard": {
+      "_comment": "利润护栏（Break-even）：基于毛利率与目标净利率计算安全 ACOS/CPC。",
+      "enabled": true,
+      "target_net_margin": 0.05,
+      "min_sales_7d": 50.0,
+      "min_ad_spend_roll": 10.0
     },
     "action_scoring": {
       "_comment": "Action Board 动作排序：把 priority(P0/P1/P2) + 证据花费 + ASIN重点度 + 弱关联可信度(asin_hint_confidence) + 阻断信息融合成 action_priority_score。你调这个通常是在“动作太多/太杂/不可信”时。",

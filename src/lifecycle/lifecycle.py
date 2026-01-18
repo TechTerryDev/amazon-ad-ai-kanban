@@ -292,14 +292,16 @@ def _sum_window(df: pd.DataFrame) -> Dict[str, float]:
     }
 
 
-def _compare_recent_prev(ts: pd.DataFrame, end_date: dt.date, window_days: int) -> Dict[str, object]:
+def _compare_recent_prev(ts: pd.DataFrame, end_date: dt.date, window_days: int, ignore_last_days: int = 0) -> Dict[str, object]:
     """
     最近N天 vs 前N天：输出一个对比行（更符合“动态日期范围”，不是逐日标签）。
     """
     n = int(window_days or 0)
     if n <= 0 or ts is None or ts.empty or CAN.date not in ts.columns:
         return {}
-    d_end = end_date
+    d_end = end_date - dt.timedelta(days=max(0, int(ignore_last_days or 0)))
+    if d_end < end_date and d_end < (end_date - dt.timedelta(days=n)):
+        return {}
     recent_start = d_end - dt.timedelta(days=n - 1)
     prev_end = recent_start - dt.timedelta(days=1)
     prev_start = prev_end - dt.timedelta(days=n - 1)
@@ -736,6 +738,7 @@ def build_lifecycle_windows_for_shop(
     lifecycle_segments: pd.DataFrame,
     lifecycle_board: pd.DataFrame,
     windows_days: Optional[List[int]] = None,
+    ignore_last_days: int = 0,
 ) -> pd.DataFrame:
     """
     你要的“动态日期范围”输出：以 ASIN 为单位、以“当前周期”为单位，生成窗口对比表。
@@ -1005,7 +1008,7 @@ def build_lifecycle_windows_for_shop(
 
         # 3) compare windows
         for n in windows_days:
-            comp = _compare_recent_prev(ts, cycle_end, int(n))
+            comp = _compare_recent_prev(ts, cycle_end, int(n), ignore_last_days=int(ignore_last_days or 0))
             if not comp:
                 continue
             # compare 窗口也带上一个一致的“口径异常”标记（方便 AI 解释）

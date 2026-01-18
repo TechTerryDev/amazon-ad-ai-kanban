@@ -1842,11 +1842,17 @@ def run(
                     shop=shop,
                     cfg=cfg_lc,
                 )
+                ignore_last_days = 0
+                try:
+                    ignore_last_days = int(getattr(policy, "dashboard_compare_ignore_last_days", 0) or 0)
+                except Exception:
+                    ignore_last_days = 0
                 lifecycle_windows_df = build_lifecycle_windows_for_shop(
                     lifecycle_daily=lifecycle_daily_df,
                     lifecycle_segments=lifecycle_segments_df,
                     lifecycle_board=lifecycle_board_df,
                     windows_days=windows_days,
+                    ignore_last_days=ignore_last_days,
                 )
         except Exception:
             lifecycle_daily_df = pd.DataFrame()

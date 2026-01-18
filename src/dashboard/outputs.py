@@ -27,7 +27,14 @@ import pandas as pd
 
 from ads.actions import ActionCandidate
 from core.config import StageConfig, get_stage_config
-from core.policy import ActionScoringPolicy, FocusScoringPolicy, OpsPolicy, StageScoringPolicy
+from core.policy import (
+    ActionScoringPolicy,
+    FocusScoringPolicy,
+    InventorySigmoidPolicy,
+    OpsPolicy,
+    ProfitGuardPolicy,
+    StageScoringPolicy,
+)
 from core.schema import CAN
 from core.utils import json_dumps
 from dashboard.keyword_topics import (
@@ -740,15 +747,34 @@ a:hover{text-decoration:underline;}
 @media (prefers-color-scheme: dark){
   .quick-entry a{background:rgba(2,6,23,.35);}
 }
-/* dashboard 第一屏：概览 KPI + 本周行动 + Shop Alerts 三栏布局（仅展示增强，不改口径） */
+/* dashboard 第一屏：概览 KPI 先单独横排，行动/预警在下方三栏 */
 .hero-grid{
   display:grid;
-  grid-template-columns:1.2fr 1fr 1fr;
+  grid-template-columns:repeat(3, minmax(0, 1fr));
+  grid-template-areas:
+    "overview overview overview"
+    "weekly alerts campaign";
   gap:12px;
   margin:10px 0 14px;
 }
+@media (max-width: 1400px){
+  .hero-grid{
+    grid-template-columns:1fr 1fr;
+    grid-template-areas:
+      "overview overview"
+      "weekly alerts"
+      "campaign campaign";
+  }
+}
 @media (max-width: 1100px){
-  .hero-grid{grid-template-columns:1fr;}
+  .hero-grid{
+    grid-template-columns:1fr;
+    grid-template-areas:
+      "overview"
+      "weekly"
+      "alerts"
+      "campaign";
+  }
 }
 .hero-panel{
   border:1px solid var(--border);
@@ -775,11 +801,24 @@ a:hover{text-decoration:underline;}
   letter-spacing:.2px;
 }
 .hero-panel .cards{margin:8px 0 0;}
+.hero-panel.overview{grid-area:overview;}
+.hero-panel.weekly{grid-area:weekly;}
+.hero-panel.alerts{grid-area:alerts;}
+.hero-panel.campaign{grid-area:campaign;}
 .kpi-grid{
   display:grid;
-  grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));
+  grid-template-columns:repeat(4, minmax(150px, 1fr));
   gap:8px;
   margin:0 0 10px;
+}
+@media (max-width: 1400px){
+  .kpi-grid{grid-template-columns:repeat(3, minmax(150px, 1fr));}
+}
+@media (max-width: 1100px){
+  .kpi-grid{grid-template-columns:repeat(2, minmax(150px, 1fr));}
+}
+@media (max-width: 700px){
+  .kpi-grid{grid-template-columns:1fr;}
 }
 .kpi{
   border:1px solid var(--border);
@@ -801,6 +840,17 @@ a:hover{text-decoration:underline;}
 .raw-details summary:before{content:'＋';display:inline-block;margin-right:6px;color:var(--muted);}
 .raw-details[open] summary:before{content:'－';}
 .raw-details .raw-body{margin-top:8px;color:var(--muted);font-size:12px;line-height:1.6;}
+.fold-section{margin:8px 0 12px;}
+.fold-section summary{
+  cursor:pointer;
+  font-weight:800;
+  color:var(--muted);
+  list-style:none;
+}
+.fold-section summary::-webkit-details-marker{display:none;}
+.fold-section summary:before{content:'＋';display:inline-block;margin-right:6px;color:var(--muted);}
+.fold-section[open] summary:before{content:'－';}
+.fold-section .fold-body{margin-top:10px;}
 .cards{
   display:grid;
   grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));
@@ -1885,7 +1935,7 @@ function _buildDashboardHero(){
     }
   }catch(e){}
 
-  // 4) 收集 “本周行动” 与 “Shop Alerts” 两个区块（heading + cards）
+  // 4) 收集 “本周行动 / Shop Alerts / Campaign 优先排查” 三个区块（heading + cards）
   function findH3ByTextOrId(root, id, text){
     if(!root) return null;
     try{
@@ -1924,21 +1974,26 @@ function _buildDashboardHero(){
   }
   const weeklyH3=findH3ByTextOrId(sec,'weekly','本周行动') || findH3ByTextOrId(content,'weekly','本周行动');
   const alertsH3=findH3ByTextOrId(sec,'alerts','Shop Alerts') || findH3ByTextOrId(content,'alerts','Shop Alerts');
+  const campaignH3=findH3ByTextOrId(sec,'campaign','Campaign 优先排查') || findH3ByTextOrId(content,'campaign','Campaign 优先排查');
   const weeklyBlock=pickBlock(weeklyH3, 'weekly');
   const alertsBlock=pickBlock(alertsH3, 'alerts');
+  const campaignBlock=pickBlock(campaignH3, 'campaign');
 
-  // 5) 构建 hero 三栏并插入到“概览 cards”原位置（避免打乱“快速入口”段落）
+  // 5) 构建 hero 四栏并插入到“概览 cards”原位置（避免打乱“快速入口”段落）
   const hero=document.createElement('div');
   hero.className='hero-grid';
   const col1=document.createElement('div');
-  col1.className='hero-panel';
+  col1.className='hero-panel overview';
   const col2=document.createElement('div');
-  col2.className='hero-panel';
+  col2.className='hero-panel weekly';
   const col3=document.createElement('div');
-  col3.className='hero-panel';
+  col3.className='hero-panel alerts';
+  const col4=document.createElement('div');
+  col4.className='hero-panel campaign';
   hero.appendChild(col1);
   hero.appendChild(col2);
   hero.appendChild(col3);
+  hero.appendChild(col4);
 
   try{
     // 先插入再移动节点（避免 reference node 已被移动导致 insertBefore 报错）
@@ -1951,7 +2006,7 @@ function _buildDashboardHero(){
   t1.textContent='概览（先抓重点）';
   col1.appendChild(t1);
   if(kpis && kpis.length>0) col1.appendChild(kpiGrid);
-  col1.appendChild(overviewCards);
+  // 本期结论卡片移到下方折叠区，避免与行动/预警重复
 
   // 5.2) 本周行动列
   if(weeklyBlock.length===0){
@@ -1980,6 +2035,36 @@ function _buildDashboardHero(){
   }else{
     alertsBlock.forEach((x)=>col3.appendChild(x));
   }
+
+  // 5.4) Campaign 优先排查列
+  if(campaignBlock.length===0){
+    const t4=document.createElement('div');
+    t4.className='hero-title';
+    t4.textContent='Campaign 优先排查（Top 3）';
+    col4.appendChild(t4);
+    const hint=document.createElement('div');
+    hint.className='hint';
+    hint.textContent='（暂无 Campaign 聚合）';
+    col4.appendChild(hint);
+  }else{
+    campaignBlock.forEach((x)=>col4.appendChild(x));
+  }
+
+  // 5.5) 本期结论补充：折叠展示（可追溯，但不干扰第一屏节奏）
+  try{
+    if(overviewCards){
+      const details=document.createElement('details');
+      details.className='fold-section';
+      const sum=document.createElement('summary');
+      sum.textContent='本期结论补充（展开）';
+      const body=document.createElement('div');
+      body.className='fold-body';
+      body.appendChild(overviewCards);
+      details.appendChild(sum);
+      details.appendChild(body);
+      hero.insertAdjacentElement('afterend', details);
+    }
+  }catch(e){}
 
   // 6) 修复目录锚点：把本周行动/Shop Alerts 的 TOC 指向“hero 上下两个锚点”
   try{
@@ -2039,6 +2124,7 @@ function _cardizeKeyLists(){
   _cardizeListAfterHeading(content, '近期重点');
   _cardizeListAfterHeading(content, '本周行动清单');
   _cardizeListAfterHeading(content, 'Shop Alerts');
+  _cardizeListAfterHeading(content, 'Campaign 优先排查');
 }
 
 function _buildOwnerKanban(){
@@ -2681,6 +2767,8 @@ def build_actions_summary(action_board: Optional[pd.DataFrame]) -> Dict[str, int
 def build_watchlists_summary(
     profit_reduce_watchlist: Optional[pd.DataFrame],
     inventory_risk_watchlist: Optional[pd.DataFrame],
+    inventory_sigmoid_watchlist: Optional[pd.DataFrame],
+    profit_guard_watchlist: Optional[pd.DataFrame],
     oos_with_ad_spend_watchlist: Optional[pd.DataFrame],
     spend_up_no_sales_watchlist: Optional[pd.DataFrame],
     phase_down_recent_watchlist: Optional[pd.DataFrame],
@@ -2692,6 +2780,8 @@ def build_watchlists_summary(
     out = {
         "profit_reduce_count": 0,
         "inventory_risk_count": 0,
+        "inventory_sigmoid_count": 0,
+        "profit_guard_count": 0,
         "oos_with_ad_spend_count": 0,
         "spend_up_no_sales_count": 0,
         "phase_down_recent_count": 0,
@@ -2700,6 +2790,8 @@ def build_watchlists_summary(
     try:
         out["profit_reduce_count"] = int(len(profit_reduce_watchlist)) if isinstance(profit_reduce_watchlist, pd.DataFrame) else 0
         out["inventory_risk_count"] = int(len(inventory_risk_watchlist)) if isinstance(inventory_risk_watchlist, pd.DataFrame) else 0
+        out["inventory_sigmoid_count"] = int(len(inventory_sigmoid_watchlist)) if isinstance(inventory_sigmoid_watchlist, pd.DataFrame) else 0
+        out["profit_guard_count"] = int(len(profit_guard_watchlist)) if isinstance(profit_guard_watchlist, pd.DataFrame) else 0
         out["oos_with_ad_spend_count"] = int(len(oos_with_ad_spend_watchlist)) if isinstance(oos_with_ad_spend_watchlist, pd.DataFrame) else 0
         out["spend_up_no_sales_count"] = int(len(spend_up_no_sales_watchlist)) if isinstance(spend_up_no_sales_watchlist, pd.DataFrame) else 0
         out["phase_down_recent_count"] = int(len(phase_down_recent_watchlist)) if isinstance(phase_down_recent_watchlist, pd.DataFrame) else 0
@@ -5335,6 +5427,235 @@ def build_inventory_risk_watchlist(
         if max_rows and int(max_rows) > 0:
             out = out.head(int(max_rows))
         return out.reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _sigmoid_modifier(dos: float, optimal: float, steepness: float, min_m: float, max_m: float) -> float:
+    try:
+        if dos <= 0 or max_m <= 0:
+            return 1.0
+        k = float(steepness or 0.0)
+        if k <= 0:
+            return 1.0
+        min_v = float(min_m)
+        max_v = float(max_m)
+        if max_v < min_v:
+            max_v = min_v
+        rng = max_v - min_v
+        if rng <= 0:
+            return 1.0
+        core = 1.0 / (1.0 + math.exp(-k * (float(dos) - float(optimal))))
+        return float(rng * core + min_v)
+    except Exception:
+        return 1.0
+
+
+def build_inventory_sigmoid_watchlist(
+    asin_cockpit: Optional[pd.DataFrame],
+    max_rows: int = 200,
+    policy: Optional[OpsPolicy] = None,
+) -> pd.DataFrame:
+    """
+    库存调速建议（Sigmoid）：只给建议，不影响排序/不自动执行。
+    """
+    if asin_cockpit is None or asin_cockpit.empty:
+        return pd.DataFrame()
+    try:
+        sig = getattr(policy, "dashboard_inventory_sigmoid", None) if isinstance(policy, OpsPolicy) else None
+        if sig is None:
+            sig = InventorySigmoidPolicy()
+        if not bool(getattr(sig, "enabled", True)):
+            return pd.DataFrame()
+
+        out = asin_cockpit.copy()
+        if "asin" in out.columns:
+            out["asin"] = out["asin"].astype(str).str.upper().str.strip()
+        if "product_category" in out.columns:
+            out["product_category"] = out["product_category"].map(_norm_product_category)
+
+        for c in ("ad_spend_roll", "inventory_cover_days_7d", "sales_per_day_7d"):
+            if c in out.columns:
+                out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+
+        min_spend = float(getattr(sig, "min_ad_spend_roll", 10.0) or 10.0)
+        out = out[out.get("ad_spend_roll", 0.0) >= float(min_spend)].copy()
+        out = out[out.get("inventory_cover_days_7d", 0.0) > 0].copy()
+        if out.empty:
+            return out
+
+        opt = float(getattr(sig, "optimal_cover_days", 45.0) or 45.0)
+        steep = float(getattr(sig, "steepness", 0.1) or 0.1)
+        min_m = float(getattr(sig, "min_modifier", 0.5) or 0.5)
+        max_m = float(getattr(sig, "max_modifier", 1.5) or 1.5)
+        min_change = float(getattr(sig, "min_change_ratio", 0.1) or 0.1)
+
+        out["sigmoid_modifier"] = out["inventory_cover_days_7d"].map(lambda x: _sigmoid_modifier(float(x or 0.0), opt, steep, min_m, max_m))
+        out["sigmoid_delta"] = (out["sigmoid_modifier"] - 1.0).abs()
+        out = out[out["sigmoid_delta"] >= float(min_change)].copy()
+        if out.empty:
+            return out
+
+        def _reasons(row: Dict[str, object]) -> List[str]:
+            rs: List[str] = []
+            try:
+                cover7 = float(row.get("inventory_cover_days_7d", 0.0) or 0.0)
+            except Exception:
+                cover7 = 0.0
+            if cover7 > 0 and cover7 < opt:
+                rs.append(f"覆盖偏紧({cover7:.1f}d<目标{opt:.0f}d)")
+            elif cover7 > 0 and cover7 > opt:
+                rs.append(f"覆盖偏高({cover7:.1f}d>目标{opt:.0f}d)")
+            rs.append(f"建议系数x{float(row.get('sigmoid_modifier', 1.0)):.2f}")
+            rs.append("仍在投放")
+            return rs[:3]
+
+        try:
+            tags = out.apply(lambda r: _reasons(r.to_dict()), axis=1)
+            out["reason_1"] = tags.map(lambda xs: xs[0] if isinstance(xs, list) and len(xs) >= 1 else "")
+            out["reason_2"] = tags.map(lambda xs: xs[1] if isinstance(xs, list) and len(xs) >= 2 else "")
+            out["reason_3"] = tags.map(lambda xs: xs[2] if isinstance(xs, list) and len(xs) >= 3 else "")
+        except Exception:
+            for c in ("reason_1", "reason_2", "reason_3"):
+                if c not in out.columns:
+                    out[c] = ""
+
+        def _action(v: float) -> str:
+            try:
+                return "控量" if float(v) < 1.0 else "放量"
+            except Exception:
+                return ""
+
+        out["sigmoid_action"] = out["sigmoid_modifier"].map(_action)
+        out = out.sort_values(["sigmoid_delta", "ad_spend_roll"], ascending=[False, False]).copy()
+        if max_rows and int(max_rows) > 0:
+            out = out.head(int(max_rows))
+        cols = [
+            "asin",
+            "product_name",
+            "product_category",
+            "current_phase",
+            "inventory_cover_days_7d",
+            "ad_spend_roll",
+            "sigmoid_modifier",
+            "sigmoid_action",
+            "reason_1",
+            "reason_2",
+        ]
+        cols = [c for c in cols if c in out.columns]
+        return out[cols].reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def build_profit_guard_watchlist(
+    asin_cockpit: Optional[pd.DataFrame],
+    max_rows: int = 200,
+    policy: Optional[OpsPolicy] = None,
+) -> pd.DataFrame:
+    """
+    利润护栏（Break-even）：当广告 ACOS/CPC 超过“安全线”时给出提示。
+    """
+    if asin_cockpit is None or asin_cockpit.empty:
+        return pd.DataFrame()
+    try:
+        pg = getattr(policy, "dashboard_profit_guard", None) if isinstance(policy, OpsPolicy) else None
+        if pg is None:
+            pg = ProfitGuardPolicy()
+        if not bool(getattr(pg, "enabled", True)):
+            return pd.DataFrame()
+
+        out = asin_cockpit.copy()
+        if "asin" in out.columns:
+            out["asin"] = out["asin"].astype(str).str.upper().str.strip()
+        if "product_category" in out.columns:
+            out["product_category"] = out["product_category"].map(_norm_product_category)
+
+        for c in (
+            "gross_margin",
+            "ad_acos_recent_7d",
+            "ad_acos",
+            "ad_spend_roll",
+            "sales_recent_7d",
+            "aov_recent_7d",
+            "ad_cvr_recent_7d",
+            "ad_spend_recent_7d",
+            "ad_clicks_recent_7d",
+        ):
+            if c in out.columns:
+                out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+
+        min_sales = float(getattr(pg, "min_sales_7d", 50.0) or 50.0)
+        min_spend = float(getattr(pg, "min_ad_spend_roll", 10.0) or 10.0)
+        target_net = float(getattr(pg, "target_net_margin", 0.05) or 0.05)
+
+        out["safe_acos"] = (out.get("gross_margin", 0.0) - float(target_net)).clip(lower=0.0)
+        out["ad_acos_recent"] = out.get("ad_acos_recent_7d", 0.0)
+        out.loc[out["ad_acos_recent"] <= 0, "ad_acos_recent"] = out.get("ad_acos", 0.0)
+
+        out["ad_cpc_recent_7d"] = 0.0
+        try:
+            m = out.get("ad_clicks_recent_7d", 0.0) > 0
+            out.loc[m, "ad_cpc_recent_7d"] = (out.loc[m, "ad_spend_recent_7d"] / out.loc[m, "ad_clicks_recent_7d"]).fillna(0.0)
+        except Exception:
+            pass
+
+        out["safe_cpc"] = 0.0
+        try:
+            m2 = (out.get("aov_recent_7d", 0.0) > 0) & (out.get("ad_cvr_recent_7d", 0.0) > 0) & (out["safe_acos"] > 0)
+            out.loc[m2, "safe_cpc"] = (out.loc[m2, "aov_recent_7d"] * out.loc[m2, "ad_cvr_recent_7d"] * out.loc[m2, "safe_acos"]).fillna(0.0)
+        except Exception:
+            pass
+
+        out = out[
+            (out.get("sales_recent_7d", 0.0) >= float(min_sales))
+            & (out.get("ad_spend_roll", 0.0) >= float(min_spend))
+            & (out.get("safe_acos", 0.0) > 0)
+            & (out.get("ad_acos_recent", 0.0) > out.get("safe_acos", 0.0))
+        ].copy()
+        if out.empty:
+            return out
+
+        def _reasons(row: Dict[str, object]) -> List[str]:
+            rs: List[str] = []
+            try:
+                sa = float(row.get("safe_acos", 0.0) or 0.0)
+                aa = float(row.get("ad_acos_recent", 0.0) or 0.0)
+            except Exception:
+                sa, aa = 0.0, 0.0
+            rs.append(f"ACOS>{sa:.2f}")
+            rs.append(f"实际ACOS={aa:.2f}")
+            rs.append("利润护栏")
+            return rs[:3]
+
+        try:
+            tags = out.apply(lambda r: _reasons(r.to_dict()), axis=1)
+            out["reason_1"] = tags.map(lambda xs: xs[0] if isinstance(xs, list) and len(xs) >= 1 else "")
+            out["reason_2"] = tags.map(lambda xs: xs[1] if isinstance(xs, list) and len(xs) >= 2 else "")
+            out["reason_3"] = tags.map(lambda xs: xs[2] if isinstance(xs, list) and len(xs) >= 3 else "")
+        except Exception:
+            for c in ("reason_1", "reason_2", "reason_3"):
+                if c not in out.columns:
+                    out[c] = ""
+
+        out = out.sort_values(["ad_acos_recent", "ad_spend_roll"], ascending=[False, False]).copy()
+        if max_rows and int(max_rows) > 0:
+            out = out.head(int(max_rows))
+        cols = [
+            "asin",
+            "product_name",
+            "product_category",
+            "gross_margin",
+            "safe_acos",
+            "ad_acos_recent",
+            "ad_cpc_recent_7d",
+            "safe_cpc",
+            "ad_spend_roll",
+            "reason_1",
+            "reason_2",
+        ]
+        cols = [c for c in cols if c in out.columns]
+        return out[cols].reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
 
@@ -8220,124 +8541,145 @@ def build_asin_focus(
             except Exception:
                 return pd.Series([0.0] * len(a), index=a.index)
 
+        # 1) 近7天/14天/30天派生字段（集中拼接，避免碎片化告警）
+        new_cols: Dict[str, pd.Series] = {}
+        orders_per_day_7d = None
+        orders_per_day_14d = None
+        orders_per_day_30d = None
+
         # 1) 近7天“速度”（日均）
         if "sales_recent_7d" in out.columns:
-            out["sales_per_day_7d"] = (out["sales_recent_7d"] / 7.0).fillna(0.0)
+            new_cols["sales_per_day_7d"] = (out["sales_recent_7d"] / 7.0).fillna(0.0)
         if "orders_recent_7d" in out.columns:
-            out["orders_per_day_7d"] = (out["orders_recent_7d"] / 7.0).fillna(0.0)
+            orders_per_day_7d = (out["orders_recent_7d"] / 7.0).fillna(0.0)
+            new_cols["orders_per_day_7d"] = orders_per_day_7d
         if "sessions_recent_7d" in out.columns:
-            out["sessions_per_day_7d"] = (out["sessions_recent_7d"] / 7.0).fillna(0.0)
+            new_cols["sessions_per_day_7d"] = (out["sessions_recent_7d"] / 7.0).fillna(0.0)
         if "ad_spend_recent_7d" in out.columns:
-            out["ad_spend_per_day_7d"] = (out["ad_spend_recent_7d"] / 7.0).fillna(0.0)
+            new_cols["ad_spend_per_day_7d"] = (out["ad_spend_recent_7d"] / 7.0).fillna(0.0)
 
         # 1.1) 广告端效率（7d）：CTR/CVR/CPA/ACOS/广告占比
         if ("ad_clicks_recent_7d" in out.columns) and ("ad_impressions_recent_7d" in out.columns):
-            out["ad_ctr_recent_7d"] = _safe_div(out["ad_clicks_recent_7d"], out["ad_impressions_recent_7d"])
+            new_cols["ad_ctr_recent_7d"] = _safe_div(out["ad_clicks_recent_7d"], out["ad_impressions_recent_7d"])
         if ("ad_clicks_prev_7d" in out.columns) and ("ad_impressions_prev_7d" in out.columns):
-            out["ad_ctr_prev_7d"] = _safe_div(out["ad_clicks_prev_7d"], out["ad_impressions_prev_7d"])
+            new_cols["ad_ctr_prev_7d"] = _safe_div(out["ad_clicks_prev_7d"], out["ad_impressions_prev_7d"])
         if ("ad_orders_recent_7d" in out.columns) and ("ad_clicks_recent_7d" in out.columns):
-            out["ad_cvr_recent_7d"] = _safe_div(out["ad_orders_recent_7d"], out["ad_clicks_recent_7d"])
+            new_cols["ad_cvr_recent_7d"] = _safe_div(out["ad_orders_recent_7d"], out["ad_clicks_recent_7d"])
         if ("ad_orders_prev_7d" in out.columns) and ("ad_clicks_prev_7d" in out.columns):
-            out["ad_cvr_prev_7d"] = _safe_div(out["ad_orders_prev_7d"], out["ad_clicks_prev_7d"])
+            new_cols["ad_cvr_prev_7d"] = _safe_div(out["ad_orders_prev_7d"], out["ad_clicks_prev_7d"])
         if ("ad_spend_recent_7d" in out.columns) and ("ad_orders_recent_7d" in out.columns):
-            out["ad_cpa_order_recent_7d"] = _safe_div(out["ad_spend_recent_7d"], out["ad_orders_recent_7d"])
+            new_cols["ad_cpa_order_recent_7d"] = _safe_div(out["ad_spend_recent_7d"], out["ad_orders_recent_7d"])
         if ("ad_spend_prev_7d" in out.columns) and ("ad_orders_prev_7d" in out.columns):
-            out["ad_cpa_order_prev_7d"] = _safe_div(out["ad_spend_prev_7d"], out["ad_orders_prev_7d"])
+            new_cols["ad_cpa_order_prev_7d"] = _safe_div(out["ad_spend_prev_7d"], out["ad_orders_prev_7d"])
         if ("ad_spend_recent_7d" in out.columns) and ("ad_sales_recent_7d" in out.columns):
-            out["ad_acos_recent_7d"] = _safe_div(out["ad_spend_recent_7d"], out["ad_sales_recent_7d"])
+            new_cols["ad_acos_recent_7d"] = _safe_div(out["ad_spend_recent_7d"], out["ad_sales_recent_7d"])
         if ("ad_spend_prev_7d" in out.columns) and ("ad_sales_prev_7d" in out.columns):
-            out["ad_acos_prev_7d"] = _safe_div(out["ad_spend_prev_7d"], out["ad_sales_prev_7d"])
+            new_cols["ad_acos_prev_7d"] = _safe_div(out["ad_spend_prev_7d"], out["ad_sales_prev_7d"])
         if ("ad_sales_recent_7d" in out.columns) and ("sales_recent_7d" in out.columns):
-            out["ad_sales_share_recent_7d"] = _safe_div(out["ad_sales_recent_7d"], out["sales_recent_7d"])
+            new_cols["ad_sales_share_recent_7d"] = _safe_div(out["ad_sales_recent_7d"], out["sales_recent_7d"])
         if ("ad_sales_prev_7d" in out.columns) and ("sales_prev_7d" in out.columns):
-            out["ad_sales_share_prev_7d"] = _safe_div(out["ad_sales_prev_7d"], out["sales_prev_7d"])
+            new_cols["ad_sales_share_prev_7d"] = _safe_div(out["ad_sales_prev_7d"], out["sales_prev_7d"])
 
         # 2) 库存覆盖天数（粗粒度）：库存 / 日均订单
-        if "inventory" in out.columns and "orders_per_day_7d" in out.columns:
-            out["inventory_cover_days_7d"] = 0.0
-            mask = out["orders_per_day_7d"] > 0
-            out.loc[mask, "inventory_cover_days_7d"] = (out.loc[mask, "inventory"] / out.loc[mask, "orders_per_day_7d"]).fillna(0.0)
+        if "inventory" in out.columns and orders_per_day_7d is not None:
+            inv = pd.to_numeric(out["inventory"], errors="coerce").fillna(0.0)
+            cover = pd.Series(0.0, index=out.index)
+            mask = orders_per_day_7d > 0
+            cover.loc[mask] = (inv.loc[mask] / orders_per_day_7d.loc[mask]).fillna(0.0)
+            new_cols["inventory_cover_days_7d"] = cover
 
         # 1.2) 近14天速度（日均）
         if "sales_recent_14d" in out.columns:
-            out["sales_per_day_14d"] = (out["sales_recent_14d"] / 14.0).fillna(0.0)
+            new_cols["sales_per_day_14d"] = (out["sales_recent_14d"] / 14.0).fillna(0.0)
         if "orders_recent_14d" in out.columns:
-            out["orders_per_day_14d"] = (out["orders_recent_14d"] / 14.0).fillna(0.0)
+            orders_per_day_14d = (out["orders_recent_14d"] / 14.0).fillna(0.0)
+            new_cols["orders_per_day_14d"] = orders_per_day_14d
         if "sessions_recent_14d" in out.columns:
-            out["sessions_per_day_14d"] = (out["sessions_recent_14d"] / 14.0).fillna(0.0)
+            new_cols["sessions_per_day_14d"] = (out["sessions_recent_14d"] / 14.0).fillna(0.0)
         if "ad_spend_recent_14d" in out.columns:
-            out["ad_spend_per_day_14d"] = (out["ad_spend_recent_14d"] / 14.0).fillna(0.0)
+            new_cols["ad_spend_per_day_14d"] = (out["ad_spend_recent_14d"] / 14.0).fillna(0.0)
 
         # 1.2) 广告端效率（14d）：用于成熟期稳定性判断
         if ("ad_clicks_recent_14d" in out.columns) and ("ad_impressions_recent_14d" in out.columns):
-            out["ad_ctr_recent_14d"] = _safe_div(out["ad_clicks_recent_14d"], out["ad_impressions_recent_14d"])
+            new_cols["ad_ctr_recent_14d"] = _safe_div(out["ad_clicks_recent_14d"], out["ad_impressions_recent_14d"])
         if ("ad_clicks_prev_14d" in out.columns) and ("ad_impressions_prev_14d" in out.columns):
-            out["ad_ctr_prev_14d"] = _safe_div(out["ad_clicks_prev_14d"], out["ad_impressions_prev_14d"])
+            new_cols["ad_ctr_prev_14d"] = _safe_div(out["ad_clicks_prev_14d"], out["ad_impressions_prev_14d"])
         if ("ad_orders_recent_14d" in out.columns) and ("ad_clicks_recent_14d" in out.columns):
-            out["ad_cvr_recent_14d"] = _safe_div(out["ad_orders_recent_14d"], out["ad_clicks_recent_14d"])
+            new_cols["ad_cvr_recent_14d"] = _safe_div(out["ad_orders_recent_14d"], out["ad_clicks_recent_14d"])
         if ("ad_orders_prev_14d" in out.columns) and ("ad_clicks_prev_14d" in out.columns):
-            out["ad_cvr_prev_14d"] = _safe_div(out["ad_orders_prev_14d"], out["ad_clicks_prev_14d"])
+            new_cols["ad_cvr_prev_14d"] = _safe_div(out["ad_orders_prev_14d"], out["ad_clicks_prev_14d"])
         if ("ad_spend_recent_14d" in out.columns) and ("ad_orders_recent_14d" in out.columns):
-            out["ad_cpa_order_recent_14d"] = _safe_div(out["ad_spend_recent_14d"], out["ad_orders_recent_14d"])
+            new_cols["ad_cpa_order_recent_14d"] = _safe_div(out["ad_spend_recent_14d"], out["ad_orders_recent_14d"])
         if ("ad_spend_prev_14d" in out.columns) and ("ad_orders_prev_14d" in out.columns):
-            out["ad_cpa_order_prev_14d"] = _safe_div(out["ad_spend_prev_14d"], out["ad_orders_prev_14d"])
+            new_cols["ad_cpa_order_prev_14d"] = _safe_div(out["ad_spend_prev_14d"], out["ad_orders_prev_14d"])
         if ("ad_spend_recent_14d" in out.columns) and ("ad_sales_recent_14d" in out.columns):
-            out["ad_acos_recent_14d"] = _safe_div(out["ad_spend_recent_14d"], out["ad_sales_recent_14d"])
+            new_cols["ad_acos_recent_14d"] = _safe_div(out["ad_spend_recent_14d"], out["ad_sales_recent_14d"])
         if ("ad_spend_prev_14d" in out.columns) and ("ad_sales_prev_14d" in out.columns):
-            out["ad_acos_prev_14d"] = _safe_div(out["ad_spend_prev_14d"], out["ad_sales_prev_14d"])
+            new_cols["ad_acos_prev_14d"] = _safe_div(out["ad_spend_prev_14d"], out["ad_sales_prev_14d"])
         if ("ad_sales_recent_14d" in out.columns) and ("sales_recent_14d" in out.columns):
-            out["ad_sales_share_recent_14d"] = _safe_div(out["ad_sales_recent_14d"], out["sales_recent_14d"])
+            new_cols["ad_sales_share_recent_14d"] = _safe_div(out["ad_sales_recent_14d"], out["sales_recent_14d"])
         if ("ad_sales_prev_14d" in out.columns) and ("sales_prev_14d" in out.columns):
-            out["ad_sales_share_prev_14d"] = _safe_div(out["ad_sales_prev_14d"], out["sales_prev_14d"])
+            new_cols["ad_sales_share_prev_14d"] = _safe_div(out["ad_sales_prev_14d"], out["sales_prev_14d"])
 
         # 2.2) 库存覆盖天数（14d）
-        if "inventory" in out.columns and "orders_per_day_14d" in out.columns:
-            out["inventory_cover_days_14d"] = 0.0
-            mask = out["orders_per_day_14d"] > 0
-            out.loc[mask, "inventory_cover_days_14d"] = (out.loc[mask, "inventory"] / out.loc[mask, "orders_per_day_14d"]).fillna(0.0)
+        if "inventory" in out.columns and orders_per_day_14d is not None:
+            inv = pd.to_numeric(out["inventory"], errors="coerce").fillna(0.0)
+            cover = pd.Series(0.0, index=out.index)
+            mask = orders_per_day_14d > 0
+            cover.loc[mask] = (inv.loc[mask] / orders_per_day_14d.loc[mask]).fillna(0.0)
+            new_cols["inventory_cover_days_14d"] = cover
 
         # 1.3) 近30天速度（日均）
         if "sales_recent_30d" in out.columns:
-            out["sales_per_day_30d"] = (out["sales_recent_30d"] / 30.0).fillna(0.0)
+            new_cols["sales_per_day_30d"] = (out["sales_recent_30d"] / 30.0).fillna(0.0)
         if "orders_recent_30d" in out.columns:
-            out["orders_per_day_30d"] = (out["orders_recent_30d"] / 30.0).fillna(0.0)
+            orders_per_day_30d = (out["orders_recent_30d"] / 30.0).fillna(0.0)
+            new_cols["orders_per_day_30d"] = orders_per_day_30d
         if "sessions_recent_30d" in out.columns:
-            out["sessions_per_day_30d"] = (out["sessions_recent_30d"] / 30.0).fillna(0.0)
+            new_cols["sessions_per_day_30d"] = (out["sessions_recent_30d"] / 30.0).fillna(0.0)
         if "ad_spend_recent_30d" in out.columns:
-            out["ad_spend_per_day_30d"] = (out["ad_spend_recent_30d"] / 30.0).fillna(0.0)
+            new_cols["ad_spend_per_day_30d"] = (out["ad_spend_recent_30d"] / 30.0).fillna(0.0)
 
         # 2.3) 库存覆盖天数（30d）
-        if "inventory" in out.columns and "orders_per_day_30d" in out.columns:
-            out["inventory_cover_days_30d"] = 0.0
-            mask = out["orders_per_day_30d"] > 0
-            out.loc[mask, "inventory_cover_days_30d"] = (out.loc[mask, "inventory"] / out.loc[mask, "orders_per_day_30d"]).fillna(0.0)
+        if "inventory" in out.columns and orders_per_day_30d is not None:
+            inv = pd.to_numeric(out["inventory"], errors="coerce").fillna(0.0)
+            cover = pd.Series(0.0, index=out.index)
+            mask = orders_per_day_30d > 0
+            cover.loc[mask] = (inv.loc[mask] / orders_per_day_30d.loc[mask]).fillna(0.0)
+            new_cols["inventory_cover_days_30d"] = cover
 
         # 3) 自然 vs 广告拆分（若缺字段则用确定性推导兜底）
         if "organic_sales" not in out.columns and "sales" in out.columns and "ad_sales" in out.columns:
-            out["organic_sales"] = (out["sales"] - out["ad_sales"]).clip(lower=0.0)
+            new_cols["organic_sales"] = (out["sales"] - out["ad_sales"]).clip(lower=0.0)
         if "organic_orders" not in out.columns and "orders" in out.columns and "ad_orders" in out.columns:
-            out["organic_orders"] = (out["orders"] - out["ad_orders"]).clip(lower=0.0)
+            new_cols["organic_orders"] = (out["orders"] - out["ad_orders"]).clip(lower=0.0)
         if "organic_sales_share" not in out.columns and "ad_sales_share" in out.columns:
-            out["organic_sales_share"] = (1.0 - pd.to_numeric(out["ad_sales_share"], errors="coerce").fillna(0.0)).clip(lower=0.0)
+            new_cols["organic_sales_share"] = (1.0 - pd.to_numeric(out["ad_sales_share"], errors="coerce").fillna(0.0)).clip(lower=0.0)
 
         # 4) CVR 兜底（极少数情况下生命周期窗口缺列时，用 orders/sessions 现算）
         if "cvr" not in out.columns and ("orders" in out.columns) and ("sessions" in out.columns):
-            out["cvr"] = 0.0
-            mask = pd.to_numeric(out["sessions"], errors="coerce").fillna(0.0) > 0
-            out.loc[mask, "cvr"] = (pd.to_numeric(out.loc[mask, "orders"], errors="coerce").fillna(0.0) / pd.to_numeric(out.loc[mask, "sessions"], errors="coerce").fillna(0.0)).fillna(0.0)
+            sessions = pd.to_numeric(out["sessions"], errors="coerce").fillna(0.0)
+            orders = pd.to_numeric(out["orders"], errors="coerce").fillna(0.0)
+            cvr_series = pd.Series(0.0, index=out.index)
+            mask = sessions > 0
+            cvr_series.loc[mask] = (orders.loc[mask] / sessions.loc[mask]).fillna(0.0)
+            new_cols["cvr"] = cvr_series
 
         # 4.1) 广告端成本指标（主窗口）：CPA(订单口径)
         if ("ad_spend" in out.columns) and ("ad_orders" in out.columns):
-            out["ad_cpa_order"] = _safe_div(out["ad_spend"], out["ad_orders"])
+            new_cols["ad_cpa_order"] = _safe_div(out["ad_spend"], out["ad_orders"])
 
         # 5) 经营侧“正常销售字段”补齐：客单价 AOV / 毛利率 gross_margin
         # 说明：
         # - AOV 用于识别“销量下滑是否来自客单变化”（价格/变体结构/促销/捆绑等）
         # - gross_margin 用于识别“利润空间是否过窄”（更适合控量/提价/降成本，而非盲目加码）
         if ("sales" in out.columns) and ("orders" in out.columns):
-            out["aov"] = 0.0
-            m = pd.to_numeric(out["orders"], errors="coerce").fillna(0.0) > 0
-            out.loc[m, "aov"] = (pd.to_numeric(out.loc[m, "sales"], errors="coerce").fillna(0.0) / pd.to_numeric(out.loc[m, "orders"], errors="coerce").fillna(0.0)).fillna(0.0)
+            sales = pd.to_numeric(out["sales"], errors="coerce").fillna(0.0)
+            orders = pd.to_numeric(out["orders"], errors="coerce").fillna(0.0)
+            aov = pd.Series(0.0, index=out.index)
+            m = orders > 0
+            aov.loc[m] = (sales.loc[m] / orders.loc[m]).fillna(0.0)
+            new_cols["aov"] = aov
 
         # 近7天 AOV（recent vs prev）：prev 由 recent - delta 推导，避免扩列导致 focus 表字段爆炸
         if ("sales_recent_7d" in out.columns) and ("orders_recent_7d" in out.columns) and ("delta_sales" in out.columns) and ("delta_orders" in out.columns):
@@ -8349,22 +8691,37 @@ def build_asin_focus(
             sales_prev = (sales_recent - delta_sales).clip(lower=0.0)
             orders_prev = (orders_recent - delta_orders).clip(lower=0.0)
 
-            out["aov_prev_7d"] = 0.0
-            out["aov_recent_7d"] = 0.0
+            aov_prev = pd.Series(0.0, index=out.index)
+            aov_recent = pd.Series(0.0, index=out.index)
 
             mp = orders_prev > 0
             mr = orders_recent > 0
-            out.loc[mp, "aov_prev_7d"] = (sales_prev[mp] / orders_prev[mp]).fillna(0.0)
-            out.loc[mr, "aov_recent_7d"] = (sales_recent[mr] / orders_recent[mr]).fillna(0.0)
-            out["delta_aov_7d"] = (pd.to_numeric(out.get("aov_recent_7d", 0.0), errors="coerce").fillna(0.0) - pd.to_numeric(out.get("aov_prev_7d", 0.0), errors="coerce").fillna(0.0)).fillna(0.0)
+            aov_prev.loc[mp] = (sales_prev[mp] / orders_prev[mp]).fillna(0.0)
+            aov_recent.loc[mr] = (sales_recent[mr] / orders_recent[mr]).fillna(0.0)
+
+            new_cols["aov_prev_7d"] = aov_prev
+            new_cols["aov_recent_7d"] = aov_recent
+            new_cols["delta_aov_7d"] = (aov_recent - aov_prev).fillna(0.0)
 
         # 毛利率（gross_margin）：profit/sales（主窗口口径）
         if ("profit" in out.columns) and ("sales" in out.columns):
-            out["gross_margin"] = 0.0
-            m = pd.to_numeric(out["sales"], errors="coerce").fillna(0.0) > 0
-            out.loc[m, "gross_margin"] = (pd.to_numeric(out.loc[m, "profit"], errors="coerce").fillna(0.0) / pd.to_numeric(out.loc[m, "sales"], errors="coerce").fillna(0.0)).fillna(0.0)
-            # 合理裁剪：极端值多半是口径/缺失导致（不影响主流程，只让筛选更稳）
-            out["gross_margin"] = pd.to_numeric(out.get("gross_margin", 0.0), errors="coerce").fillna(0.0).clip(lower=-1.0, upper=1.0)
+            profit = pd.to_numeric(out["profit"], errors="coerce").fillna(0.0)
+            sales = pd.to_numeric(out["sales"], errors="coerce").fillna(0.0)
+            gm = pd.Series(0.0, index=out.index)
+            m = sales > 0
+            gm.loc[m] = (profit.loc[m] / sales.loc[m]).fillna(0.0)
+            gm = pd.to_numeric(gm, errors="coerce").fillna(0.0).clip(lower=-1.0, upper=1.0)
+            new_cols["gross_margin"] = gm
+
+        if new_cols:
+            try:
+                # 覆盖同名列，避免重复列
+                to_drop = [c for c in new_cols.keys() if c in out.columns]
+                if to_drop:
+                    out = out.drop(columns=to_drop, errors="ignore")
+                out = pd.concat([out, pd.DataFrame(new_cols, index=out.index)], axis=1)
+            except Exception:
+                pass
     except Exception:
         # 防御性：任何新维度计算失败都不影响主流程
         pass
@@ -9078,6 +9435,13 @@ def write_dashboard_md(
         lines.append(f"- 阶段: `{stage}`")
         lines.append(f"- 时间范围: `{date_start} ~ {date_end}`")
         lines.append("- 口径说明: 未标注的累计指标=主窗口；标注 compare/Δ 的为近N天 vs 前N天（日期见表内 recent/prev）")
+        lines.append("- 表头含(7d/14d/30d)=近窗；含Δ=对比窗口；含roll=滚动窗口（字段名自带口径提示）")
+        try:
+            ignore_last = int(getattr(policy, "dashboard_compare_ignore_last_days", 0) or 0) if policy is not None else 0
+            if ignore_last > 0:
+                lines.append(f"- compare 忽略最近 {ignore_last} 天（规避归因滞后噪声）")
+        except Exception:
+            pass
         lines.append("")
 
         # 预计算：Shop Alerts / 机会池（用于“本期结论”与后续章节复用）
@@ -9107,6 +9471,7 @@ def write_dashboard_md(
         # 运营操作手册：把“告警/生命周期/关键词主题/动作闭环”串起来，避免只盯广告调
         quick_links = ["[运营操作手册](../../../../docs/OPS_PLAYBOOK.md)", "[Shop Alerts](#alerts)"]
         quick_links.append("[本周行动](#weekly)")
+        quick_links.append("[Campaign排查](#campaign)")
         if isinstance(action_review, pd.DataFrame) and (not action_review.empty):
             quick_links.append("[执行复盘](#review)")
         quick_links += ["[Watchlists](#watchlists)", "[生命周期时间轴](./lifecycle_overview.md)", "[关键词主题](#keywords)", "[Drivers](#drivers)"]
@@ -9225,12 +9590,24 @@ def write_dashboard_md(
                 s = _fmt_num(x, nd=2)
                 return f"${s}" if s else ""
 
+            def _fmt_signed_usd(x: object) -> str:
+                s = _fmt_num(x, nd=2)
+                if not s:
+                    return ""
+                if s.startswith("-"):
+                    return f"-${s.lstrip('-')}"
+                return f"${s}"
+
             def _as_float(x: object) -> float:
                 try:
                     v = float(pd.to_numeric(x, errors="coerce"))
                     return 0.0 if (pd.isna(v) if hasattr(pd, "isna") else False) else v  # type: ignore[arg-type]
                 except Exception:
                     return 0.0
+
+            def _evidence_text(parts: List[str]) -> str:
+                ps = [p for p in parts if str(p or "").strip()]
+                return f"证据: {' | '.join(ps)}" if ps else "证据: 见明细表"
 
             def _priority_rank(p: str) -> int:
                 pr = str(p or "").strip().upper()
@@ -9366,34 +9743,37 @@ def write_dashboard_md(
 
                     asin_link = _asin_md_link(asin, "./asin_drilldown.md") if asin else asin
                     ev_parts = []
+                    spend_val = 0.0
+                    delta_val = 0.0
                     spd7 = _fmt_num(r.get("sales_per_day_7d"), nd=2)
                     cov7 = _fmt_num(r.get("inventory_cover_days_7d"), nd=1)
                     bg = _fmt_usd(r.get("budget_gap_usd_est"))
                     pg = _fmt_usd(r.get("profit_gap_usd_est"))
                     if spd7:
-                        ev_parts.append(f"sales/day7=`{spd7}`")
+                        ev_parts.append(f"日销7d=`{spd7}`")
+                        delta_val = abs(_as_float(r.get("sales_per_day_7d")))
                     if cov7:
                         ev_parts.append(f"cover7d=`{cov7}`")
                     if bg and bg != "$0":
-                        ev_parts.append(f"budget_gap≈`{bg}`")
+                        ev_parts.append(f"预算缺口≈`{bg}`")
+                        spend_val += abs(_as_float(r.get("budget_gap_usd_est")))
                     if pg and pg != "$0":
-                        ev_parts.append(f"profit_gap≈`{pg}`")
-                    ev_txt = " | ".join(ev_parts) if ev_parts else "（证据见任务表）"
+                        ev_parts.append(f"利润缺口≈`{pg}`")
+                        spend_val += abs(_as_float(r.get("profit_gap_usd_est")))
+                    ev_txt = _evidence_text(ev_parts)
 
                     prefix = f"{cat} " if cat else ""
                     title = f"{prefix}{asin_link} {task_type}".strip()
                     if not title:
                         continue
-                    score = abs(_as_float(r.get("budget_gap_usd_est"))) + abs(_as_float(r.get("profit_gap_usd_est"))) + _as_float(
-                        r.get("sales_per_day_7d")
-                    )
                     candidates.append(
                         {
                             "priority": p,
                             "group": group,
                             "asin": asin,
-                            "score": float(score),
-                            "line": f"`{p}` `{_group_tag(group)}` {title}（{owner}）：{ev_txt}（[任务表](../dashboard/unlock_scale_tasks.csv)）",
+                            "spend": float(spend_val),
+                            "delta": float(delta_val),
+                            "line": f"`{p}` `{_group_tag(group)}` {title} | {ev_txt} | 责任:{owner} | [任务表](../dashboard/unlock_scale_tasks.csv)",
                         }
                     )
 
@@ -9408,11 +9788,11 @@ def write_dashboard_md(
                         continue
                     owner = _owner_from_alert(title)
                     group = _group_from_alert(title)
-                    ev_txt = detail if detail else "（证据见 Shop Alerts）"
-                    line = f"`{p}` `{_group_tag(group)}` {title}（{owner}）：{ev_txt}"
+                    ev_txt = _evidence_text([detail] if detail else [])
+                    line = f"`{p}` `{_group_tag(group)}` {title} | {ev_txt} | 责任:{owner}"
                     if link:
-                        line += f"（{link}）"
-                    candidates.append({"priority": p, "group": group, "asin": "", "score": float(_priority_rank(p) == 0), "line": line})
+                        line += f" | {link}"
+                    candidates.append({"priority": p, "group": group, "asin": "", "spend": 0.0, "delta": 0.0, "line": line})
 
             # C) Action Board：广告端可直接执行（补齐“止损/放量/排查”）
             if isinstance(action_board, pd.DataFrame) and (not action_board.empty):
@@ -9428,7 +9808,7 @@ def write_dashboard_md(
                     ab["_spend"] = pd.to_numeric(ab["e_spend"], errors="coerce").fillna(0.0)
                 else:
                     ab["_spend"] = 0.0
-                ab = ab.sort_values(["_pr", "_score", "_spend"], ascending=[True, False, False])
+                ab = ab.sort_values(["_pr", "_spend", "_score"], ascending=[True, False, False])
                 for _, r in ab.head(30).iterrows():
                     p = str(r.get("priority", "P1") or "P1").strip().upper()
                     action_type = str(r.get("action_type", "") or "").strip()
@@ -9458,38 +9838,45 @@ def write_dashboard_md(
                     e_spend = _fmt_usd(r.get("e_spend"))
                     e_orders = _fmt_num(r.get("e_orders"), nd=0)
                     e_acos = _fmt_num(r.get("e_acos"), nd=4)
+                    delta_sales_val = _as_float(r.get("asin_delta_sales"))
+                    delta_spend_val = _as_float(r.get("asin_delta_spend"))
+                    delta_sales = _fmt_signed_usd(delta_sales_val) if delta_sales_val != 0 else ""
+                    delta_spend = _fmt_signed_usd(delta_spend_val) if delta_spend_val != 0 else ""
 
                     ev_parts = []
-                    if blocked > 0 and blocked_reason:
-                        ev_parts.append(f"blocked=`{blocked_reason}`")
                     if e_spend:
-                        ev_parts.append(f"spend=`{e_spend}`")
+                        ev_parts.append(f"花费=`{e_spend}`")
+                    if delta_sales:
+                        ev_parts.append(f"ΔSales=`{delta_sales}`")
+                    if delta_spend:
+                        ev_parts.append(f"ΔSpend=`{delta_spend}`")
                     if e_orders:
-                        ev_parts.append(f"orders=`{e_orders}`")
+                        ev_parts.append(f"订单=`{e_orders}`")
                     if e_acos:
-                        ev_parts.append(f"acos=`{e_acos}`")
-                    ev_txt = " | ".join(ev_parts) if ev_parts else "（证据见 Action Board）"
+                        ev_parts.append(f"ACOS=`{e_acos}`")
+                    if blocked > 0 and blocked_reason:
+                        ev_parts.append(f"阻断=`{blocked_reason}`")
+                    ev_txt = _evidence_text(ev_parts)
 
                     core = f"{action_type} {obj}".strip() if action_type or obj else "广告动作"
                     if camp:
                         core += f" @ {camp}"
                     if needs_confirm:
-                        core += "（需人工确认）"
+                        core += " [需确认]"
 
                     link_parts = []
                     if asin_link:
                         link_parts.append(asin_link)
                     link_parts.append("[Action Board](../dashboard/action_board.csv)")
 
-                    # score：优先用 action_priority_score，其次用 spend 作为证据强度
-                    score = float(_as_float(r.get("action_priority_score"))) * 100.0 + float(_as_float(r.get("e_spend")))
                     candidates.append(
                         {
                             "priority": p,
                             "group": group,
                             "asin": asin,
-                            "score": float(score),
-                            "line": f"`{p}` `{_group_tag(group)}` {core}（{owner}）：{ev_txt}（{' | '.join(link_parts)}）",
+                            "spend": float(_as_float(r.get("e_spend"))),
+                            "delta": float(abs(delta_sales_val) if delta_sales_val != 0 else abs(delta_spend_val)),
+                            "line": f"`{p}` `{_group_tag(group)}` {core} | {ev_txt} | 责任:{owner} | {' | '.join(link_parts)}",
                         }
                     )
 
@@ -9514,8 +9901,9 @@ def write_dashboard_md(
                     if asin and asin in used_asins:
                         continue
                     pr = _priority_rank(str(c.get("priority", "P1") or "P1"))
-                    score = float(c.get("score", 0.0) or 0.0)
-                    key = (pr, -score)
+                    spend_v = float(c.get("spend", 0.0) or 0.0)
+                    delta_v = float(c.get("delta", 0.0) or 0.0)
+                    key = (pr, -spend_v, -delta_v)
                     if best_key is None or key < best_key:
                         best_key = key
                         best_idx = i
@@ -9574,11 +9962,11 @@ def write_dashboard_md(
                 detail = str(a.get("detail", "") or "").strip()
                 link = str(a.get("link", "") or "").strip()
                 if title and detail and link:
-                    lines.append(f"- `{p}` {title}：{detail}（{link}）")
+                    lines.append(f"- `{p}` {title}：证据: {detail}（{link}）")
                 elif title and link:
                     lines.append(f"- `{p}` {title}（{link}）")
                 elif title and detail:
-                    lines.append(f"- `{p}` {title}：{detail}")
+                    lines.append(f"- `{p}` {title}：证据: {detail}")
                 elif title:
                     lines.append(f"- `{p}` {title}")
         else:
@@ -9602,14 +9990,37 @@ def write_dashboard_md(
                     "product_name": "商品名",
                     "product_category": "类目",
                     "sessions_recent_7d": "Sessions(7d)",
-                    "ad_ctr_recent_7d": "广告CTR(7d)",
-                    "ad_cvr_recent_7d": "广告CVR(7d)",
-                    "ad_cpa_order_recent_7d": "CPA(订单,7d)",
-                    "ad_sales_share_recent_7d": "广告占比(7d)",
-                    "ad_acos_recent_7d": "广告ACOS(7d)",
-                    "ad_spend_recent_7d": "广告花费(7d)",
+                    "ad_ctr_recent_7d": "广告CTR(7d,%)",
+                    "ad_cvr_recent_7d": "广告CVR(7d,%)",
+                    "ad_cpa_order_recent_7d": "CPA(订单,USD)",
+                    "ad_sales_share_recent_7d": "广告占比(7d,%)",
+                    "ad_acos_recent_7d": "广告ACOS(7d,%)",
+                    "ad_spend_recent_7d": "广告花费(7d,USD)",
                     "stage_focus_reasons": "阶段提示",
                 }
+
+                def _fmt_num(x: object, nd: int = 2) -> str:
+                    try:
+                        v = float(pd.to_numeric(x, errors="coerce"))
+                        if pd.isna(v):
+                            return ""
+                        s = f"{v:.{nd}f}"
+                        return s.rstrip("0").rstrip(".")
+                    except Exception:
+                        return str(x or "").strip()
+
+                def _fmt_usd(x: object) -> str:
+                    s = _fmt_num(x, nd=2)
+                    return f"${s}" if s else ""
+
+                def _fmt_pct(x: object, nd: int = 1) -> str:
+                    try:
+                        v = float(pd.to_numeric(x, errors="coerce"))
+                        if pd.isna(v):
+                            return ""
+                        return f"{v * 100:.{nd}f}%"
+                    except Exception:
+                        return str(x or "").strip()
 
                 def _stage_table(df: pd.DataFrame, group_name: str, cols: List[str]) -> str:
                     sub = df[df["stage_group"] == group_name].copy()
@@ -9621,7 +10032,22 @@ def write_dashboard_md(
                     elif "focus_score" in sub.columns:
                         sub = sub.sort_values(["focus_score"], ascending=[False])
                     sub = sub.head(5).copy()
-                    return _display_table(sub, cols, stage_map)
+                    sub_fmt = sub.copy()
+                    for c in ("sessions_recent_7d",):
+                        if c in sub_fmt.columns:
+                            sub_fmt[c] = pd.to_numeric(sub_fmt[c], errors="coerce").fillna(0).astype(int)
+                    for c in (
+                        "ad_ctr_recent_7d",
+                        "ad_cvr_recent_7d",
+                        "ad_sales_share_recent_7d",
+                        "ad_acos_recent_7d",
+                    ):
+                        if c in sub_fmt.columns:
+                            sub_fmt[c] = sub_fmt[c].map(lambda x: _fmt_pct(x, nd=1))
+                    for c in ("ad_cpa_order_recent_7d", "ad_spend_recent_7d"):
+                        if c in sub_fmt.columns:
+                            sub_fmt[c] = sub_fmt[c].map(_fmt_usd)
+                    return _display_table(sub_fmt, cols, stage_map)
 
                 # 新品期 Top
                 lines.append("### 启动期 Top（launch）")
@@ -9695,6 +10121,69 @@ def write_dashboard_md(
         else:
             lines.append("- （暂无可收敛的本周行动清单；建议先看 [Action Board](../dashboard/action_board.csv) 与 [Watchlists](#watchlists)）")
 
+        # Campaign 优先排查：让运营先按“外层 campaign”收口，再下钻到词/ASIN
+        lines.append("")
+        lines.append('<a id="campaign"></a>')
+        lines.append("### Campaign 优先排查（Top 3）")
+        lines.append("")
+        try:
+            camp_view = campaign_action_view.copy() if isinstance(campaign_action_view, pd.DataFrame) else pd.DataFrame()
+            if camp_view is None or camp_view.empty:
+                lines.append("- （暂无）")
+            else:
+                cv = camp_view.copy()
+                for c in ("action_count", "p0_count", "p1_count", "p2_count", "blocked_count"):
+                    if c in cv.columns:
+                        cv[c] = pd.to_numeric(cv[c], errors="coerce").fillna(0).astype(int)
+                for c in ("spend_sum", "delta_sales_sum", "delta_spend_sum"):
+                    if c in cv.columns:
+                        cv[c] = pd.to_numeric(cv[c], errors="coerce").fillna(0.0)
+                # 排序：先 P0，再花费，再 ΔSales
+                try:
+                    cv = cv.sort_values(["p0_count", "spend_sum", "delta_sales_sum"], ascending=[False, False, False])
+                except Exception:
+                    pass
+
+                for _, r in cv.head(3).iterrows():
+                    ad_type = str(r.get("ad_type", "") or "").strip()
+                    camp = str(r.get("campaign", "") or "").strip()
+                    p0 = int(r.get("p0_count", 0) or 0)
+                    p1 = int(r.get("p1_count", 0) or 0)
+                    cnt = int(r.get("action_count", 0) or 0)
+                    blocked_cnt = int(r.get("blocked_count", 0) or 0)
+                    spend = _fmt_usd(r.get("spend_sum"))
+                    delta_sales = _fmt_signed_usd(r.get("delta_sales_sum"))
+                    delta_spend = _fmt_signed_usd(r.get("delta_spend_sum"))
+                    top_asins_raw = str(r.get("top_asins", "") or "").strip()
+                    top_asins = ""
+                    if top_asins_raw:
+                        tops = [x for x in top_asins_raw.split(";") if x]
+                        top_asins = ";".join(tops[:2])
+
+                    parts = []
+                    if ad_type:
+                        parts.append(f"`{ad_type}`")
+                    if camp:
+                        parts.append(camp)
+                    parts.append(f"P0=`{p0}` P1=`{p1}` 动作=`{cnt}`")
+                    ev_parts = []
+                    if spend:
+                        ev_parts.append(f"花费=`{spend}`")
+                    if delta_sales:
+                        ev_parts.append(f"ΔSales=`{delta_sales}`")
+                    if delta_spend:
+                        ev_parts.append(f"ΔSpend=`{delta_spend}`")
+                    if blocked_cnt > 0:
+                        ev_parts.append(f"阻断=`{blocked_cnt}`")
+                    if ev_parts:
+                        parts.append(f"证据: {' | '.join(ev_parts)}")
+                    if top_asins:
+                        parts.append(f"TopASIN=`{top_asins}`")
+                    parts.append("[筛选表](../dashboard/campaign_action_view.csv)")
+                    lines.append("- " + " | ".join([p for p in parts if p]))
+        except Exception:
+            lines.append("- （暂无）")
+
         # 规则化告警（Top 5）：避免 dashboard 变成“指标堆叠”，先把最关键的风险/机会露出来
         lines.append("")
         lines.append('<a id="alerts"></a>')
@@ -9709,9 +10198,9 @@ def write_dashboard_md(
                 detail = str(a.get("detail", "") or "").strip()
                 link = str(a.get("link", "") or "").strip()
                 if link:
-                    lines.append(f"- `{p}` {title}：{detail}（{link}）")
+                    lines.append(f"- `{p}` {title}：证据: {detail}（{link}）")
                 else:
-                    lines.append(f"- `{p}` {title}：{detail}")
+                    lines.append(f"- `{p}` {title}：证据: {detail}")
 
         # L0+ 执行复盘（可选）：基于 execution_log 回填，回答“上次做了什么？有没有效果？有什么异常？”
         try:
@@ -9832,6 +10321,8 @@ def write_dashboard_md(
         lines.append('<a id="watchlists"></a>')
         lines.append("### 五大 Watchlist 摘要（Top 5）")
         lines.append("")
+        lines.append("- 表头释义：`roll`=滚动窗口；`cover7d`=库存覆盖天数(7d)；`原因1/原因2`=规则标签")
+        lines.append("")
         try:
             ac = asin_cockpit if isinstance(asin_cockpit, pd.DataFrame) else None
 
@@ -9847,6 +10338,28 @@ def write_dashboard_md(
                         v[c] = pd.to_numeric(v[c], errors="coerce").fillna(0).astype(int)
                 return v
 
+            def _ensure_reason_cols(df: pd.DataFrame) -> pd.DataFrame:
+                v = df.copy()
+                if "reason_1" in v.columns and "reason_2" in v.columns:
+                    return v
+                reason_candidates = []
+                for c in ("reason", "reasons", "focus_reasons", "focus_reasons_history", "stage_focus_reasons"):
+                    if c in v.columns:
+                        reason_candidates.append(c)
+                if not reason_candidates:
+                    v["reason_1"] = v.get("reason_1", "")
+                    v["reason_2"] = v.get("reason_2", "")
+                    return v
+                src = reason_candidates[0]
+                try:
+                    parts = v[src].astype(str).fillna("").map(lambda x: [p for p in str(x).split(";") if str(p).strip()])
+                    v["reason_1"] = parts.map(lambda xs: xs[0] if isinstance(xs, list) and len(xs) >= 1 else "")
+                    v["reason_2"] = parts.map(lambda xs: xs[1] if isinstance(xs, list) and len(xs) >= 2 else "")
+                except Exception:
+                    v["reason_1"] = v.get("reason_1", "")
+                    v["reason_2"] = v.get("reason_2", "")
+                return v
+
             wl_map = {
                 "asin": "ASIN",
                 "product_name": "品名",
@@ -9854,6 +10367,13 @@ def write_dashboard_md(
                 "ad_spend_roll": "广告花费(滚动)",
                 "over_profit_cap": "超利润上限",
                 "inventory_cover_days_7d": "库存覆盖(7天)",
+                "sigmoid_modifier": "调速系数",
+                "sigmoid_action": "调速建议",
+                "gross_margin": "毛利率",
+                "safe_acos": "安全ACOS",
+                "ad_acos_recent": "实际ACOS(近7天)",
+                "ad_cpc_recent_7d": "实际CPC(近7天)",
+                "safe_cpc": "安全CPC",
                 "oos_with_ad_spend_days": "断货仍花费天数",
                 "delta_spend": "花费Δ",
                 "delta_sales": "销售Δ",
@@ -9879,7 +10399,7 @@ def write_dashboard_md(
             if w1 is None or w1.empty:
                 lines.append("- （无）")
             else:
-                w1v = _fmt(w1, float_cols=["ad_spend_roll", "over_profit_cap"], int_cols=[])
+                w1v = _ensure_reason_cols(_fmt(w1, float_cols=["ad_spend_roll", "over_profit_cap"], int_cols=[]))
                 lines.append(
                     _display_table(
                         w1v,
@@ -9912,11 +10432,59 @@ def write_dashboard_md(
             if w2 is None or w2.empty:
                 lines.append("- （无）")
             else:
-                w2v = _fmt(w2, float_cols=["ad_spend_roll", "inventory_cover_days_7d"], int_cols=[])
+                w2v = _ensure_reason_cols(_fmt(w2, float_cols=["ad_spend_roll", "inventory_cover_days_7d"], int_cols=[]))
                 lines.append(
                     _display_table(
                         w2v,
                         ["asin", "product_name", "product_category", "ad_spend_roll", "inventory_cover_days_7d", "reason_1", "reason_2"],
+                        wl_map,
+                    )
+                )
+            lines.append("")
+
+            # 2.5) 补充建议：库存调速（Sigmoid，仅建议）
+            lines.append("### 补充建议（可选）")
+            lines.append("")
+            lines.append(
+                "#### 库存调速建议（Sigmoid，仅建议） - [打开筛选表](../dashboard/inventory_sigmoid_watchlist.csv)"
+            )
+            lines.append("")
+            lines.append("- 口径：基于 `inventory_cover_days_7d` 计算调速系数；仅提示，不影响排序/不自动执行。")
+            try:
+                w2s = build_inventory_sigmoid_watchlist(asin_cockpit=ac, max_rows=5, policy=policy)
+            except Exception:
+                w2s = pd.DataFrame()
+            if w2s is None or w2s.empty:
+                lines.append("- （无）")
+            else:
+                w2sv = _ensure_reason_cols(_fmt(w2s, float_cols=["ad_spend_roll", "inventory_cover_days_7d", "sigmoid_modifier"], int_cols=[]))
+                lines.append(
+                    _display_table(
+                        w2sv,
+                        ["asin", "product_name", "product_category", "inventory_cover_days_7d", "sigmoid_modifier", "sigmoid_action", "reason_1"],
+                        wl_map,
+                    )
+                )
+            lines.append("")
+
+            # 2.6) 补充建议：利润护栏（Break-even）
+            lines.append(
+                "#### 利润护栏（Break-even） - [打开筛选表](../dashboard/profit_guard_watchlist.csv)"
+            )
+            lines.append("")
+            lines.append("- 口径：安全ACOS = 毛利率 - 目标净利率；当实际 ACOS 超线时提示。")
+            try:
+                w2p = build_profit_guard_watchlist(asin_cockpit=ac, max_rows=5, policy=policy)
+            except Exception:
+                w2p = pd.DataFrame()
+            if w2p is None or w2p.empty:
+                lines.append("- （无）")
+            else:
+                w2pv = _ensure_reason_cols(_fmt(w2p, float_cols=["gross_margin", "safe_acos", "ad_acos_recent", "ad_cpc_recent_7d", "safe_cpc", "ad_spend_roll"], int_cols=[]))
+                lines.append(
+                    _display_table(
+                        w2pv,
+                        ["asin", "product_name", "product_category", "gross_margin", "safe_acos", "ad_acos_recent", "ad_cpc_recent_7d", "safe_cpc", "reason_1"],
                         wl_map,
                     )
                 )
@@ -9939,7 +10507,7 @@ def write_dashboard_md(
             if w3 is None or w3.empty:
                 lines.append("- （无）")
             else:
-                w3v = _fmt(w3, float_cols=["ad_spend_roll", "delta_spend", "delta_sales"], int_cols=[])
+                w3v = _ensure_reason_cols(_fmt(w3, float_cols=["ad_spend_roll", "delta_spend", "delta_sales"], int_cols=[]))
                 lines.append(
                     _display_table(
                         w3v,
@@ -9967,7 +10535,7 @@ def write_dashboard_md(
             if w5 is None or w5.empty:
                 lines.append("- （无）")
             else:
-                w5v = _fmt(w5, float_cols=["ad_spend_roll"], int_cols=["flag_oos", "flag_low_inventory", "oos_with_ad_spend_days"])
+                w5v = _ensure_reason_cols(_fmt(w5, float_cols=["ad_spend_roll"], int_cols=["flag_oos", "flag_low_inventory", "oos_with_ad_spend_days"]))
                 lines.append(
                     _display_table(
                         w5v,
@@ -9989,7 +10557,7 @@ def write_dashboard_md(
             if w4 is None or w4.empty:
                 lines.append("- （无）")
             else:
-                w4v = _fmt(w4, float_cols=["delta_sales", "tacos_roll", "inventory_cover_days_7d"], int_cols=[])
+                w4v = _ensure_reason_cols(_fmt(w4, float_cols=["delta_sales", "tacos_roll", "inventory_cover_days_7d"], int_cols=[]))
                 lines.append(
                     _display_table(
                         w4v,
@@ -10013,7 +10581,7 @@ def write_dashboard_md(
             if w6 is None or w6.empty:
                 lines.append("- （无）")
             else:
-                w6v = _fmt(w6, float_cols=["ad_spend_roll"], int_cols=["oos_with_ad_spend_days"])
+                w6v = _ensure_reason_cols(_fmt(w6, float_cols=["ad_spend_roll"], int_cols=["oos_with_ad_spend_days"]))
                 lines.append(
                     _display_table(
                         w6v,
@@ -10033,6 +10601,7 @@ def write_dashboard_md(
         )
         lines.append("")
         lines.append("- 口径提示：同一搜索词会贡献多个 n-gram，因此主题 spend 会有重复计数；该表仅用于线索与聚焦，不做精确归因。")
+        lines.append("- 字段释义：n=词长；waste_spend=浪费花费；top_terms=代表搜索词；ctr/cvr/acos 为广告口径。")
         lines.append("- 下钻页：`./keyword_topics.md`（按步骤：Segment Top → Action Hints → ASIN Context）")
         lines.append("- Segment Top（先选类目/阶段再下钻）：`../dashboard/keyword_topics_segment_top.csv`（每行=类目×阶段；Top 浪费/贡献主题各 TopN）")
         lines.append("- 主题建议清单：`../dashboard/keyword_topics_action_hints.csv`（Top 浪费主题→否词/降价；Top 贡献主题→加精确/提价/加预算；含 top_campaigns/top_ad_groups；scale 方向会标注/阻断库存风险：blocked/blocked_reason）")
@@ -10122,6 +10691,7 @@ def write_dashboard_md(
         lines.append("### 变化来源（近7天 vs 前7天 Top ASIN） - [打开筛选表](../dashboard/drivers_top_asins.csv)")
         lines.append("")
         lines.append("- 运营版：只保留少列快速扫；更多维度请看 `../dashboard/drivers_top_asins.csv`")
+        lines.append("- 字段释义：ΔSales/ΔAdSpend=近7天-前7天；marginal_tacos=ΔAdSpend/ΔSales（销售为0时以原表为准）")
         lines.append("")
         if drivers_top_asins is None or drivers_top_asins.empty:
             lines.append("- （无）")
@@ -10432,6 +11002,7 @@ def write_dashboard_md(
         lines.append("## 3) Campaign 行动聚合（优先按 campaign 排查）")
         lines.append("")
         lines.append("- 说明：从 Action Board 聚合到 Campaign，先定位“哪个 Campaign 最需要处理”。")
+        lines.append("- 字段释义：P0/P1=优先级计数；ΔSales/ΔSpend=近7天-前7天；TopASIN=该 Campaign 花费Top ASIN")
         lines.append("- 下钻入口：`../dashboard/action_board.csv`（按 campaign 过滤即可定位细项）")
         lines.append("")
         try:
@@ -10476,9 +11047,9 @@ def write_dashboard_md(
             lines.append("- （无）")
 
         lines.append("")
-        lines.append("## 4) Action Board（P0/P1 优先，最多展示 20 条）")
+        lines.append("## 4) Action Board（运营聚焦版）")
         lines.append("")
-        lines.append("- 运营版：只保留少列快速扫；更多维度请看 `../dashboard/action_board.csv`")
+        lines.append("- 只保留“行动/证据/责任/操作手册”四列，避免词级噪音；更多维度请看 `../dashboard/action_board.csv`")
         # 口径提示：asin_hint 是弱关联，低置信度动作不建议直接执行
         try:
             low_thr = 0.35
@@ -10494,6 +11065,7 @@ def write_dashboard_md(
             lines.append(
                 "- 口径提示：`asin_hint` 为弱关联定位；低置信度时建议先人工确认（可在 `../dashboard/action_board.csv` 里筛选/对照候选ASIN）"
             )
+        lines.append("- 字段释义：行动=动作类型+对象+动作值；证据=花费/Δ/订单/ACOS/阻断；责任=建议归属；操作手册=排查路径")
         lines.append("")
         if action_board is None or action_board.empty:
             lines.append("- （无）")
@@ -10567,44 +11139,66 @@ def write_dashboard_md(
             if "blocked" in view.columns:
                 view["blocked"] = pd.to_numeric(view["blocked"], errors="coerce").fillna(0).astype(int)
 
+            # 运营聚焦：合并行动描述
+            try:
+                def _fmt_action_row(r: pd.Series) -> str:
+                    p = str(r.get("priority", "") or "").strip().upper()
+                    obj = str(r.get("object_name", "") or "").strip()
+                    act = str(r.get("action_type", "") or "").strip().upper()
+                    val = str(r.get("action_value", "") or "").strip()
+                    if val:
+                        return f"`{p}` {act} {obj} {val}".strip()
+                    return f"`{p}` {act} {obj}".strip()
+
+                view["action_brief"] = view.apply(_fmt_action_row, axis=1)
+            except Exception:
+                view["action_brief"] = view.get("action_type", "")
+
+            # 证据列（统一格式）
+            try:
+                evid = []
+                for _, r in view.iterrows():
+                    parts = []
+                    if "e_spend" in r and r.get("e_spend") is not None:
+                        parts.append(f"花费={_fmt_usd(r.get('e_spend'))}")
+                    if "e_orders" in r and r.get("e_orders") is not None:
+                        parts.append(f"订单={_fmt_num(r.get('e_orders'), nd=0)}")
+                    if "e_acos" in r and r.get("e_acos") is not None:
+                        parts.append(f"ACOS={_fmt_num(r.get('e_acos'), nd=4)}")
+                    if "asin_delta_sales" in r and r.get("asin_delta_sales") is not None:
+                        ds = _fmt_signed_usd(r.get("asin_delta_sales"))
+                        if ds:
+                            parts.append(f"ΔSales={ds}")
+                    if "blocked_reason" in r and str(r.get("blocked_reason") or "").strip():
+                        parts.append(f"阻断={str(r.get('blocked_reason') or '').strip()}")
+                    evid.append(" | ".join([p for p in parts if p]))
+                view["evidence_brief"] = evid
+            except Exception:
+                view["evidence_brief"] = ""
+
+            # 责任归属
+            try:
+                def _owner_from_row(r: pd.Series) -> str:
+                    if int(r.get("blocked", 0) or 0) > 0:
+                        return "供应链/广告运营"
+                    act = str(r.get("action_type", "") or "").upper()
+                    if act in {"NEGATE", "BID_DOWN"}:
+                        return "广告运营"
+                    if act in {"BID_UP", "BUDGET_UP"}:
+                        return "广告运营"
+                    return "运营/广告运营"
+
+                view["owner_brief"] = view.apply(_owner_from_row, axis=1)
+            except Exception:
+                view["owner_brief"] = ""
+
             ab_map = {
-                "priority": "优先级",
-                "blocked": "阻断",
-                "blocked_reason": "阻断原因",
-                "product_category": "商品分类",
-                "asin_hint": "ASIN",
-                "asin_hint_confidence": "ASIN置信度",
-                "current_phase": "生命周期",
-                "asin_sales_recent_7d": "近7天销售额",
-                "asin_delta_sales": "销售Δ",
-                "action_type": "动作类型",
-                "action_value": "动作值",
-                "object_name": "对象",
-                "e_spend": "广告花费",
-                "priority_reason": "规则原因",
+                "action_brief": "行动",
+                "evidence_brief": "证据",
+                "owner_brief": "责任",
                 "playbook": "操作手册",
             }
-            show_cols = [
-                c
-                for c in [
-                    "priority",
-                    "blocked",
-                    "blocked_reason",
-                    "product_category",
-                    "asin_hint",
-                    "asin_hint_confidence",
-                    "current_phase",
-                    "asin_sales_recent_7d",
-                    "asin_delta_sales",
-                    "action_type",
-                    "action_value",
-                    "object_name",
-                    "e_spend",
-                    "priority_reason",
-                    "playbook",
-                ]
-                if c in view.columns
-            ]
+            show_cols = [c for c in ["action_brief", "evidence_brief", "owner_brief", "playbook"] if c in view.columns]
             lines.append(_display_table(view, show_cols, ab_map))
         lines.append("")
         lines.append("## 5) 文件导航")
@@ -10615,6 +11209,8 @@ def write_dashboard_md(
         lines.append("- `../dashboard/unlock_scale_tasks_full.csv`：放量解锁任务表全量（含更多任务/优先级，便于追溯）")
         lines.append("- `../dashboard/profit_reduce_watchlist.csv`：利润控量 Watchlist（profit_direction=reduce 且仍在烧钱，可筛选优先止血）")
         lines.append("- `../dashboard/inventory_risk_watchlist.csv`：库存告急仍投放 Watchlist（cover7d 低且仍在投放，提前控量/预警）")
+        lines.append("- `../dashboard/inventory_sigmoid_watchlist.csv`：库存调速建议（Sigmoid，仅建议，不影响排序）")
+        lines.append("- `../dashboard/profit_guard_watchlist.csv`：利润护栏 Watchlist（Break-even：安全ACOS/CPC 超线提示）")
         lines.append("- `../dashboard/oos_with_ad_spend_watchlist.csv`：断货仍烧钱 Watchlist（oos_with_ad_spend_days>0 且仍在投放，优先止损）")
         lines.append("- `../dashboard/spend_up_no_sales_watchlist.csv`：加花费但销量不增 Watchlist（delta_spend>0 且 delta_sales<=0，优先排查）")
         lines.append("- `../dashboard/phase_down_recent_watchlist.csv`：阶段走弱 Watchlist（近14天阶段走弱 down 且仍在花费：优先排查根因）")
@@ -13249,6 +13845,38 @@ def write_dashboard_outputs(
         else:
             pd.DataFrame(columns=["asin"]).to_csv(inventory_risk_watchlist_path, index=False, encoding="utf-8-sig")
 
+        # 3.565) inventory_sigmoid_watchlist.csv（库存调速建议：Sigmoid）
+        inventory_sigmoid_watchlist = None
+        try:
+            inventory_sigmoid_watchlist = build_inventory_sigmoid_watchlist(
+                asin_cockpit=asin_cockpit if isinstance(asin_cockpit, pd.DataFrame) else None,
+                max_rows=500,
+                policy=policy,
+            )
+        except Exception:
+            inventory_sigmoid_watchlist = pd.DataFrame()
+        inventory_sigmoid_watchlist_path = dashboard_dir / "inventory_sigmoid_watchlist.csv"
+        if inventory_sigmoid_watchlist is not None and not inventory_sigmoid_watchlist.empty:
+            inventory_sigmoid_watchlist.to_csv(inventory_sigmoid_watchlist_path, index=False, encoding="utf-8-sig")
+        else:
+            pd.DataFrame(columns=["asin"]).to_csv(inventory_sigmoid_watchlist_path, index=False, encoding="utf-8-sig")
+
+        # 3.566) profit_guard_watchlist.csv（利润护栏：Break-even 提示）
+        profit_guard_watchlist = None
+        try:
+            profit_guard_watchlist = build_profit_guard_watchlist(
+                asin_cockpit=asin_cockpit if isinstance(asin_cockpit, pd.DataFrame) else None,
+                max_rows=500,
+                policy=policy,
+            )
+        except Exception:
+            profit_guard_watchlist = pd.DataFrame()
+        profit_guard_watchlist_path = dashboard_dir / "profit_guard_watchlist.csv"
+        if profit_guard_watchlist is not None and not profit_guard_watchlist.empty:
+            profit_guard_watchlist.to_csv(profit_guard_watchlist_path, index=False, encoding="utf-8-sig")
+        else:
+            pd.DataFrame(columns=["asin"]).to_csv(profit_guard_watchlist_path, index=False, encoding="utf-8-sig")
+
         # 3.57) oos_with_ad_spend_watchlist.csv（断货仍烧钱：历史诊断入口）
         oos_watchlist = None
         try:
@@ -13824,6 +14452,8 @@ def write_dashboard_outputs(
             sc_score2["watchlists"] = build_watchlists_summary(
                 profit_reduce_watchlist=profit_reduce_watchlist if isinstance(profit_reduce_watchlist, pd.DataFrame) else None,
                 inventory_risk_watchlist=inventory_risk_watchlist if isinstance(inventory_risk_watchlist, pd.DataFrame) else None,
+                inventory_sigmoid_watchlist=inventory_sigmoid_watchlist if isinstance(inventory_sigmoid_watchlist, pd.DataFrame) else None,
+                profit_guard_watchlist=profit_guard_watchlist if isinstance(profit_guard_watchlist, pd.DataFrame) else None,
                 oos_with_ad_spend_watchlist=oos_watchlist if isinstance(oos_watchlist, pd.DataFrame) else None,
                 spend_up_no_sales_watchlist=spend_up_no_sales_watchlist if isinstance(spend_up_no_sales_watchlist, pd.DataFrame) else None,
                 phase_down_recent_watchlist=phase_down_recent_watchlist if isinstance(phase_down_recent_watchlist, pd.DataFrame) else None,
