@@ -827,7 +827,14 @@ a:hover{text-decoration:underline;}
   background:rgba(37,99,235,.03);
 }
 .kpi .k{font-size:12px;color:var(--muted);margin-bottom:6px;}
-.kpi .v{font-size:18px;font-weight:800;letter-spacing:.2px;line-height:1.2;}
+.kpi .v{font-size:18px;font-weight:800;letter-spacing:.2px;line-height:1.2;font-variant-numeric:tabular-nums;}
+.kpi .v.neg{color:#b91c1c;}
+.kpi .v.pos{color:#16a34a;}
+.kpi .v.zero{color:var(--muted);}
+@media (prefers-color-scheme: dark){
+  .kpi .v.neg{color:#f87171;}
+  .kpi .v.pos{color:#34d399;}
+}
 .kpi .s{font-size:11px;color:var(--muted);margin-top:4px;}
 .raw-details{margin-top:6px;}
 .raw-details summary{
@@ -1839,6 +1846,33 @@ function _extractDashboardKpis(text){
     const t=String(text||'');
     const range=_nthCapture(t, /近7天\(([^)]+)\)/, 1);
 
+    const _toNum=(x)=>{
+      try{
+        const v=parseFloat(String(x||'').replace(/,/g,''));
+        return Number.isFinite(v) ? v : null;
+      }catch(e){ return null; }
+    };
+    const _fmtNum=(x, nd=2)=>{
+      const v=_toNum(x);
+      if(v===null) return String(x||'');
+      try{
+        return v.toLocaleString(undefined, {minimumFractionDigits: nd, maximumFractionDigits: nd});
+      }catch(e){
+        return v.toFixed(nd);
+      }
+    };
+    const _fmtUSD=(x)=>{
+      const v=_toNum(x);
+      if(v===null) return String(x||'');
+      const sign=v<0 ? '-' : '';
+      return `${sign}$${_fmtNum(Math.abs(v), 2)}`;
+    };
+    const _fmtPct=(x, nd=1)=>{
+      const v=_toNum(x);
+      if(v===null) return String(x||'');
+      return `${(v*100).toFixed(nd)}%`;
+    };
+
     const sales1=_nthCapture(t, /Sales\s*=\s*([-\d.,]+)/, 1);
     const sales2=_nthCapture(t, /Sales\s*=\s*([-\d.,]+)/, 2);
     const spend1=_nthCapture(t, /AdSpend\s*=\s*([-\d.,]+)/, 1);
@@ -1849,17 +1883,63 @@ function _extractDashboardKpis(text){
     const mtacos=_nthCapture(t, /marginal_tacos\s*=\s*([-\d.,]+)/, 1);
 
     const out=[];
-    if(sales1) out.push({k:'Sales（总）', v:sales1, s:''});
-    if(spend1) out.push({k:'AdSpend（总）', v:spend1, s:''});
-    if(tacos) out.push({k:'TACoS（总）', v:tacos, s:''});
-    if(sales2) out.push({k:'Sales（近7天）', v:sales2, s:range?('近7天 '+range):'近7天'});
-    if(spend2) out.push({k:'AdSpend（近7天）', v:spend2, s:range?('近7天 '+range):'近7天'});
-    if(profit7) out.push({k:'Profit（近7天）', v:profit7, s:range?('近7天 '+range):'近7天'});
-    if(dprofit) out.push({k:'ΔProfit（近7天vs前7天）', v:dprofit, s:''});
-    if(mtacos) out.push({k:'边际TACoS', v:mtacos, s:''});
+    if(sales1) out.push({k:'Sales（总）', v:_fmtUSD(sales1), s:''});
+    if(spend1) out.push({k:'AdSpend（总）', v:_fmtUSD(spend1), s:''});
+    if(tacos) out.push({k:'TACoS（总）', v:_fmtPct(tacos, 2), s:''});
+    if(sales2) out.push({k:'Sales（近7天）', v:_fmtUSD(sales2), s:range?('近7天 '+range):'近7天'});
+    if(spend2) out.push({k:'AdSpend（近7天）', v:_fmtUSD(spend2), s:range?('近7天 '+range):'近7天'});
+    if(profit7) out.push({k:'Profit（近7天）', v:_fmtUSD(profit7), s:range?('近7天 '+range):'近7天'});
+    if(dprofit) out.push({k:'ΔProfit（近7天vs前7天）', v:_fmtUSD(dprofit), s:''});
+    if(mtacos) out.push({k:'边际TACoS', v:_fmtPct(mtacos, 2), s:''});
     return out;
   }catch(e){
     return [];
+  }
+}
+
+function _cloneBlock(block){
+  const frag=document.createElement('div');
+  try{
+    block.forEach((node)=>{
+      const cloned=node.cloneNode(true);
+      if(cloned && cloned.nodeType===1 && cloned.hasAttribute('id')) cloned.removeAttribute('id');
+      if(cloned && cloned.querySelectorAll){
+        cloned.querySelectorAll('[id]').forEach(el=>el.removeAttribute('id'));
+      }
+      frag.appendChild(cloned);
+    });
+  }catch(e){}
+  return frag;
+}
+
+function _limitList(container, maxItems, filterFn, moreHref){
+  if(!container) return;
+  const list=container.querySelector('ul,ol');
+  if(!list) return;
+  const items=Array.from(list.children).filter(el=>String(el.tagName||'').toLowerCase()==='li');
+  let kept=0;
+  let totalMatch=0;
+  items.forEach((li)=>{
+    const keep=filterFn ? !!filterFn(li) : true;
+    if(keep) totalMatch++;
+    if(keep && kept<maxItems){
+      kept++;
+    }else{
+      li.style.display='none';
+    }
+  });
+  if(kept===0){
+    const hint=document.createElement('div');
+    hint.className='hint';
+    hint.textContent='（暂无匹配项）';
+    container.appendChild(hint);
+    return;
+  }
+  if(totalMatch>kept){
+    const hint=document.createElement('div');
+    hint.className='hint';
+    hint.innerHTML=moreHref ? `<a href=\"${moreHref}\">更多见下方</a>` : '更多见下方';
+    container.appendChild(hint);
   }
 }
 
@@ -1904,7 +1984,15 @@ function _buildDashboardHero(){
       k.textContent=String(it.k||'');
       const v=document.createElement('div');
       v.className='v';
-      v.textContent=String(it.v||'');
+      const vText=String(it.v||'');
+      v.textContent=vText;
+      if(vText.trim().startsWith('-')){
+        v.classList.add('neg');
+      }else if(vText.trim()==='0' || vText.trim()==='0.0' || vText.trim()==='0.00'){
+        v.classList.add('zero');
+      }else{
+        v.classList.add('pos');
+      }
       card.appendChild(k);
       card.appendChild(v);
       if(it.s){
@@ -1917,23 +2005,7 @@ function _buildDashboardHero(){
     });
   }
 
-  // 3) 把原“全量大盘指标”收起来（保留追溯，不干扰阅读）
-  try{
-    if(kpiCard){
-      const raw=kpiCard.innerHTML;
-      kpiCard.innerHTML='';
-      const details=document.createElement('details');
-      details.className='raw-details';
-      const sum=document.createElement('summary');
-      sum.textContent='大盘全量指标（展开）';
-      const body=document.createElement('div');
-      body.className='raw-body';
-      body.innerHTML=raw;
-      details.appendChild(sum);
-      details.appendChild(body);
-      kpiCard.appendChild(details);
-    }
-  }catch(e){}
+  // 3) 不再在“本期结论”区展示“大盘全量指标”，避免与 Hero 重复
 
   // 4) 收集 “本周行动 / Shop Alerts / Campaign 优先排查” 三个区块（heading + cards）
   function findH3ByTextOrId(root, id, text){
@@ -2050,23 +2122,25 @@ function _buildDashboardHero(){
     campaignBlock.forEach((x)=>col4.appendChild(x));
   }
 
-  // 5.5) 本期结论补充：折叠展示（可追溯，但不干扰第一屏节奏）
+  let insertAfter=hero;
+
+  // Hero 内只显示 Top 2（P0/P1 优先），减少第一屏噪音
   try{
-    if(overviewCards){
-      const details=document.createElement('details');
-      details.className='fold-section';
-      const sum=document.createElement('summary');
-      sum.textContent='本期结论补充（展开）';
-      const body=document.createElement('div');
-      body.className='fold-body';
-      body.appendChild(overviewCards);
-      details.appendChild(sum);
-      details.appendChild(body);
-      hero.insertAdjacentElement('afterend', details);
+    _limitList(col2, 2, null, '');
+    _limitList(col3, 2, (li)=>/\\bP0\\b|\\bP1\\b/.test(String(li.textContent||'')), '');
+    _limitList(col4, 2, null, '');
+  }catch(e){}
+
+  // 5.6) 本期结论补充已移除（避免重复占用第一屏空间）
+
+  // 6) 移除本期结论卡片区（避免重复：大盘指标/本周行动摘要）
+  try{
+    if(overviewCards && overviewCards.parentNode){
+      overviewCards.parentNode.removeChild(overviewCards);
     }
   }catch(e){}
 
-  // 6) 修复目录锚点：把本周行动/Shop Alerts 的 TOC 指向“hero 上下两个锚点”
+  // 7) 修复目录锚点：把本周行动/Shop Alerts 的 TOC 指向“hero 上下两个锚点”
   try{
     const weeklyAnchor=document.createElement('div');
     weeklyAnchor.id='weekly-anchor';
@@ -9627,6 +9701,16 @@ def write_dashboard_md(
                     return "放量"
                 return "排查"
 
+            def _group_rank(group: str) -> int:
+                g = str(group or "").strip().lower()
+                if g == "stop":
+                    return 0
+                if g == "review":
+                    return 1
+                if g == "scale":
+                    return 2
+                return 1
+
             def _group_from_alert(title: str) -> str:
                 """
                 轻量分类（只用于“本周行动”展示聚焦，不影响任何算数逻辑）：
@@ -9901,9 +9985,10 @@ def write_dashboard_md(
                     if asin and asin in used_asins:
                         continue
                     pr = _priority_rank(str(c.get("priority", "P1") or "P1"))
+                    gr = _group_rank(str(c.get("group", "") or ""))
                     spend_v = float(c.get("spend", 0.0) or 0.0)
                     delta_v = float(c.get("delta", 0.0) or 0.0)
-                    key = (pr, -spend_v, -delta_v)
+                    key = (pr, gr, -spend_v, -delta_v)
                     if best_key is None or key < best_key:
                         best_key = key
                         best_idx = i
