@@ -442,6 +442,14 @@ def _md_to_html_body(md_text: str, base_dir: Optional[Path] = None) -> str:
                 i += 1
                 continue
 
+            # allow specific raw HTML blocks (for layout cards/flows in reports)
+            if re.match(r"^</?(div|details|summary|span)(\s|>)", line):
+                _close_ul()
+                _close_table()
+                out.append(raw)
+                i += 1
+                continue
+
             # horizontal rule
             if line == "---":
                 _close_ul()
@@ -947,6 +955,93 @@ a:hover{text-decoration:underline;}
 @media (prefers-color-scheme: dark){
   .kanban-card{background:rgba(2,6,23,.25);}
 }
+.loop-flow{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  align-items:center;
+  margin:8px 0 12px;
+}
+.loop-step{
+  padding:6px 10px;
+  border:1px solid var(--border);
+  border-radius:12px;
+  background:rgba(99,102,241,.06);
+  font-weight:800;
+  font-size:12px;
+}
+.loop-arrow{color:var(--muted);font-weight:800;}
+.loop-metrics{
+  display:grid;
+  grid-template-columns:repeat(auto-fit, minmax(160px, 1fr));
+  gap:8px;
+  margin:6px 0 12px;
+}
+.loop-metric{
+  border:1px solid var(--border);
+  border-radius:12px;
+  padding:8px 10px;
+  background:rgba(37,99,235,.03);
+}
+.loop-metric .k{font-size:12px;color:var(--muted);}
+.loop-metric .v{font-size:16px;font-weight:800;font-variant-numeric:tabular-nums;}
+.timeline-cards{
+  display:grid;
+  grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));
+  gap:10px;
+  margin:8px 0 14px;
+}
+.timeline-card{
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:10px 10px;
+  background:rgba(255,255,255,.60);
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+}
+@media (prefers-color-scheme: dark){
+  .timeline-card{background:rgba(2,6,23,.22);}
+}
+.timeline-card.risk{border-left:4px solid rgba(239,68,68,.55);}
+.timeline-card.opp{border-left:4px solid rgba(34,197,94,.55);}
+.timeline-card .timeline{width:100%;max-width:100%;}
+.timeline-card .timeline-row{
+  display:grid;
+  grid-template-columns:minmax(180px, 1.2fr) minmax(140px, 1fr);
+  gap:8px;
+  align-items:center;
+}
+.timeline-card .timeline-wrap{min-width:0;}
+.timeline-card .metrics{
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+  font-size:12px;
+  color:var(--muted);
+}
+@media (max-width: 720px){
+  .timeline-card .timeline-row{grid-template-columns:1fr;}
+}
+.timeline-card .title{font-weight:800;font-size:13px;}
+.timeline-card .sub{font-size:12px;color:var(--muted);}
+.timeline-card .badges{display:flex;gap:6px;flex-wrap:wrap;}
+.phase-badge{
+  font-size:11px;
+  font-weight:800;
+  padding:2px 8px;
+  border-radius:999px;
+  border:1px solid var(--border);
+  background:rgba(148,163,184,.10);
+}
+.phase-badge.phase-pre_launch{background:rgba(100,116,139,.12);}
+.phase-badge.phase-launch{background:rgba(168,85,247,.14);}
+.phase-badge.phase-growth{background:rgba(37,99,235,.14);}
+.phase-badge.phase-stable{background:rgba(34,197,94,.14);}
+.phase-badge.phase-mature{background:rgba(34,197,94,.14);}
+.phase-badge.phase-decline{background:rgba(249,115,22,.14);}
+.phase-badge.phase-inactive{background:rgba(239,68,68,.14);}
+.phase-badge.strategy{background:rgba(14,165,233,.10);}
 .kanban-col.risk .kanban-head{background:rgba(239,68,68,.08);}
 .kanban-col.opp .kanban-head{background:rgba(34,197,94,.08);}
 .kanban-col.action .kanban-head{background:rgba(59,130,246,.08);}
@@ -1156,6 +1251,10 @@ tbody tr:hover td{background:rgba(37,99,235,.06);}
 	  border-radius:999px;
 	  overflow:hidden;
 	  background:rgba(100,116,139,.08);
+	}
+	.timeline.recent{
+	  box-shadow:0 0 0 2px rgba(239,68,68,.25);
+	  border-color:rgba(239,68,68,.45);
 	}
 	.timeline .seg{
 	  display:flex;
@@ -2133,8 +2232,11 @@ function _buildDashboardHero(){
 
   // 5.6) 本期结论补充已移除（避免重复占用第一屏空间）
 
-  // 6) 移除本期结论卡片区（避免重复：大盘指标/本周行动摘要）
+  // 6) 移除本期结论区头部（避免重复模块），快速入口移入概览列
   try{
+    if(h2){ h2.remove(); }
+    const qe=sec.querySelector('.quick-entry');
+    if(qe){ col1.appendChild(qe); }
     if(overviewCards && overviewCards.parentNode){
       overviewCards.parentNode.removeChild(overviewCards);
     }
@@ -2155,6 +2257,11 @@ function _buildDashboardHero(){
     if(toc){
       Array.from(toc.querySelectorAll('a.toc-item')).forEach((a)=>{
         const t=String(a.textContent||'');
+        if(t.includes('本期结论')){
+          const li=a.closest('li');
+          if(li) li.remove();
+          return;
+        }
         if(t.includes('本周行动')) a.setAttribute('href','#weekly-anchor');
         if(t.includes('Shop Alerts')) a.setAttribute('href','#alerts-anchor');
       });
@@ -2490,17 +2597,21 @@ function _decorateBadges(){
 	  const raw=String(t||'').trim();
 	  if(!raw.startsWith('tl:')) return null;
 	  const s=raw.slice(3);
-	  const items=s.split(';').map(x=>String(x||'').trim()).filter(Boolean);
+	  const parts=s.split('|').map(x=>String(x||'').trim()).filter(Boolean);
+	  const segText=parts[0] || '';
+	  const flags=parts.slice(1);
+	  const items=segText.split(';').map(x=>String(x||'').trim()).filter(Boolean);
 	  const segs=[];
 	  items.forEach((it)=>{
-	    const parts=it.split('=');
-	    if(parts.length!==2) return;
-	    const phase=String(parts[0]||'').trim().toLowerCase();
-	    const days=parseFloat(String(parts[1]||'').trim());
+	    const segParts=it.split('=');
+	    if(segParts.length!==2) return;
+	    const phase=String(segParts[0]||'').trim().toLowerCase();
+	    const days=parseFloat(String(segParts[1]||'').trim());
 	    if(!phase || !Number.isFinite(days) || days<=0) return;
 	    segs.push({phase, days});
 	  });
-	  return segs.length>0 ? segs : null;
+	  if(segs.length<=0) return null;
+	  return {segs, recent: flags.includes('chg14')};
 	}
 	function _renderTimelines(){
 	  const content=_qs('#content');
@@ -2508,11 +2619,13 @@ function _decorateBadges(){
 	  content.querySelectorAll('code').forEach((el)=>{
 	    const txt=(el.innerText||'').trim();
 	    if(!txt.startsWith('tl:')) return;
-	    const segs=_parseTimelineText(txt);
-	    if(!segs) return;
+	    const parsed=_parseTimelineText(txt);
+	    if(!parsed) return;
+	    const segs=parsed.segs || [];
+	    if(segs.length<=0) return;
 	    const total=segs.reduce((a,b)=>a+(b.days||0),0);
 	    const bar=document.createElement('div');
-	    bar.className='timeline';
+	    bar.className=parsed.recent ? 'timeline recent' : 'timeline';
 	    segs.forEach((seg)=>{
 	      const d=seg.days||0;
 	      const part=document.createElement('div');
@@ -9548,7 +9661,13 @@ def write_dashboard_md(
         quick_links.append("[Campaign排查](#campaign)")
         if isinstance(action_review, pd.DataFrame) and (not action_review.empty):
             quick_links.append("[执行复盘](#review)")
-        quick_links += ["[Watchlists](#watchlists)", "[生命周期时间轴](./lifecycle_overview.md)", "[关键词主题](#keywords)", "[Drivers](#drivers)"]
+        quick_links += [
+            "[Watchlists](#watchlists)",
+            "[生命周期闭环](./lifecycle_overview.md#loop)",
+            "[生命周期时间轴](./lifecycle_overview.md)",
+            "[关键词主题](#keywords)",
+            "[Drivers](#drivers)",
+        ]
         lines.append("快速入口：" + " | ".join(quick_links))
         lines.append("")
 
@@ -12628,6 +12747,10 @@ def write_lifecycle_overview_md(
                 except Exception:
                     cur = "unknown"
 
+            cm = cockpit_map.get(a, {})
+            chg_days_val = _safe_int(cm.get("phase_change_days_ago", 0))
+            recent_flag = True if (0 < int(chg_days_val) <= 14) else False
+
             raw_parts: List[Tuple[str, int]] = []
             total_days = 0
             for _, r in gg.iterrows():
@@ -12649,6 +12772,8 @@ def write_lifecycle_overview_md(
             )
             parts2 = [f"{ph}={int(days)}" for ph, days in smooth_parts if int(days) > 0]
             tl = "tl:" + ";".join(parts2) if parts2 else ""
+            if tl and recent_flag:
+                tl = tl + "|chg14"
             tl_cell = f"`{tl}`" if tl else ""
 
             strategy_tag = "排查"
@@ -12680,8 +12805,31 @@ def write_lifecycle_overview_md(
                     return s[0] + "$" + s[1:]
                 return "$" + s
 
+            def _fmt_num(x: object, nd: int = 1) -> str:
+                try:
+                    v = float(pd.to_numeric(x, errors="coerce"))
+                    if pd.isna(v):
+                        return ""
+                    s = f"{v:.{int(nd)}f}"
+                    s = s.rstrip("0").rstrip(".")
+                    return s
+                except Exception:
+                    return ""
+
+            def _fmt_usd(x: object, nd: int = 1) -> str:
+                s = _fmt_num(x, nd=nd)
+                return f"${s}" if s else ""
+
+            def _fmt_pct(x: object, nd: int = 1) -> str:
+                try:
+                    v = float(pd.to_numeric(x, errors="coerce"))
+                    if pd.isna(v):
+                        return ""
+                    return f"{v * 100:.{int(nd)}f}%"
+                except Exception:
+                    return ""
+
             hint_parts: List[str] = []
-            cm = cockpit_map.get(a, {})
             pdx = str(cm.get("profit_direction", "") or "").strip().lower()
             if pdx in {"reduce", "scale"}:
                 hint_parts.append(f"profit={pdx}")
@@ -12690,9 +12838,9 @@ def write_lifecycle_overview_md(
             trend14 = str(cm.get("phase_trend_14d", "") or "").strip().lower()
             if trend14 in {"up", "down"}:
                 hint_parts.append(f"trend14={trend14}")
-            chg_days = _safe_int(cm.get("phase_change_days_ago", 0))
+            chg_days = chg_days_val
             if 0 < int(chg_days) <= 14:
-                hint_parts.append(f"chg={int(chg_days)}d")
+                hint_parts.append(f"⚡chg={int(chg_days)}d")
             ds = _fmt_signed(cm.get("delta_sales", ""), nd=1)
             if ds:
                 hint_parts.append(f"ΔSales={ds}")
@@ -12718,6 +12866,13 @@ def write_lifecycle_overview_md(
                 pass
             hint = " | ".join(hint_parts)
 
+            sales7 = _fmt_usd(cm.get("sales_recent_7d", ""), nd=1)
+            spend_roll = _fmt_usd(cm.get("ad_spend_roll", ""), nd=1)
+            tacos_roll = _fmt_pct(cm.get("tacos_roll", ""), nd=1)
+            cover7 = _fmt_num(cm.get("inventory_cover_days_7d", ""), nd=1)
+            delta_sales = _fmt_usd_signed(cm.get("delta_sales", ""), nd=1)
+            delta_spend = _fmt_usd_signed(cm.get("delta_spend", ""), nd=1)
+
             rows.append(
                 {
                     "product_category": cat,
@@ -12729,6 +12884,12 @@ def write_lifecycle_overview_md(
                     "timeline": tl_cell,
                     "strategy": strategy_tag,
                     "hint": hint,
+                    "sales_recent_7d": sales7,
+                    "ad_spend_roll": spend_roll,
+                    "tacos_roll": tacos_roll,
+                    "inventory_cover_days_7d": f"{cover7}d" if cover7 else "",
+                    "delta_sales": delta_sales,
+                    "delta_spend": delta_spend,
                     "_focus_score": float(pd.to_numeric(cm.get("focus_score", 0.0), errors="coerce") or 0.0),
                 }
             )
@@ -12769,7 +12930,8 @@ def write_lifecycle_overview_md(
 
         cat_list = cat_list[: max(1, int(max_categories or 30))]
 
-        # 近期重点（Top 异常/Top 机会）：基于 asin_cockpit 的近7/14天窗口信号，控制 3-5 条（展示层聚焦）
+        # 生命周期闭环（全链条追踪）+ 近期重点
+        loop_lines: List[str] = []
         highlight_lines: List[str] = []
         phase_dist_lines: List[str] = []
         try:
@@ -13071,6 +13233,299 @@ def write_lifecycle_overview_md(
         except Exception:
             highlight_lines = []
 
+        # 生命周期闭环（全链条追踪）：阶段流转概览 + ASIN 闭环追踪表
+        try:
+            lb = lifecycle_board.copy() if isinstance(lifecycle_board, pd.DataFrame) else pd.DataFrame()
+            if lb is None:
+                lb = pd.DataFrame()
+            if not lb.empty and "asin" in lb.columns:
+                lb = lb.copy()
+                lb["asin"] = lb["asin"].astype(str).fillna("").str.upper().str.strip()
+                lb = lb[lb["asin"] != ""].copy()
+                if "current_phase" in lb.columns:
+                    lb["current_phase"] = lb["current_phase"].map(_norm_phase)
+                if "prev_phase" in lb.columns:
+                    lb["prev_phase"] = lb["prev_phase"].map(_norm_phase)
+                if "phase_change_days_ago" in lb.columns:
+                    lb["phase_change_days_ago"] = pd.to_numeric(lb["phase_change_days_ago"], errors="coerce").fillna(0).astype(int)
+                if "phase_changed_recent_14d" in lb.columns:
+                    lb["phase_changed_recent_14d"] = pd.to_numeric(lb["phase_changed_recent_14d"], errors="coerce").fillna(0).astype(int)
+
+            # 1) 阶段流转统计（近14天）
+            trans_table = ""
+            try:
+                if not lb.empty and ("prev_phase" in lb.columns) and ("current_phase" in lb.columns):
+                    t = lb[(lb["prev_phase"] != "") & (lb["current_phase"] != "") & (lb["prev_phase"] != lb["current_phase"])].copy()
+                    if not t.empty:
+                        if "phase_change_days_ago" in t.columns:
+                            t["_recent"] = (t["phase_change_days_ago"] > 0) & (t["phase_change_days_ago"] <= 14)
+                        elif "phase_changed_recent_14d" in t.columns:
+                            t["_recent"] = t["phase_changed_recent_14d"] > 0
+                        else:
+                            t["_recent"] = False
+                        t["transition"] = t["prev_phase"] + "→" + t["current_phase"]
+                        stat = (
+                            t.groupby("transition", dropna=False, as_index=False)
+                            .agg(total=("asin", "nunique"), recent_14d=("_recent", "sum"))
+                            .copy()
+                        )
+                        stat = stat.sort_values(["recent_14d", "total"], ascending=[False, False]).copy()
+                        trans_table = _df_to_md_table(stat, ["transition", "total", "recent_14d"])
+            except Exception:
+                trans_table = ""
+
+            # 2) ASIN 闭环追踪（Top 30）
+            try:
+                view = df.copy()
+                if not view.empty:
+                    prev_map: Dict[str, Dict[str, object]] = {}
+                    if not lb.empty and "asin" in lb.columns:
+                        for _, r in lb.iterrows():
+                            a = str(r.get("asin", "") or "").strip().upper()
+                            if not a or a in prev_map:
+                                continue
+                            prev_map[a] = {
+                                "prev_phase": r.get("prev_phase", ""),
+                                "phase_change_days_ago": r.get("phase_change_days_ago", 0),
+                                "phase_trend_14d": r.get("phase_trend_14d", ""),
+                            }
+                    view["prev_phase"] = view["asin"].map(lambda a: prev_map.get(str(a or "").strip().upper(), {}).get("prev_phase", ""))
+                    view["phase_change_days_ago"] = view["asin"].map(
+                        lambda a: prev_map.get(str(a or "").strip().upper(), {}).get("phase_change_days_ago", 0)
+                    )
+                    view["phase_trend_14d"] = view["asin"].map(
+                        lambda a: prev_map.get(str(a or "").strip().upper(), {}).get("phase_trend_14d", "")
+                    )
+
+                    def _cm_num(a: object, key: str) -> float:
+                        try:
+                            aa = str(a or "").strip().upper()
+                            v = (cockpit_map.get(aa, {}) or {}).get(key, 0.0)
+                            vv = pd.to_numeric(v, errors="coerce")
+                            if pd.isna(vv):
+                                return 0.0
+                            return float(vv)
+                        except Exception:
+                            return 0.0
+
+                    view["sales_recent_7d"] = view["asin"].map(lambda a: _cm_num(a, "sales_recent_7d"))
+                    view["ad_spend_roll"] = view["asin"].map(lambda a: _cm_num(a, "ad_spend_roll"))
+                    view["inventory_cover_days_7d"] = view["asin"].map(lambda a: _cm_num(a, "inventory_cover_days_7d"))
+                    view["top_action_count"] = view["asin"].map(lambda a: _cm_num(a, "top_action_count"))
+                    view["top_blocked_action_count"] = view["asin"].map(lambda a: _cm_num(a, "top_blocked_action_count"))
+
+                    view["prev_phase"] = view["prev_phase"].map(_norm_phase)
+                    view["phase_trend_14d"] = view["phase_trend_14d"].astype(str).str.strip().str.lower()
+                    view["phase_change_days_ago"] = pd.to_numeric(view["phase_change_days_ago"], errors="coerce").fillna(0).astype(int)
+                    view["inventory_cover_days_7d"] = pd.to_numeric(view["inventory_cover_days_7d"], errors="coerce").fillna(0.0)
+                    view["sales_recent_7d"] = pd.to_numeric(view["sales_recent_7d"], errors="coerce").fillna(0.0)
+                    view["ad_spend_roll"] = pd.to_numeric(view["ad_spend_roll"], errors="coerce").fillna(0.0)
+                    view["top_action_count"] = pd.to_numeric(view["top_action_count"], errors="coerce").fillna(0.0).astype(int)
+                    view["top_blocked_action_count"] = pd.to_numeric(view["top_blocked_action_count"], errors="coerce").fillna(0.0).astype(int)
+
+                    view_full_raw = view.copy()
+                    try:
+                        view_focus_raw = view[
+                            (view["phase_change_days_ago"] > 0)
+                            | (view["phase_trend_14d"].isin(["up", "down"]))
+                            | (view["top_action_count"] > 0)
+                            | (view["top_blocked_action_count"] > 0)
+                            | ((view["inventory_cover_days_7d"] > 0) & (view["inventory_cover_days_7d"] < 7))
+                        ].copy()
+                    except Exception:
+                        view_focus_raw = view.copy()
+
+                    def _short_name(x: object, n2: int = 24) -> str:
+                        try:
+                            s = str(x or "").strip()
+                            if not s or s.lower() == "nan":
+                                return ""
+                            if len(s) <= int(n2):
+                                return s
+                            return s[: int(n2)] + "…"
+                        except Exception:
+                            return ""
+
+                    def _trend_tag(x: object) -> str:
+                        s = str(x or "").strip().lower()
+                        if s == "down":
+                            return "🔻down"
+                        if s == "up":
+                            return "🔺up"
+                        return ""
+
+                    def _decorate_loop_view(df0: pd.DataFrame) -> pd.DataFrame:
+                        v = df0.copy()
+                        v["product_name"] = v["product_name"].map(lambda x: _short_name(x, 24))
+                        v["product_category"] = v["product_category"].map(lambda x: _norm_product_category(x))
+                        v["item"] = v.apply(
+                            lambda r: (str(r.get("product_name", "") or "").strip() + " / " + str(r.get("product_category", "") or "").strip()).strip(" /"),
+                            axis=1,
+                        )
+                        v["item"] = v["item"].map(lambda x: _short_name(x, 28))
+                        v["phase_trend_14d"] = v["phase_trend_14d"].map(_trend_tag)
+                        v["phase_change_days_ago"] = v["phase_change_days_ago"].map(lambda x: f"{int(x)}d" if int(x) > 0 else "")
+                        v["inventory_cover_days_7d"] = v["inventory_cover_days_7d"].map(lambda x: f"{x:.1f}d" if x else "")
+                        v["sales_recent_7d"] = v["sales_recent_7d"].map(lambda x: f"${x:.1f}" if x > 0 else "$0")
+                        v["ad_spend_roll"] = v["ad_spend_roll"].map(lambda x: f"${x:.1f}" if x > 0 else "$0")
+                        def _fmt_delta(x: object) -> str:
+                            try:
+                                s = str(x or "").strip()
+                                if s:
+                                    return s
+                                v = float(pd.to_numeric(x, errors="coerce"))
+                                if pd.isna(v):
+                                    return ""
+                                sign = "+" if v > 0 else "-" if v < 0 else ""
+                                return f"{sign}${abs(v):.1f}" if sign else ""
+                            except Exception:
+                                return str(x or "").strip()
+
+                        v["delta_sales"] = v["delta_sales"].map(_fmt_delta)
+                        v["delta_spend"] = v["delta_spend"].map(_fmt_delta)
+                        v["actions"] = v.apply(
+                            lambda r: f"{int(r.get('top_action_count', 0) or 0)}/{int(r.get('top_blocked_action_count', 0) or 0)}",
+                            axis=1,
+                        )
+                        v["asin"] = v["asin"].map(lambda x: _asin_md_link(str(x or ""), "./asin_drilldown.md"))
+                        v["current_phase"] = v["current_phase"].map(lambda x: _phase_md_link(str(x or ""), "./phase_drilldown.md"))
+                        v["prev_phase"] = v["prev_phase"].map(lambda x: _phase_md_link(str(x or ""), "./phase_drilldown.md"))
+                        v["phase_path"] = v.apply(
+                            lambda r: f"{r.get('prev_phase','')}→{r.get('current_phase','')}".strip("→"),
+                            axis=1,
+                        )
+                        return v
+
+                    view = view_full_raw.sort_values(["_focus_score", "asin"], ascending=[False, True]).copy().head(30)
+                    view = _decorate_loop_view(view)
+                    view_focus = view_focus_raw.sort_values(["_focus_score", "asin"], ascending=[False, True]).copy().head(15)
+                    view_focus = _decorate_loop_view(view_focus)
+
+                    # 闭环指标卡片
+                    total_asins = 0
+                    try:
+                        total_asins = int(df["asin"].nunique()) if (df is not None and not df.empty and "asin" in df.columns) else 0
+                    except Exception:
+                        total_asins = 0
+                    change_14d = 0
+                    try:
+                        if not lb.empty and "phase_change_days_ago" in lb.columns:
+                            change_14d = int(lb[(lb["phase_change_days_ago"] > 0) & (lb["phase_change_days_ago"] <= 14)]["asin"].nunique())
+                        elif not lb.empty and "phase_changed_recent_14d" in lb.columns:
+                            change_14d = int(lb[lb["phase_changed_recent_14d"] > 0]["asin"].nunique())
+                    except Exception:
+                        change_14d = 0
+                    down_14d = 0
+                    try:
+                        if not df.empty and "asin" in df.columns:
+                            for a in df["asin"].unique().tolist():
+                                aa = str(a or "").strip().upper()
+                                if not aa:
+                                    continue
+                                trend = str((cockpit_map.get(aa, {}) or {}).get("phase_trend_14d", "") or "").strip().lower()
+                                if trend == "down":
+                                    down_14d += 1
+                    except Exception:
+                        down_14d = 0
+                    action_asins = 0
+                    blocked_asins = 0
+                    try:
+                        if not df.empty and "asin" in df.columns:
+                            for a in df["asin"].unique().tolist():
+                                aa = str(a or "").strip().upper()
+                                if not aa:
+                                    continue
+                                act = float(pd.to_numeric((cockpit_map.get(aa, {}) or {}).get("top_action_count", 0), errors="coerce") or 0)
+                                blk = float(pd.to_numeric((cockpit_map.get(aa, {}) or {}).get("top_blocked_action_count", 0), errors="coerce") or 0)
+                                if act > 0:
+                                    action_asins += 1
+                                if blk > 0:
+                                    blocked_asins += 1
+                    except Exception:
+                        action_asins = 0
+                        blocked_asins = 0
+
+                    loop_lines = [
+                        '<a id="loop"></a>',
+                        "## 0.5) 生命周期闭环（全链条追踪）",
+                        "",
+                        "- 闭环路径：数据采集 → 阶段诊断 → 动作执行（Action Board/Watchlists）→ 复盘回流",
+                        "- 该区块只做“全链条追踪”展示，不改变任何口径或评分。",
+                        "",
+                        '<div class="loop-flow">',
+                        '<div class="loop-step">数据采集</div>',
+                        '<div class="loop-arrow">→</div>',
+                        '<div class="loop-step">阶段诊断</div>',
+                        '<div class="loop-arrow">→</div>',
+                        '<div class="loop-step">动作执行</div>',
+                        '<div class="loop-arrow">→</div>',
+                        '<div class="loop-step">复盘回流</div>',
+                        "</div>",
+                        '<div class="loop-metrics">',
+                        f'<div class="loop-metric"><div class="k">ASIN 总数</div><div class="v">{total_asins}</div></div>',
+                        f'<div class="loop-metric"><div class="k">近14天阶段变化</div><div class="v">{change_14d}</div></div>',
+                        f'<div class="loop-metric"><div class="k">trend14=down</div><div class="v">{down_14d}</div></div>',
+                        f'<div class="loop-metric"><div class="k">有动作 ASIN</div><div class="v">{action_asins}</div></div>',
+                        f'<div class="loop-metric"><div class="k">被阻断 ASIN</div><div class="v">{blocked_asins}</div></div>',
+                        "</div>",
+                    ]
+                    if trans_table:
+                        loop_lines += [
+                            "### 阶段流转概览（近14天）",
+                            "",
+                            trans_table,
+                            "",
+                        ]
+                    loop_lines += [
+                        "### ASIN 闭环追踪（聚焦，Top 15）",
+                        "",
+                        _df_to_md_table(
+                            view_focus,
+                            [
+                                "asin",
+                                "item",
+                                "phase_path",
+                                "phase_change_days_ago",
+                                "phase_trend_14d",
+                                "sales_recent_7d",
+                                "ad_spend_roll",
+                                "inventory_cover_days_7d",
+                                "delta_sales",
+                                "delta_spend",
+                                "actions",
+                            ],
+                        ),
+                        "",
+                        "<details>",
+                        "<summary>全量追踪（展开）</summary>",
+                        "",
+                        _df_to_md_table(
+                            view,
+                            [
+                                "asin",
+                                "item",
+                                "phase_path",
+                                "phase_change_days_ago",
+                                "phase_trend_14d",
+                                "sales_recent_7d",
+                                "ad_spend_roll",
+                                "inventory_cover_days_7d",
+                                "delta_sales",
+                                "delta_spend",
+                                "actions",
+                            ],
+                        ),
+                        "</details>",
+                        "",
+                        "- 说明：`phase_path`=上一阶段→当前阶段；`phase_change_days_ago`=阶段变化距今天数；`phase_trend_14d`=近14天趋势；`actions`=动作数/阻断数。",
+                        "- 提示：动作执行优先看 `Action Board / Watchlists`，此表用于“全链条复盘”。",
+                        "",
+                    ]
+            except Exception:
+                loop_lines = []
+        except Exception:
+            loop_lines = []
+
         # 阶段分布小结：让你先判断“结构问题”（down/inactive 占比）再看单品细节
         try:
             try:
@@ -13334,7 +13789,7 @@ def write_lifecycle_overview_md(
         lines.append("- 口径说明: 未标注的累计指标=主窗口；标注 compare/Δ 的为近N天 vs 前N天（日期见表内 recent/prev）")
         lines.append("")
         lines.append(
-            "快速入口：[返回 Dashboard](./dashboard.md) | [近期重点](#highlights) | [阶段分布](#phase_dist) | [类目结构](#cat_struct) | [ASIN Drilldown](./asin_drilldown.md) | [Phase Drilldown](./phase_drilldown.md)"
+            "快速入口：[返回 Dashboard](./dashboard.md) | [近期重点](#highlights) | [生命周期闭环](#loop) | [阶段分布](#phase_dist) | [类目结构](#cat_struct) | [ASIN Drilldown](./asin_drilldown.md) | [Phase Drilldown](./phase_drilldown.md)"
         )
         lines.append("")
 
@@ -13347,6 +13802,8 @@ def write_lifecycle_overview_md(
             lines.append("- （暂无足够信号；建议先看 [Action Board](../dashboard/action_board.csv) 与 [Watchlists](./dashboard.md#watchlists)）")
         lines.append("")
 
+        if loop_lines:
+            lines.extend(loop_lines)
         if phase_dist_lines:
             lines.extend(phase_dist_lines)
         if cat_struct_lines:
@@ -13357,9 +13814,12 @@ def write_lifecycle_overview_md(
         lines.append("- 每行=一个 ASIN 的“当前补货周期（cycle_id）”生命周期轨迹（时间轴）。")
         lines.append("- `current_phase` 是当前阶段；右侧 `timeline` 展示该周期内各阶段持续时长。")
         lines.append("- “近期重点”基于近7/14天窗口信号（ΔSales/ΔSpend/趋势/库存覆盖等）做聚焦展示。")
+        lines.append("- “生命周期闭环”展示阶段流转概览 + ASIN 全链条追踪（便于复盘从诊断到执行的路径）。")
         lines.append("- “阶段分布小结”回答结构问题：各 phase 数量与 down/inactive 占比（用于判断整体是否在走弱/停滞）。")
         lines.append("- “类目阶段结构 Top5”帮助你先定位“最需要优先看的类目”。")
         lines.append("- `timeline` 为了可读性会对短碎片段做“平滑合并”（仅展示层，不改变任何算数/口径）。")
+        lines.append("- 时间轴红色描边=近14天发生过阶段变化（chg14）。")
+        lines.append("- 阶段判定规则（简述）：以 rolling 销量峰值为参照；首单前为 pre_launch，首单后 <= launch_days 为 launch；未到成熟且斜率≥0 为 growth；接近峰值且斜率≈0 为 mature；低于 decline_ratio 且斜率<0 为 decline；其余为 stable；不活跃为 inactive。")
         lines.append("- 这是解释层/可视化：执行仍以 `Action Board / 解锁任务 / Watchlists` 为准。")
         lines.append("")
 
@@ -13432,17 +13892,105 @@ def write_lifecycle_overview_md(
             except Exception:
                 pass
 
+            view = view.rename(
+                columns={
+                    "product_name": "商品",
+                    "current_phase": "阶段",
+                    "timeline": "时间轴",
+                    "strategy": "策略",
+                    "sales_recent_7d": "销售7d",
+                    "ad_spend_roll": "花费(滚动)",
+                    "tacos_roll": "TACOS(滚动)",
+                    "inventory_cover_days_7d": "库存覆盖7d",
+                    "delta_sales": "ΔSales(7d)",
+                    "delta_spend": "ΔSpend(7d)",
+                    "hint": "提示",
+                }
+            )
+            # 卡片视图（Top 12）
+            try:
+                card_limit = min(12, int(len(view)))
+                card_rows = view.head(card_limit).copy()
+                if card_rows is not None and (not card_rows.empty):
+                    lines.append("#### ASIN 时间轴卡片（Top 12）")
+                    lines.append("")
+                    lines.append("- 说明：红边=近14天阶段变化；`ΔSales/ΔSpend` 为近7天对比前7天。")
+                    lines.append("")
+                    lines.append('<div class="timeline-cards">')
+                    for _, r in card_rows.iterrows():
+                        asin_link = str(r.get("asin", "") or "").strip()
+                        name = str(r.get("商品", "") or "").strip()
+                        phase = str(r.get("阶段", "") or "").strip()
+                        strategy = str(r.get("策略", "") or "").strip()
+                        tl_raw = str(r.get("时间轴", "") or "").strip().strip("`")
+                        tl_html = f"<code>{tl_raw}</code>" if tl_raw else ""
+                        sales7 = str(r.get("销售7d", "") or "").strip()
+                        spend = str(r.get("花费(滚动)", "") or "").strip()
+                        tacos = str(r.get("TACOS(滚动)", "") or "").strip()
+                        cover7 = str(r.get("库存覆盖7d", "") or "").strip()
+                        d_sales = str(r.get("ΔSales(7d)", "") or "").strip()
+                        d_spend = str(r.get("ΔSpend(7d)", "") or "").strip()
+                        hint = str(r.get("提示", "") or "").strip()
+                        phase_cls = "phase-" + re.sub(r"[^a-z0-9_\\-]+", "", _norm_phase(phase)) if phase else "phase-unknown"
+                        card_cls = ""
+                        hint_l = hint.lower()
+                        if ("trend14=down" in hint_l) or ("止损" in strategy):
+                            card_cls = " risk"
+                        elif ("trend14=up" in hint_l) or ("放量" in strategy):
+                            card_cls = " opp"
+                        lines.append(f'<div class="timeline-card{card_cls}">')
+                        lines.append(f'<div class="title">{asin_link} {name}</div>')
+                        lines.append('<div class="badges">')
+                        if phase:
+                            lines.append(f'<span class="phase-badge {phase_cls}">{phase}</span>')
+                        if strategy:
+                            lines.append(f'<span class="phase-badge strategy">{strategy}</span>')
+                        lines.append("</div>")
+                        lines.append('<div class="timeline-row">')
+                        if tl_html:
+                            lines.append(f'<div class="timeline-wrap">{tl_html}</div>')
+                        lines.append('<div class="metrics">')
+                        if sales7:
+                            lines.append(f"<span>Sales7d {sales7}</span>")
+                        if spend:
+                            lines.append(f"<span>花费 {spend}</span>")
+                        if tacos:
+                            lines.append(f"<span>TACOS {tacos}</span>")
+                        if cover7:
+                            lines.append(f"<span>Cover {cover7}</span>")
+                        if d_sales:
+                            lines.append(f"<span>ΔSales {d_sales}</span>")
+                        if d_spend:
+                            lines.append(f"<span>ΔSpend {d_spend}</span>")
+                        lines.append("</div>")
+                        lines.append("</div>")
+                        if hint:
+                            lines.append(f'<div class="sub">{hint}</div>')
+                        lines.append("</div>")
+                    lines.append("</div>")
+            except Exception:
+                pass
+
+            # 表格视图（完整）
             show_cols = [
                 "asin",
-                "product_name",
-                "current_phase",
-                "cycle_id",
-                "cycle_range",
-                "timeline",
-                "strategy",
-                "hint",
+                "商品",
+                "阶段",
+                "时间轴",
+                "策略",
+                "销售7d",
+                "花费(滚动)",
+                "TACOS(滚动)",
+                "库存覆盖7d",
+                "ΔSales(7d)",
+                "ΔSpend(7d)",
+                "提示",
             ]
+            lines.append("<details>")
+            lines.append("<summary>表格视图（展开）</summary>")
+            lines.append("")
             lines.append(_df_to_md_table(view, [c for c in show_cols if c in view.columns]))
+            lines.append("</details>")
             lines.append("")
             lines.append("[回到顶部](#top) | [返回 Dashboard](./dashboard.md)")
             lines.append("")
