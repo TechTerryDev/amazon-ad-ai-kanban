@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from core.schema import CAN
+from core.risk_scoring import signal_confidence, trend_signal_label
 from core.utils import safe_div, to_float
 
 
@@ -308,9 +309,14 @@ def _compare_recent_prev(ts: pd.DataFrame, end_date: dt.date, window_days: int, 
 
     prev = ts[(ts[CAN.date] >= prev_start) & (ts[CAN.date] <= prev_end)].copy()
     recent = ts[(ts[CAN.date] >= recent_start) & (ts[CAN.date] <= d_end)].copy()
+    # 前前窗口（用于趋势加速度）
+    preprev_end = prev_start - dt.timedelta(days=1)
+    preprev_start = preprev_end - dt.timedelta(days=n - 1)
+    preprev = ts[(ts[CAN.date] >= preprev_start) & (ts[CAN.date] <= preprev_end)].copy()
 
     p = _sum_window(prev)
     r = _sum_window(recent)
+    pp = _sum_window(preprev) if preprev is not None and not preprev.empty else _sum_window(pd.DataFrame())
 
     delta_sales = float(r["sales"]) - float(p["sales"])
     delta_ad_spend = float(r["ad_spend"]) - float(p["ad_spend"])
@@ -326,6 +332,16 @@ def _compare_recent_prev(ts: pd.DataFrame, end_date: dt.date, window_days: int, 
     delta_organic_sales = float(r.get("organic_sales", 0.0) or 0.0) - float(p.get("organic_sales", 0.0) or 0.0)
     delta_organic_sales_share = float(r.get("organic_sales_share", 0.0) or 0.0) - float(p.get("organic_sales_share", 0.0) or 0.0)
     delta_ad_sales_share = float(r.get("ad_sales_share", 0.0) or 0.0) - float(p.get("ad_sales_share", 0.0) or 0.0)
+    # 二阶变化（趋势加速度）
+    delta_sales_prev = float(p.get("sales", 0.0) or 0.0) - float(pp.get("sales", 0.0) or 0.0)
+    delta_delta_sales = float(delta_sales) - float(delta_sales_prev)
+
+    # 信号置信度：窗口覆盖天数
+    try:
+        recent_days = int(recent[CAN.date].nunique()) if recent is not None and not recent.empty else 0
+    except Exception:
+        recent_days = 0
+    sig_conf = signal_confidence(recent_days, n)
 
     return {
         "window_days": int(n),
@@ -384,6 +400,9 @@ def _compare_recent_prev(ts: pd.DataFrame, end_date: dt.date, window_days: int, 
         "delta_organic_sales": float(delta_organic_sales),
         "delta_organic_sales_share": float(delta_organic_sales_share),
         "delta_ad_sales_share": float(delta_ad_sales_share),
+        "delta_delta_sales": float(delta_delta_sales),
+        "trend_signal": trend_signal_label(delta_sales, delta_delta_sales),
+        "signal_confidence": float(sig_conf),
         # 增量效率：给 2 个口径（总销售额口径 / 广告销售额口径），你后续可选用更合适的
         "marginal_tacos": safe_div(delta_ad_spend, delta_sales) if delta_sales != 0 else 0.0,
         "marginal_ad_acos": safe_div(delta_ad_spend, delta_ad_sales) if delta_ad_sales != 0 else 0.0,

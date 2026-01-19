@@ -35,6 +35,13 @@ from core.policy import (
     ProfitGuardPolicy,
     StageScoringPolicy,
 )
+from core.risk_scoring import (
+    acos_risk_probability,
+    calculate_overall_risk,
+    cvr_drop_risk_probability,
+    oos_risk_probability,
+    risk_level,
+)
 from core.schema import CAN
 from core.utils import json_dumps
 from dashboard.keyword_topics import (
@@ -7602,6 +7609,10 @@ def score_action_board(
             "sales_per_day_7d",
             "orders_per_day_7d",
             "inventory_cover_days_7d",
+            "risk_score",
+            "risk_level",
+            "trend_signal",
+            "signal_confidence",
             "sales_recent_14d",
             "orders_recent_14d",
             "sales_per_day_14d",
@@ -7650,6 +7661,10 @@ def score_action_board(
                 "sales_per_day_7d": "asin_sales_per_day_7d",
                 "orders_per_day_7d": "asin_orders_per_day_7d",
                 "inventory_cover_days_7d": "asin_inventory_cover_days_7d",
+                "risk_score": "asin_risk_score",
+                "risk_level": "asin_risk_level",
+                "trend_signal": "asin_trend_signal",
+                "signal_confidence": "asin_signal_confidence",
                 "sales_recent_14d": "asin_sales_recent_14d",
                 "orders_recent_14d": "asin_orders_recent_14d",
                 "sales_per_day_14d": "asin_sales_per_day_14d",
@@ -7691,6 +7706,10 @@ def score_action_board(
         df["asin_sales_per_day_7d"] = 0.0
         df["asin_orders_per_day_7d"] = 0.0
         df["asin_inventory_cover_days_7d"] = 0.0
+        df["asin_risk_score"] = 0.0
+        df["asin_risk_level"] = ""
+        df["asin_trend_signal"] = ""
+        df["asin_signal_confidence"] = 0.0
         df["asin_sales_recent_14d"] = 0.0
         df["asin_orders_recent_14d"] = 0.0
         df["asin_sales_per_day_14d"] = 0.0
@@ -7739,6 +7758,8 @@ def score_action_board(
         "asin_sales_per_day_7d",
         "asin_orders_per_day_7d",
         "asin_inventory_cover_days_7d",
+        "asin_risk_score",
+        "asin_signal_confidence",
         "asin_sales_recent_14d",
         "asin_orders_recent_14d",
         "asin_sales_per_day_14d",
@@ -7776,6 +7797,14 @@ def score_action_board(
         df["asin_profit_direction"] = ""
     df["asin_profit_stage"] = df["asin_profit_stage"].astype(str).fillna("")
     df["asin_profit_direction"] = df["asin_profit_direction"].astype(str).fillna("")
+
+    # 字符字段兜底（风险/趋势）
+    if "asin_risk_level" not in df.columns:
+        df["asin_risk_level"] = ""
+    if "asin_trend_signal" not in df.columns:
+        df["asin_trend_signal"] = ""
+    df["asin_risk_level"] = df["asin_risk_level"].astype(str).fillna("")
+    df["asin_trend_signal"] = df["asin_trend_signal"].astype(str).fillna("")
 
     # 字符字段兜底（生命周期迁移）
     if "asin_phase_change" not in df.columns:
@@ -8352,6 +8381,7 @@ def build_asin_focus(
     lifecycle_board: Optional[pd.DataFrame],
     lifecycle_windows: Optional[pd.DataFrame],
     policy: OpsPolicy,
+    stage: Optional[str] = None,
     top_n: int = 50,
 ) -> pd.DataFrame:
     """
@@ -8460,6 +8490,9 @@ def build_asin_focus(
         "delta_organic_sales",
         "delta_organic_sales_share",
         "delta_ad_sales_share",
+        "delta_delta_sales",
+        "trend_signal",
+        "signal_confidence",
         "marginal_tacos",
         "marginal_ad_acos",
     ]
@@ -8645,6 +8678,7 @@ def build_asin_focus(
             "organic_sales_share_recent_7d",
             "delta_cvr",
             "delta_sales",
+            "delta_delta_sales",
             "delta_orders",
             "delta_spend",
             "delta_sessions",
@@ -8656,6 +8690,7 @@ def build_asin_focus(
             "delta_ad_ctr",
             "delta_ad_cvr",
             "delta_ad_sales_share",
+            "signal_confidence",
             "sales_recent_14d",
             "sales_prev_14d",
             "orders_recent_14d",
@@ -8912,6 +8947,55 @@ def build_asin_focus(
     except Exception:
         # 防御性：任何新维度计算失败都不影响主流程
         pass
+
+    # --- Sigmoid 风险评分（P0）：覆盖天数 + ACoS + CVR 下降 ---
+    try:
+        try:
+            cfg = get_stage_config(stage or "")
+            target_acos = float(getattr(cfg, "target_acos", 0.25) or 0.25)
+        except Exception:
+            target_acos = 0.25
+
+        def _calc_risk(row: pd.Series) -> Tuple[float, str]:
+            # 覆盖天数（仅在近7天有订单速度时启用，避免缺口误判）
+            inv_cover = _safe_float(row.get("inventory_cover_days_7d", 0.0))
+            orders_pd = _safe_float(row.get("orders_per_day_7d", 0.0))
+            oos_r = oos_risk_probability(inv_cover) if orders_pd > 0 else None
+
+            # ACoS 风险：仅在近期有投放时启用
+            ad_spend_recent = _safe_float(row.get("ad_spend_recent_7d", 0.0))
+            ad_sales_recent = _safe_float(row.get("ad_sales_recent_7d", 0.0))
+            acos_recent = _safe_float(row.get("ad_acos_recent_7d", row.get("ad_acos", 0.0)))
+            acos_r = None
+            if ad_spend_recent > 0 or ad_sales_recent > 0:
+                acos_r = acos_risk_probability(acos_recent, target_acos)
+
+            # CVR 下降风险（7d vs prev7d）
+            delta_cvr = _safe_float(row.get("delta_cvr", 0.0))
+            if abs(delta_cvr) <= 1e-12:
+                cvr_prev = _safe_float(row.get("cvr_prev_7d", 0.0))
+                cvr_recent = _safe_float(row.get("cvr_recent_7d", 0.0))
+                if cvr_prev != 0.0 or cvr_recent != 0.0:
+                    delta_cvr = cvr_recent - cvr_prev
+            cvr_r = cvr_drop_risk_probability(delta_cvr)
+
+            score = calculate_overall_risk(oos_risk=oos_r, acos_risk=acos_r, cvr_risk=cvr_r)
+            # 置信度折减：覆盖不足时降低风险分
+            conf = _safe_float(row.get("signal_confidence", 1.0))
+            score = float(score) * max(0.0, min(1.0, conf))
+            return float(score), risk_level(score)
+
+        risk_vals = out.apply(_calc_risk, axis=1, result_type="expand")
+        if isinstance(risk_vals, pd.DataFrame) and risk_vals.shape[1] >= 2:
+            out["risk_score"] = pd.to_numeric(risk_vals.iloc[:, 0], errors="coerce").fillna(0.0)
+            out["risk_level"] = risk_vals.iloc[:, 1].astype(str).fillna("")
+    except Exception:
+        out["risk_score"] = 0.0
+        out["risk_level"] = "低"
+    if "risk_score" not in out.columns:
+        out["risk_score"] = 0.0
+    if "risk_level" not in out.columns:
+        out["risk_level"] = "低"
 
     # 去碎片化：避免多次 insert/赋值导致 PerformanceWarning
     try:
@@ -14310,6 +14394,7 @@ def write_dashboard_outputs(
             lifecycle_board=lifecycle_board,
             lifecycle_windows=lifecycle_windows,
             policy=policy,
+            stage=stage,
             top_n=1000000,  # 足够大：用于映射与统计，不用于展示
         )
         # 2.0) 利润承受度字段前置（来自 diagnostics["asin_stages"]）
