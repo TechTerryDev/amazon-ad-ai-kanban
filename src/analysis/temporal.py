@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from core.metrics import summarize
+from core.risk_scoring import signal_confidence, trend_signal_label
 from core.schema import CAN
 from core.utils import safe_div
 
@@ -115,17 +116,61 @@ def window_compare(
         }
     )
 
+    # 前前窗口（用于计算二阶变化）
+    preprev_s = pd.DataFrame()
+    try:
+        preprev_end = window.prev_start - dt.timedelta(days=1)
+        preprev_start = preprev_end - dt.timedelta(days=window.days - 1)
+        preprev_df = _filter_range(df, preprev_start, preprev_end)
+        if preprev_df is not None and not preprev_df.empty:
+            preprev_s = summarize(preprev_df, group_cols).rename(
+                columns={
+                    "spend": "spend_preprev",
+                    "sales": "sales_preprev",
+                    "orders": "orders_preprev",
+                }
+            )
+    except Exception:
+        preprev_s = pd.DataFrame()
+
     merged = prev_s.merge(rec_s, on=group_cols, how="outer").fillna(0.0)
     if merged.empty:
         return pd.DataFrame()
+    if preprev_s is not None and not preprev_s.empty:
+        merged = merged.merge(preprev_s, on=group_cols, how="left").fillna(0.0)
+    else:
+        # 兜底：缺失前前窗口时按 0 处理
+        merged["spend_preprev"] = 0.0
+        merged["sales_preprev"] = 0.0
+        merged["orders_preprev"] = 0.0
 
     merged["delta_spend"] = merged["spend_recent"] - merged["spend_prev"]
     merged["delta_sales"] = merged["sales_recent"] - merged["sales_prev"]
     merged["delta_orders"] = merged["orders_recent"] - merged["orders_prev"]
     merged["delta_clicks"] = merged["clicks_recent"] - merged["clicks_prev"]
 
+    # 二阶变化（趋势加速度）：delta - delta_prev
+    try:
+        merged["delta_delta_sales"] = merged["delta_sales"] - (merged["sales_prev"] - merged["sales_preprev"])
+    except Exception:
+        merged["delta_delta_sales"] = 0.0
+
     merged["marginal_acos"] = merged.apply(lambda r: safe_div(r["delta_spend"], r["delta_sales"]) if r["delta_sales"] > 0 else 0.0, axis=1)
     merged["marginal_cpa"] = merged.apply(lambda r: safe_div(r["delta_spend"], r["delta_orders"]) if r["delta_orders"] > 0 else 0.0, axis=1)
+
+    # 信号置信度（窗口天数覆盖率）
+    try:
+        recent_days = rec_df.groupby(group_cols, dropna=False)[CAN.date].nunique().reset_index().rename(columns={CAN.date: "recent_days"})
+        merged = merged.merge(recent_days, on=group_cols, how="left").fillna({"recent_days": 0.0})
+        merged["signal_confidence"] = (
+            pd.to_numeric(merged.get("recent_days", 0.0), errors="coerce").fillna(0.0) / float(window.days)
+            if float(window.days) > 0
+            else 0.0
+        )
+        merged["signal_confidence"] = merged["signal_confidence"].clip(lower=0.0, upper=1.0)
+        merged = merged.drop(columns=["recent_days"], errors="ignore")
+    except Exception:
+        merged["signal_confidence"] = 0.0
 
     # 信号标签：用“增量”判断，而不是静态阈值
     def signal(row: pd.Series) -> str:
@@ -149,6 +194,15 @@ def window_compare(
         return "stable"
 
     merged["signal"] = merged.apply(signal, axis=1)
+
+    # 趋势信号：结合一阶与二阶变化
+    try:
+        merged["trend_signal"] = merged.apply(
+            lambda r: trend_signal_label(r.get("delta_sales", 0.0), r.get("delta_delta_sales", 0.0)),
+            axis=1,
+        )
+    except Exception:
+        merged["trend_signal"] = ""
 
     # score：用于排序，越大越需要关注/或越值得加码
     def score(row: pd.Series) -> float:

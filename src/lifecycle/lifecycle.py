@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from core.schema import CAN
+from core.risk_scoring import signal_confidence, trend_signal_label
 from core.utils import safe_div, to_float
 
 
@@ -36,6 +37,11 @@ class LifecycleConfig:
     roll_days: int = 7
     # 启动期（首单后多少天视为 launch）
     launch_days: int = 14
+    # 成熟期门槛（避免新品/低体量误判）
+    min_mature_days: int = 21
+    min_mature_orders: float = 20.0
+    min_mature_sales: float = 200.0
+    min_peak_sales_roll: float = 10.0
     # 判定成熟/衰退阈值（相对峰值的比例）
     mature_ratio: float = 0.85
     decline_ratio: float = 0.65
@@ -308,9 +314,14 @@ def _compare_recent_prev(ts: pd.DataFrame, end_date: dt.date, window_days: int, 
 
     prev = ts[(ts[CAN.date] >= prev_start) & (ts[CAN.date] <= prev_end)].copy()
     recent = ts[(ts[CAN.date] >= recent_start) & (ts[CAN.date] <= d_end)].copy()
+    # 前前窗口（用于趋势加速度）
+    preprev_end = prev_start - dt.timedelta(days=1)
+    preprev_start = preprev_end - dt.timedelta(days=n - 1)
+    preprev = ts[(ts[CAN.date] >= preprev_start) & (ts[CAN.date] <= preprev_end)].copy()
 
     p = _sum_window(prev)
     r = _sum_window(recent)
+    pp = _sum_window(preprev) if preprev is not None and not preprev.empty else _sum_window(pd.DataFrame())
 
     delta_sales = float(r["sales"]) - float(p["sales"])
     delta_ad_spend = float(r["ad_spend"]) - float(p["ad_spend"])
@@ -324,8 +335,19 @@ def _compare_recent_prev(ts: pd.DataFrame, end_date: dt.date, window_days: int, 
     delta_ad_ctr = float(r.get("ad_ctr", 0.0) or 0.0) - float(p.get("ad_ctr", 0.0) or 0.0)
     delta_ad_cvr = float(r.get("ad_cvr", 0.0) or 0.0) - float(p.get("ad_cvr", 0.0) or 0.0)
     delta_organic_sales = float(r.get("organic_sales", 0.0) or 0.0) - float(p.get("organic_sales", 0.0) or 0.0)
+    delta_organic_orders = float(r.get("organic_orders", 0.0) or 0.0) - float(p.get("organic_orders", 0.0) or 0.0)
     delta_organic_sales_share = float(r.get("organic_sales_share", 0.0) or 0.0) - float(p.get("organic_sales_share", 0.0) or 0.0)
     delta_ad_sales_share = float(r.get("ad_sales_share", 0.0) or 0.0) - float(p.get("ad_sales_share", 0.0) or 0.0)
+    # 二阶变化（趋势加速度）
+    delta_sales_prev = float(p.get("sales", 0.0) or 0.0) - float(pp.get("sales", 0.0) or 0.0)
+    delta_delta_sales = float(delta_sales) - float(delta_sales_prev)
+
+    # 信号置信度：窗口覆盖天数
+    try:
+        recent_days = int(recent[CAN.date].nunique()) if recent is not None and not recent.empty else 0
+    except Exception:
+        recent_days = 0
+    sig_conf = signal_confidence(recent_days, n)
 
     return {
         "window_days": int(n),
@@ -347,6 +369,8 @@ def _compare_recent_prev(ts: pd.DataFrame, end_date: dt.date, window_days: int, 
         # 自然端：用于把“销量变化”拆成自然 vs 广告（更贴近运营决策）
         "organic_sales_prev": float(p.get("organic_sales", 0.0) or 0.0),
         "organic_sales_recent": float(r.get("organic_sales", 0.0) or 0.0),
+        "organic_orders_prev": float(p.get("organic_orders", 0.0) or 0.0),
+        "organic_orders_recent": float(r.get("organic_orders", 0.0) or 0.0),
         "organic_sales_share_prev": float(p.get("organic_sales_share", 0.0) or 0.0),
         "organic_sales_share_recent": float(r.get("organic_sales_share", 0.0) or 0.0),
         "ad_clicks_prev": float(p["ad_clicks"]),
@@ -382,8 +406,12 @@ def _compare_recent_prev(ts: pd.DataFrame, end_date: dt.date, window_days: int, 
         "delta_ad_ctr": float(delta_ad_ctr),
         "delta_ad_cvr": float(delta_ad_cvr),
         "delta_organic_sales": float(delta_organic_sales),
+        "delta_organic_orders": float(delta_organic_orders),
         "delta_organic_sales_share": float(delta_organic_sales_share),
         "delta_ad_sales_share": float(delta_ad_sales_share),
+        "delta_delta_sales": float(delta_delta_sales),
+        "trend_signal": trend_signal_label(delta_sales, delta_delta_sales),
+        "signal_confidence": float(sig_conf),
         # 增量效率：给 2 个口径（总销售额口径 / 广告销售额口径），你后续可选用更合适的
         "marginal_tacos": safe_div(delta_ad_spend, delta_sales) if delta_sales != 0 else 0.0,
         "marginal_ad_acos": safe_div(delta_ad_spend, delta_ad_sales) if delta_ad_sales != 0 else 0.0,
@@ -506,6 +534,13 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
     phases: List[str] = []
     for cid, g in ts.groupby("cycle_id", dropna=False, sort=False):
         g = g.copy()
+        # 累计口径（用于成熟期门槛）
+        try:
+            g["cum_sales"] = pd.to_numeric(g.get("销售额", 0.0), errors="coerce").fillna(0.0).cumsum()
+            g["cum_orders"] = pd.to_numeric(g.get("订单量", 0.0), errors="coerce").fillna(0.0).cumsum()
+        except Exception:
+            g["cum_sales"] = 0.0
+            g["cum_orders"] = 0.0
         # cycle 内峰值（用 rolling sales 更稳定）
         peak = float(g["sales_roll"].max() or 0.0)
         peak = peak if peak > 0 else float(g["销售额"].max() or 0.0)
@@ -538,6 +573,23 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
                     # 相对峰值比例（动态周期）
                     ratio = 0.0 if peak <= 0 else sales_r / peak
                     days_since_first_sale = (d - first_sale_date).days if isinstance(first_sale_date, dt.date) else 0
+                    cum_sales = float(r.get("cum_sales", 0.0) or 0.0)
+                    cum_orders = float(r.get("cum_orders", 0.0) or 0.0)
+
+                    # 成熟期门槛（避免新品/低体量误判）
+                    mature_gate = True
+                    min_days = int(cfg.min_mature_days or 0)
+                    if min_days > 0 and days_since_first_sale < min_days:
+                        mature_gate = False
+                    min_orders = float(cfg.min_mature_orders or 0.0)
+                    if min_orders > 0 and cum_orders < min_orders:
+                        mature_gate = False
+                    min_sales = float(cfg.min_mature_sales or 0.0)
+                    if min_sales > 0 and cum_sales < min_sales:
+                        mature_gate = False
+                    min_peak = float(cfg.min_peak_sales_roll or 0.0)
+                    if min_peak > 0 and peak < min_peak:
+                        mature_gate = False
 
                     # launch：刚开始出单的一段时间（默认 14 天，可配置）
                     if days_since_first_sale <= int(cfg.launch_days or 14) and ratio < cfg.mature_ratio:
@@ -546,7 +598,7 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
                     elif ratio < cfg.mature_ratio and slope >= 0:
                         phase = "growth"
                     # mature：接近峰值且变化不大
-                    elif ratio >= cfg.mature_ratio and abs(slope) < max(1e-6, peak * 0.02):
+                    elif ratio >= cfg.mature_ratio and abs(slope) < max(1e-6, peak * 0.02) and mature_gate:
                         phase = "mature"
                     # decline：明显低于峰值且斜率为负
                     elif ratio <= cfg.decline_ratio and slope < 0:

@@ -2264,12 +2264,88 @@ def generate_shop_report(
             except Exception:
                 pass
 
+        # 产品侧变化摘要（自然/流量）
+        try:
+            if lifecycle_windows is not None and not lifecycle_windows.empty and "window_type" in lifecycle_windows.columns:
+                cmp7 = lifecycle_windows[lifecycle_windows["window_type"].astype(str) == "compare_7d"].copy()
+            else:
+                cmp7 = pd.DataFrame()
+            if cmp7 is not None and not cmp7.empty and "asin" in cmp7.columns:
+                cmp7["asin_norm"] = cmp7["asin"].astype(str).str.upper().str.strip()
+                if lifecycle_board is not None and not lifecycle_board.empty and "asin" in lifecycle_board.columns:
+                    lb = lifecycle_board.copy()
+                    lb["asin_norm"] = lb["asin"].astype(str).str.upper().str.strip()
+                    keep_cols = ["asin_norm"]
+                    for c in ("product_category", "product_name", "current_phase"):
+                        if c in lb.columns:
+                            keep_cols.append(c)
+                    lb = lb[keep_cols].drop_duplicates("asin_norm")
+                    cmp7 = cmp7.merge(lb, on="asin_norm", how="left")
+            if cmp7 is not None and not cmp7.empty:
+                f.write("### 2.6 产品侧变化摘要（近7天 vs 前7天）\n\n")
+
+                # 自然销售变化 Top
+                if "delta_organic_sales" in cmp7.columns:
+                    view = cmp7.copy()
+                    for c in ("organic_sales_prev", "organic_sales_recent", "delta_organic_sales"):
+                        if c in view.columns:
+                            view[c] = pd.to_numeric(view[c], errors="coerce").fillna(0.0)
+                    view["_abs_delta"] = pd.to_numeric(view["delta_organic_sales"], errors="coerce").fillna(0.0).abs()
+                    view = view.sort_values("_abs_delta", ascending=False).head(12).drop(columns=["_abs_delta"], errors="ignore")
+                    cols = [
+                        c
+                        for c in [
+                            "product_category",
+                            "product_name",
+                            "asin",
+                            "organic_sales_prev",
+                            "organic_sales_recent",
+                            "delta_organic_sales",
+                            "current_phase",
+                        ]
+                        if c in view.columns
+                    ]
+                    f.write("#### 自然销售变化 Top\n\n")
+                    f.write(df_to_md_table(view[cols], max_rows=12))
+                    f.write("\n\n")
+
+                # Sessions 变化 Top
+                if "delta_sessions" in cmp7.columns:
+                    view = cmp7.copy()
+                    for c in ("sessions_prev", "sessions_recent", "delta_sessions"):
+                        if c in view.columns:
+                            view[c] = pd.to_numeric(view[c], errors="coerce").fillna(0.0)
+                    view["_abs_delta"] = pd.to_numeric(view["delta_sessions"], errors="coerce").fillna(0.0).abs()
+                    view = view.sort_values("_abs_delta", ascending=False).head(12).drop(columns=["_abs_delta"], errors="ignore")
+                    cols = [
+                        c
+                        for c in [
+                            "product_category",
+                            "product_name",
+                            "asin",
+                            "sessions_prev",
+                            "sessions_recent",
+                            "delta_sessions",
+                            "current_phase",
+                        ]
+                        if c in view.columns
+                    ]
+                    f.write("#### Sessions 变化 Top\n\n")
+                    f.write(df_to_md_table(view[cols], max_rows=12))
+                    f.write("\n\n")
+            else:
+                f.write("### 2.6 产品侧变化摘要（近7天 vs 前7天）\n\n")
+                f.write("（无）\n\n")
+        except Exception:
+            f.write("### 2.6 产品侧变化摘要（近7天 vs 前7天）\n\n")
+            f.write("（生成失败）\n\n")
+
         # 店铺维度：商品分类汇总（横向对比同类产品）
         cat_df = pd.DataFrame()
         try:
             cat_df = _category_summary(product_listing_shop=product_listing_shop, product_analysis_shop=product_analysis_shop)
             if cat_df is not None and not cat_df.empty:
-                f.write("### 2.6 商品分类汇总（横向对比同类产品）\n\n")
+                f.write("### 2.7 商品分类汇总（横向对比同类产品）\n\n")
                 cols = [c for c in ["product_category", "asin_count", "sales_total", "profit_total", "ad_spend_total", "tacos_total", "ad_sales_total", "ad_acos_total", "cvr_total"] if c in cat_df.columns]
                 f.write(df_to_md_table(cat_df[cols], max_rows=30))
                 f.write("\n\n")

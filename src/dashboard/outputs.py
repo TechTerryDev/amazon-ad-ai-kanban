@@ -33,7 +33,17 @@ from core.policy import (
     InventorySigmoidPolicy,
     OpsPolicy,
     ProfitGuardPolicy,
+    SignalScoringPolicy,
     StageScoringPolicy,
+)
+from core.risk_scoring import (
+    acos_risk_probability,
+    ad_signal_score,
+    calculate_overall_risk,
+    cvr_drop_risk_probability,
+    oos_risk_probability,
+    product_signal_score,
+    risk_level,
 )
 from core.schema import CAN
 from core.utils import json_dumps
@@ -6776,6 +6786,30 @@ def build_shop_alerts(
     alerts: List[Dict[str, str]] = []
     category_blocked_added = False
     PB_DOC = "../../../../docs/OPS_PLAYBOOK.md"
+    asin_name_map: Dict[str, str] = {}
+    try:
+        ac_map = asin_cockpit.copy() if isinstance(asin_cockpit, pd.DataFrame) else pd.DataFrame()
+        if ac_map is not None and not ac_map.empty and "asin" in ac_map.columns and "product_name" in ac_map.columns:
+            ac_map = ac_map.copy()
+            ac_map["asin"] = ac_map["asin"].astype(str).str.upper().str.strip()
+            ac_map["product_name"] = ac_map["product_name"].astype(str).str.strip()
+            ac_map = ac_map[ac_map["asin"] != ""].drop_duplicates(subset=["asin"], keep="first")
+            for _, r in ac_map.iterrows():
+                asin = str(r.get("asin", "") or "").strip().upper()
+                name = str(r.get("product_name", "") or "").strip()
+                if asin and name and name.lower() != "nan" and asin not in asin_name_map:
+                    asin_name_map[asin] = name
+    except Exception:
+        asin_name_map = {}
+
+    def _asin_label(asin: str) -> str:
+        a = str(asin or "").strip().upper()
+        if not a:
+            return ""
+        name = str(asin_name_map.get(a, "") or "").strip()
+        if name:
+            return f"{name}({a})"
+        return a
 
     def _with_playbook(link: str, anchor: str) -> str:
         """
@@ -7034,10 +7068,11 @@ def build_shop_alerts(
                 # detail 里给“规模 + top 例子”，让运营一眼知道为什么会出现这个提示
                 top_hint = ""
                 if top_asin:
+                    top_label = _asin_label(top_asin)
                     if top_change:
-                        top_hint = f"top={top_asin}({top_change})"
+                        top_hint = f"top={top_label}({top_change})"
                     else:
-                        top_hint = f"top={top_asin}(phase={top_phase})"
+                        top_hint = f"top={top_label}(phase={top_phase})"
                 detail = f"asin={cnt}，spend_roll_sum={spend_sum:.2f}（占比={spend_share:.1%}）"
                 if top_hint:
                     detail = f"{detail}；{top_hint}"
@@ -7602,6 +7637,14 @@ def score_action_board(
             "sales_per_day_7d",
             "orders_per_day_7d",
             "inventory_cover_days_7d",
+            "risk_score",
+            "risk_level",
+            "trend_signal",
+            "signal_confidence",
+            "product_signal_score",
+            "product_signal_level",
+            "ad_signal_score",
+            "ad_signal_level",
             "sales_recent_14d",
             "orders_recent_14d",
             "sales_per_day_14d",
@@ -7650,6 +7693,14 @@ def score_action_board(
                 "sales_per_day_7d": "asin_sales_per_day_7d",
                 "orders_per_day_7d": "asin_orders_per_day_7d",
                 "inventory_cover_days_7d": "asin_inventory_cover_days_7d",
+                "risk_score": "asin_risk_score",
+                "risk_level": "asin_risk_level",
+                "trend_signal": "asin_trend_signal",
+                "signal_confidence": "asin_signal_confidence",
+                "product_signal_score": "asin_product_signal_score",
+                "product_signal_level": "asin_product_signal_level",
+                "ad_signal_score": "asin_ad_signal_score",
+                "ad_signal_level": "asin_ad_signal_level",
                 "sales_recent_14d": "asin_sales_recent_14d",
                 "orders_recent_14d": "asin_orders_recent_14d",
                 "sales_per_day_14d": "asin_sales_per_day_14d",
@@ -7691,6 +7742,14 @@ def score_action_board(
         df["asin_sales_per_day_7d"] = 0.0
         df["asin_orders_per_day_7d"] = 0.0
         df["asin_inventory_cover_days_7d"] = 0.0
+        df["asin_risk_score"] = 0.0
+        df["asin_risk_level"] = ""
+        df["asin_trend_signal"] = ""
+        df["asin_signal_confidence"] = 0.0
+        df["asin_product_signal_score"] = 0.0
+        df["asin_product_signal_level"] = ""
+        df["asin_ad_signal_score"] = 0.0
+        df["asin_ad_signal_level"] = ""
         df["asin_sales_recent_14d"] = 0.0
         df["asin_orders_recent_14d"] = 0.0
         df["asin_sales_per_day_14d"] = 0.0
@@ -7739,6 +7798,10 @@ def score_action_board(
         "asin_sales_per_day_7d",
         "asin_orders_per_day_7d",
         "asin_inventory_cover_days_7d",
+        "asin_risk_score",
+        "asin_signal_confidence",
+        "asin_product_signal_score",
+        "asin_ad_signal_score",
         "asin_sales_recent_14d",
         "asin_orders_recent_14d",
         "asin_sales_per_day_14d",
@@ -7776,6 +7839,22 @@ def score_action_board(
         df["asin_profit_direction"] = ""
     df["asin_profit_stage"] = df["asin_profit_stage"].astype(str).fillna("")
     df["asin_profit_direction"] = df["asin_profit_direction"].astype(str).fillna("")
+
+    # 字符字段兜底（风险/趋势）
+    if "asin_risk_level" not in df.columns:
+        df["asin_risk_level"] = ""
+    if "asin_trend_signal" not in df.columns:
+        df["asin_trend_signal"] = ""
+    df["asin_risk_level"] = df["asin_risk_level"].astype(str).fillna("")
+    df["asin_trend_signal"] = df["asin_trend_signal"].astype(str).fillna("")
+
+    # 字符字段兜底（产品/广告信号）
+    if "asin_product_signal_level" not in df.columns:
+        df["asin_product_signal_level"] = ""
+    if "asin_ad_signal_level" not in df.columns:
+        df["asin_ad_signal_level"] = ""
+    df["asin_product_signal_level"] = df["asin_product_signal_level"].astype(str).fillna("")
+    df["asin_ad_signal_level"] = df["asin_ad_signal_level"].astype(str).fillna("")
 
     # 字符字段兜底（生命周期迁移）
     if "asin_phase_change" not in df.columns:
@@ -8352,6 +8431,7 @@ def build_asin_focus(
     lifecycle_board: Optional[pd.DataFrame],
     lifecycle_windows: Optional[pd.DataFrame],
     policy: OpsPolicy,
+    stage: Optional[str] = None,
     top_n: int = 50,
 ) -> pd.DataFrame:
     """
@@ -8445,6 +8525,8 @@ def build_asin_focus(
         "cvr_recent",
         "organic_sales_prev",
         "organic_sales_recent",
+        "organic_orders_prev",
+        "organic_orders_recent",
         "organic_sales_share_prev",
         "organic_sales_share_recent",
         "delta_spend",
@@ -8458,8 +8540,12 @@ def build_asin_focus(
         "delta_ad_cvr",
         "delta_ad_impressions",
         "delta_organic_sales",
+        "delta_organic_orders",
         "delta_organic_sales_share",
         "delta_ad_sales_share",
+        "delta_delta_sales",
+        "trend_signal",
+        "signal_confidence",
         "marginal_tacos",
         "marginal_ad_acos",
     ]
@@ -8495,6 +8581,8 @@ def build_asin_focus(
                 "cvr_recent": "cvr_recent_7d",
                 "organic_sales_prev": "organic_sales_prev_7d",
                 "organic_sales_recent": "organic_sales_recent_7d",
+                "organic_orders_prev": "organic_orders_prev_7d",
+                "organic_orders_recent": "organic_orders_recent_7d",
                 "organic_sales_share_prev": "organic_sales_share_prev_7d",
                 "organic_sales_share_recent": "organic_sales_share_recent_7d",
                 "oos_with_ad_spend_days_recent": "oos_with_ad_spend_days_7d",
@@ -8522,6 +8610,9 @@ def build_asin_focus(
             "ad_ctr_recent",
             "ad_cvr_recent",
             "ad_sales_share_recent",
+            "organic_sales_recent",
+            "organic_orders_recent",
+            "organic_sales_share_recent",
             "oos_with_ad_spend_days_recent",
             "oos_with_sessions_days_recent",
             "presale_order_days_recent",
@@ -8539,6 +8630,9 @@ def build_asin_focus(
                 "ad_ctr_prev",
                 "ad_cvr_prev",
                 "ad_sales_share_prev",
+                "organic_sales_prev",
+                "organic_orders_prev",
+                "organic_sales_share_prev",
             ]
         if include_delta:
             keep += [
@@ -8552,6 +8646,9 @@ def build_asin_focus(
                 "delta_ad_ctr",
                 "delta_ad_cvr",
                 "delta_ad_sales_share",
+                "delta_organic_sales",
+                "delta_organic_orders",
+                "delta_organic_sales_share",
             ]
         keep = [c for c in keep if c in df.columns]
         out2 = df[keep].copy() if keep else pd.DataFrame(columns=["asin_norm"])
@@ -8569,6 +8666,9 @@ def build_asin_focus(
                 "ad_ctr_recent": f"ad_ctr_recent_{int(days)}d",
                 "ad_cvr_recent": f"ad_cvr_recent_{int(days)}d",
                 "ad_sales_share_recent": f"ad_sales_share_recent_{int(days)}d",
+                "organic_sales_recent": f"organic_sales_recent_{int(days)}d",
+                "organic_orders_recent": f"organic_orders_recent_{int(days)}d",
+                "organic_sales_share_recent": f"organic_sales_share_recent_{int(days)}d",
                 "oos_with_ad_spend_days_recent": f"oos_with_ad_spend_days_{int(days)}d",
                 "oos_with_sessions_days_recent": f"oos_with_sessions_days_{int(days)}d",
                 "presale_order_days_recent": f"presale_order_days_{int(days)}d",
@@ -8583,6 +8683,9 @@ def build_asin_focus(
                 "ad_ctr_prev": f"ad_ctr_prev_{int(days)}d",
                 "ad_cvr_prev": f"ad_cvr_prev_{int(days)}d",
                 "ad_sales_share_prev": f"ad_sales_share_prev_{int(days)}d",
+                "organic_sales_prev": f"organic_sales_prev_{int(days)}d",
+                "organic_orders_prev": f"organic_orders_prev_{int(days)}d",
+                "organic_sales_share_prev": f"organic_sales_share_prev_{int(days)}d",
                 "delta_sales": f"delta_sales_{int(days)}d",
                 "delta_orders": f"delta_orders_{int(days)}d",
                 "delta_sessions": f"delta_sessions_{int(days)}d",
@@ -8593,6 +8696,9 @@ def build_asin_focus(
                 "delta_ad_ctr": f"delta_ad_ctr_{int(days)}d",
                 "delta_ad_cvr": f"delta_ad_cvr_{int(days)}d",
                 "delta_ad_sales_share": f"delta_ad_sales_share_{int(days)}d",
+                "delta_organic_sales": f"delta_organic_sales_{int(days)}d",
+                "delta_organic_orders": f"delta_organic_orders_{int(days)}d",
+                "delta_organic_sales_share": f"delta_organic_sales_share_{int(days)}d",
             }
         )
         except Exception:
@@ -8641,14 +8747,18 @@ def build_asin_focus(
             "cvr_recent_7d",
             "organic_sales_prev_7d",
             "organic_sales_recent_7d",
+            "organic_orders_prev_7d",
+            "organic_orders_recent_7d",
             "organic_sales_share_prev_7d",
             "organic_sales_share_recent_7d",
             "delta_cvr",
             "delta_sales",
+            "delta_delta_sales",
             "delta_orders",
             "delta_spend",
             "delta_sessions",
             "delta_organic_sales",
+            "delta_organic_orders",
             "delta_organic_sales_share",
             "delta_ad_sales",
             "delta_ad_orders",
@@ -8656,6 +8766,7 @@ def build_asin_focus(
             "delta_ad_ctr",
             "delta_ad_cvr",
             "delta_ad_sales_share",
+            "signal_confidence",
             "sales_recent_14d",
             "sales_prev_14d",
             "orders_recent_14d",
@@ -8678,6 +8789,12 @@ def build_asin_focus(
             "ad_cvr_prev_14d",
             "ad_sales_share_recent_14d",
             "ad_sales_share_prev_14d",
+            "organic_sales_recent_14d",
+            "organic_orders_recent_14d",
+            "organic_sales_share_recent_14d",
+            "organic_sales_prev_14d",
+            "organic_orders_prev_14d",
+            "organic_sales_share_prev_14d",
             "delta_sales_14d",
             "delta_orders_14d",
             "delta_sessions_14d",
@@ -8688,6 +8805,9 @@ def build_asin_focus(
             "delta_ad_ctr_14d",
             "delta_ad_cvr_14d",
             "delta_ad_sales_share_14d",
+            "delta_organic_sales_14d",
+            "delta_organic_orders_14d",
+            "delta_organic_sales_share_14d",
             "sales_recent_30d",
             "orders_recent_30d",
             "sessions_recent_30d",
@@ -8699,6 +8819,9 @@ def build_asin_focus(
             "ad_ctr_recent_30d",
             "ad_cvr_recent_30d",
             "ad_sales_share_recent_30d",
+            "organic_sales_recent_30d",
+            "organic_orders_recent_30d",
+            "organic_sales_share_recent_30d",
             "inventory",
             "sales",
             "orders",
@@ -8912,6 +9035,55 @@ def build_asin_focus(
     except Exception:
         # 防御性：任何新维度计算失败都不影响主流程
         pass
+
+    # --- Sigmoid 风险评分（P0）：覆盖天数 + ACoS + CVR 下降 ---
+    try:
+        try:
+            cfg = get_stage_config(stage or "")
+            target_acos = float(getattr(cfg, "target_acos", 0.25) or 0.25)
+        except Exception:
+            target_acos = 0.25
+
+        def _calc_risk(row: pd.Series) -> Tuple[float, str]:
+            # 覆盖天数（仅在近7天有订单速度时启用，避免缺口误判）
+            inv_cover = _safe_float(row.get("inventory_cover_days_7d", 0.0))
+            orders_pd = _safe_float(row.get("orders_per_day_7d", 0.0))
+            oos_r = oos_risk_probability(inv_cover) if orders_pd > 0 else None
+
+            # ACoS 风险：仅在近期有投放时启用
+            ad_spend_recent = _safe_float(row.get("ad_spend_recent_7d", 0.0))
+            ad_sales_recent = _safe_float(row.get("ad_sales_recent_7d", 0.0))
+            acos_recent = _safe_float(row.get("ad_acos_recent_7d", row.get("ad_acos", 0.0)))
+            acos_r = None
+            if ad_spend_recent > 0 or ad_sales_recent > 0:
+                acos_r = acos_risk_probability(acos_recent, target_acos)
+
+            # CVR 下降风险（7d vs prev7d）
+            delta_cvr = _safe_float(row.get("delta_cvr", 0.0))
+            if abs(delta_cvr) <= 1e-12:
+                cvr_prev = _safe_float(row.get("cvr_prev_7d", 0.0))
+                cvr_recent = _safe_float(row.get("cvr_recent_7d", 0.0))
+                if cvr_prev != 0.0 or cvr_recent != 0.0:
+                    delta_cvr = cvr_recent - cvr_prev
+            cvr_r = cvr_drop_risk_probability(delta_cvr)
+
+            score = calculate_overall_risk(oos_risk=oos_r, acos_risk=acos_r, cvr_risk=cvr_r)
+            # 置信度折减：覆盖不足时降低风险分
+            conf = _safe_float(row.get("signal_confidence", 1.0))
+            score = float(score) * max(0.0, min(1.0, conf))
+            return float(score), risk_level(score)
+
+        risk_vals = out.apply(_calc_risk, axis=1, result_type="expand")
+        if isinstance(risk_vals, pd.DataFrame) and risk_vals.shape[1] >= 2:
+            out["risk_score"] = pd.to_numeric(risk_vals.iloc[:, 0], errors="coerce").fillna(0.0)
+            out["risk_level"] = risk_vals.iloc[:, 1].astype(str).fillna("")
+    except Exception:
+        out["risk_score"] = 0.0
+        out["risk_level"] = "低"
+    if "risk_score" not in out.columns:
+        out["risk_score"] = 0.0
+    if "risk_level" not in out.columns:
+        out["risk_level"] = "低"
 
     # 去碎片化：避免多次 insert/赋值导致 PerformanceWarning
     try:
@@ -9457,6 +9629,134 @@ def enrich_asin_focus_with_profit_capacity(
     return out
 
 
+def enrich_asin_focus_with_signal_scores(
+    asin_focus_all: pd.DataFrame,
+    policy: Optional[OpsPolicy] = None,
+    stage: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    计算产品侧/广告侧 Sigmoid 信号评分（仅用于排序参考）。
+    """
+    if asin_focus_all is None or asin_focus_all.empty:
+        return asin_focus_all
+
+    out = asin_focus_all.copy()
+    sig_policy = None
+    try:
+        sig_policy = getattr(policy, "dashboard_signal_scoring", None)
+    except Exception:
+        sig_policy = None
+    if sig_policy is None:
+        sig_policy = SignalScoringPolicy()
+
+    try:
+        cfg = get_stage_config(stage or "")
+        target_acos = float(getattr(cfg, "target_acos", 0.25) or 0.25)
+    except Exception:
+        target_acos = 0.25
+
+    weights_prod = {
+        "sales": float(getattr(sig_policy, "product_sales_weight", 0.4) or 0.4),
+        "sessions": float(getattr(sig_policy, "product_sessions_weight", 0.2) or 0.2),
+        "organic_sales": float(getattr(sig_policy, "product_organic_sales_weight", 0.3) or 0.3),
+        "profit": float(getattr(sig_policy, "product_profit_weight", 0.1) or 0.1),
+    }
+    weights_ad = {
+        "acos": float(getattr(sig_policy, "ad_acos_weight", 0.6) or 0.6),
+        "cvr": float(getattr(sig_policy, "ad_cvr_weight", 0.3) or 0.3),
+        "spend_up_no_sales": float(getattr(sig_policy, "ad_spend_up_no_sales_weight", 0.1) or 0.1),
+    }
+    prod_steep = float(getattr(sig_policy, "product_steepness", 4.0) or 4.0)
+    ad_steep = float(getattr(sig_policy, "ad_steepness", 4.0) or 4.0)
+
+    def _ratio(delta: object, prev: object) -> float:
+        try:
+            d = _safe_float(delta)
+            p = _safe_float(prev)
+            denom = p if p > 0 else 1.0
+            return float(d / denom)
+        except Exception:
+            return 0.0
+
+    def _profit_score(direction: object) -> float:
+        try:
+            s = str(direction or "").strip().lower()
+            if s == "reduce":
+                return 1.0
+            if s == "scale":
+                return -0.5
+            return 0.0
+        except Exception:
+            return 0.0
+
+    def _product_score(row: pd.Series) -> float:
+        try:
+            return float(
+                product_signal_score(
+                    delta_sales_ratio=_ratio(row.get("delta_sales"), row.get("sales_prev_7d")),
+                    delta_sessions_ratio=_ratio(row.get("delta_sessions"), row.get("sessions_prev_7d")),
+                    delta_organic_sales_ratio=_ratio(row.get("delta_organic_sales"), row.get("organic_sales_prev_7d")),
+                    profit_direction_score=_profit_score(row.get("profit_direction")),
+                    weights=weights_prod,
+                    steepness=prod_steep,
+                )
+            )
+        except Exception:
+            return 0.0
+
+    def _ad_score(row: pd.Series) -> float:
+        try:
+            ad_spend_recent = _safe_float(row.get("ad_spend_recent_7d"))
+            ad_sales_recent = _safe_float(row.get("ad_sales_recent_7d"))
+            acos_val = _safe_float(row.get("ad_acos_recent_7d", row.get("ad_acos")))
+            acos_r = 0.0
+            if ad_spend_recent > 0 or ad_sales_recent > 0:
+                acos_r = acos_risk_probability(acos_val, target_acos)
+
+            delta_ad_cvr = _safe_float(row.get("delta_ad_cvr"))
+            if abs(delta_ad_cvr) <= 1e-12:
+                cvr_prev = _safe_float(row.get("ad_cvr_prev_7d"))
+                cvr_recent = _safe_float(row.get("ad_cvr_recent_7d"))
+                if cvr_prev != 0.0 or cvr_recent != 0.0:
+                    delta_ad_cvr = cvr_recent - cvr_prev
+            cvr_r = cvr_drop_risk_probability(delta_ad_cvr)
+
+            spend_up_no_sales = 1.0 if (_safe_float(row.get("delta_spend")) > 0 and _safe_float(row.get("delta_sales")) <= 0) else 0.0
+            return float(
+                ad_signal_score(
+                    acos_risk=acos_r,
+                    cvr_risk=cvr_r,
+                    spend_up_no_sales=spend_up_no_sales,
+                    weights=weights_ad,
+                    steepness=ad_steep,
+                )
+            )
+        except Exception:
+            return 0.0
+
+    try:
+        out["product_signal_score"] = out.apply(_product_score, axis=1)
+        out["ad_signal_score"] = out.apply(_ad_score, axis=1)
+
+        if "signal_confidence" in out.columns:
+            conf = out["signal_confidence"]
+        else:
+            conf = pd.Series([1.0] * len(out), index=out.index)
+        conf = pd.to_numeric(conf, errors="coerce").fillna(1.0).clip(lower=0.0, upper=1.0)
+        out["product_signal_score"] = pd.to_numeric(out["product_signal_score"], errors="coerce").fillna(0.0) * conf
+        out["ad_signal_score"] = pd.to_numeric(out["ad_signal_score"], errors="coerce").fillna(0.0) * conf
+
+        out["product_signal_level"] = out["product_signal_score"].map(risk_level)
+        out["ad_signal_level"] = out["ad_signal_score"].map(risk_level)
+    except Exception:
+        out["product_signal_score"] = 0.0
+        out["ad_signal_score"] = 0.0
+        out["product_signal_level"] = "低"
+        out["ad_signal_level"] = "低"
+
+    return out
+
+
 def build_action_board(actions: List[ActionCandidate], top_n: int = 60) -> pd.DataFrame:
     """
     动作看板（Action Board）：把动作候选变成可排序表格。
@@ -9616,6 +9916,69 @@ def write_dashboard_md(
             except Exception:
                 return _df_to_md_table(df, cols)
 
+        def _clean_product_name(value: object) -> str:
+            name = str(value or "").strip()
+            if name.lower() == "nan":
+                return ""
+            return name
+
+        def _build_asin_name_map() -> Dict[str, str]:
+            """
+            统一收集 ASIN -> 品名 映射，供展示层优先展示产品名。
+            """
+            name_map: Dict[str, str] = {}
+
+            def _add(df: Optional[pd.DataFrame], asin_col: str, name_col: str) -> None:
+                if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                    return
+                if asin_col not in df.columns or name_col not in df.columns:
+                    return
+                try:
+                    view = df[[asin_col, name_col]].copy()
+                    view[asin_col] = view[asin_col].astype(str).str.upper().str.strip()
+                    view[name_col] = view[name_col].map(_clean_product_name)
+                    view = view[view[asin_col] != ""].copy()
+                    view = view.drop_duplicates(subset=[asin_col], keep="first")
+                    for _, r in view.iterrows():
+                        asin = str(r.get(asin_col, "") or "").strip().upper()
+                        name = str(r.get(name_col, "") or "").strip()
+                        if asin and name and asin not in name_map:
+                            name_map[asin] = name
+                except Exception:
+                    return
+
+            _add(asin_focus, "asin", "product_name")
+            _add(asin_cockpit, "asin", "product_name")
+            _add(action_board, "asin_hint", "product_name")
+            _add(unlock_scale_tasks, "asin", "product_name")
+            return name_map
+
+        asin_name_map = _build_asin_name_map()
+
+        def _resolve_product_name(asin: str, product_name: object) -> str:
+            name = _clean_product_name(product_name)
+            if not name and asin:
+                name = str(asin_name_map.get(asin, "") or "").strip()
+            return name
+
+        def _format_product_label(asin: str, product_name: object) -> str:
+            asin_norm = str(asin or "").strip().upper()
+            name = _resolve_product_name(asin_norm, product_name)
+            asin_link = _asin_md_link(asin_norm, "./asin_drilldown.md") if asin_norm else ""
+            if name:
+                name_disp = f"**{name}**"
+                if asin_link:
+                    return f"{name_disp}（{asin_link}）"
+                return name_disp
+            return asin_link or asin_norm
+
+        def _compact_product_label(asin: str, product_name: object) -> str:
+            asin_norm = str(asin or "").strip().upper()
+            name = _resolve_product_name(asin_norm, product_name)
+            if name and asin_norm:
+                return f"{name}({asin_norm})"
+            return name or asin_norm
+
         lines: List[str] = []
         lines.append(f"# {shop} Dashboard（聚焦版）")
         lines.append("")
@@ -9659,6 +10022,9 @@ def write_dashboard_md(
         quick_links = ["[运营操作手册](../../../../docs/OPS_PLAYBOOK.md)", "[Shop Alerts](#alerts)"]
         quick_links.append("[本周行动](#weekly)")
         quick_links.append("[Campaign排查](#campaign)")
+        quick_links.append("[Action Board](../dashboard/action_board.csv)")
+        quick_links.append("[解锁任务表](../dashboard/unlock_scale_tasks.csv)")
+        quick_links.append("[Campaign筛选表](../dashboard/campaign_action_view.csv)")
         if isinstance(action_review, pd.DataFrame) and (not action_review.empty):
             quick_links.append("[执行复盘](#review)")
         quick_links += [
@@ -9667,6 +10033,7 @@ def write_dashboard_md(
             "[生命周期时间轴](./lifecycle_overview.md)",
             "[关键词主题](#keywords)",
             "[Drivers](#drivers)",
+            "[产品侧变化](#product_changes)",
         ]
         lines.append("快速入口：" + " | ".join(quick_links))
         lines.append("")
@@ -9725,7 +10092,7 @@ def write_dashboard_md(
         try:
             if scale_opportunity_all is not None and not scale_opportunity_all.empty and "asin" in scale_opportunity_all.columns:
                 top_asin = str(scale_opportunity_all.iloc[0].get("asin", "") or "").strip().upper()
-                top_asin_md = _asin_md_link(top_asin, "./asin_drilldown.md") if top_asin else ""
+                top_asin_md = _format_product_label(top_asin, "")
                 cnt = int(len(scale_opportunity_all))
                 if top_asin_md:
                     lines.append(
@@ -9944,7 +10311,6 @@ def write_dashboard_md(
                     if ("供应链" in owner) or ("库存" in task_type) or ("断货" in task_type):
                         group = "review"
 
-                    asin_link = _asin_md_link(asin, "./asin_drilldown.md") if asin else asin
                     ev_parts = []
                     spend_val = 0.0
                     delta_val = 0.0
@@ -9966,7 +10332,8 @@ def write_dashboard_md(
                     ev_txt = _evidence_text(ev_parts)
 
                     prefix = f"{cat} " if cat else ""
-                    title = f"{prefix}{asin_link} {task_type}".strip()
+                    product_label = _format_product_label(asin, r.get("product_name", ""))
+                    title = f"{prefix}{product_label} {task_type}".strip()
                     if not title:
                         continue
                     candidates.append(
@@ -9976,7 +10343,7 @@ def write_dashboard_md(
                             "asin": asin,
                             "spend": float(spend_val),
                             "delta": float(delta_val),
-                            "line": f"`{p}` `{_group_tag(group)}` {title} | {ev_txt} | 责任:{owner} | [任务表](../dashboard/unlock_scale_tasks.csv)",
+                            "line": f"`{p}` `{_group_tag(group)}` {title} | {ev_txt} | 责任:{owner}",
                         }
                     )
 
@@ -9986,15 +10353,12 @@ def write_dashboard_md(
                     p = str(a.get("priority", "P1") or "P1").strip().upper()
                     title = str(a.get("title", "") or "").strip()
                     detail = str(a.get("detail", "") or "").strip()
-                    link = str(a.get("link", "") or "").strip()
                     if not title:
                         continue
                     owner = _owner_from_alert(title)
                     group = _group_from_alert(title)
                     ev_txt = _evidence_text([detail] if detail else [])
                     line = f"`{p}` `{_group_tag(group)}` {title} | {ev_txt} | 责任:{owner}"
-                    if link:
-                        line += f" | {link}"
                     candidates.append({"priority": p, "group": group, "asin": "", "spend": 0.0, "delta": 0.0, "line": line})
 
             # C) Action Board：广告端可直接执行（补齐“止损/放量/排查”）
@@ -10018,7 +10382,7 @@ def write_dashboard_md(
                     obj = str(r.get("object_name", "") or "").strip()
                     camp = str(r.get("campaign", "") or "").strip()
                     asin = str(r.get("asin_hint", "") or "").strip().upper()
-                    asin_link = _asin_md_link(asin, "./asin_drilldown.md") if asin else ""
+                    product_label = _format_product_label(asin, r.get("product_name", ""))
 
                     blocked = 0
                     try:
@@ -10062,15 +10426,12 @@ def write_dashboard_md(
                     ev_txt = _evidence_text(ev_parts)
 
                     core = f"{action_type} {obj}".strip() if action_type or obj else "广告动作"
+                    if product_label:
+                        core = f"{product_label} {core}".strip()
                     if camp:
                         core += f" @ {camp}"
                     if needs_confirm:
                         core += " [需确认]"
-
-                    link_parts = []
-                    if asin_link:
-                        link_parts.append(asin_link)
-                    link_parts.append("[Action Board](../dashboard/action_board.csv)")
 
                     candidates.append(
                         {
@@ -10079,7 +10440,7 @@ def write_dashboard_md(
                             "asin": asin,
                             "spend": float(_as_float(r.get("e_spend"))),
                             "delta": float(abs(delta_sales_val) if delta_sales_val != 0 else abs(delta_spend_val)),
-                            "line": f"`{p}` `{_group_tag(group)}` {core} | {ev_txt} | 责任:{owner} | {' | '.join(link_parts)}",
+                            "line": f"`{p}` `{_group_tag(group)}` {core} | {ev_txt} | 责任:{owner}",
                         }
                     )
 
@@ -10141,9 +10502,7 @@ def write_dashboard_md(
 
         if weekly_actions:
             has_weekly_tasks = True
-            lines.append(
-                f"- 本周行动清单：Top {len(weekly_actions)}（[跳转](#weekly) | [任务表](../dashboard/unlock_scale_tasks.csv) | [Action Board](../dashboard/action_board.csv)）"
-            )
+            lines.append(f"- 本周行动清单：Top {len(weekly_actions)}（见下方）")
         else:
             has_weekly_tasks = False
 
@@ -10175,7 +10534,7 @@ def write_dashboard_md(
                     lines.append(f"- `{p}` {title}")
         else:
             # 防御性兜底：至少给一个“下一步”
-            lines.append("- （暂无显著告警；建议先看 Shop Alerts/Watchlists/Drivers）")
+            lines.append("- （暂无显著告警；建议先看快速入口）")
 
         # ===== 阶段化指标区块（新品期 / 成熟期）=====
         lines.append("")
@@ -10314,6 +10673,65 @@ def write_dashboard_md(
         except Exception:
             lines.append("- （阶段化指标生成失败）")
 
+        # 产品侧变化摘要（自然/流量）
+        lines.append("")
+        lines.append('<a id="product_changes"></a>')
+        lines.append("### 产品侧变化摘要（近7天 vs 前7天）")
+        lines.append("")
+        lines.append("- 说明：按 |Δ| 排序，仅用于抓重点。")
+        try:
+            af = asin_focus.copy() if isinstance(asin_focus, pd.DataFrame) else pd.DataFrame()
+            if af is None or af.empty:
+                lines.append("- （暂无）")
+            else:
+                def _top_changes(df: pd.DataFrame, delta_col: str, prev_col: str, recent_col: str, title: str, mapping: Dict[str, str]) -> None:
+                    if df is None or df.empty or delta_col not in df.columns:
+                        lines.append(f"- {title}：暂无")
+                        return
+                    view = df.copy()
+                    for c in (delta_col, prev_col, recent_col, "signal_confidence"):
+                        if c in view.columns:
+                            view[c] = pd.to_numeric(view[c], errors="coerce").fillna(0.0)
+                    if "asin" in view.columns:
+                        view["asin"] = view["asin"].map(lambda x: _asin_md_link(str(x or ""), "./asin_drilldown.md"))
+                    if "product_category" in view.columns:
+                        view["product_category"] = view["product_category"].map(
+                            lambda x: _cat_md_link(str(x or ""), "./category_drilldown.md")
+                        )
+                    view["_abs_delta"] = pd.to_numeric(view[delta_col], errors="coerce").fillna(0.0).abs()
+                    view = view.sort_values("_abs_delta", ascending=False).head(5).drop(columns=["_abs_delta"], errors="ignore")
+                    show_cols = [c for c in ["asin", "product_name", "product_category", prev_col, recent_col, delta_col, "signal_confidence"] if c in view.columns]
+                    lines.append(f"#### {title}")
+                    lines.append("")
+                    if view.empty:
+                        lines.append("- （暂无）")
+                    else:
+                        lines.append(_display_table(view, show_cols, mapping))
+                    lines.append("")
+
+                organic_map = {
+                    "asin": "ASIN",
+                    "product_name": "品名",
+                    "product_category": "类目",
+                    "organic_sales_prev_7d": "自然销售(前7天)",
+                    "organic_sales_recent_7d": "自然销售(近7天)",
+                    "delta_organic_sales": "自然销售Δ",
+                    "signal_confidence": "置信度",
+                }
+                session_map = {
+                    "asin": "ASIN",
+                    "product_name": "品名",
+                    "product_category": "类目",
+                    "sessions_prev_7d": "Sessions(前7天)",
+                    "sessions_recent_7d": "Sessions(近7天)",
+                    "delta_sessions": "SessionsΔ",
+                    "signal_confidence": "置信度",
+                }
+                _top_changes(af, "delta_organic_sales", "organic_sales_prev_7d", "organic_sales_recent_7d", "自然销售变化 Top5", organic_map)
+                _top_changes(af, "delta_sessions", "sessions_prev_7d", "sessions_recent_7d", "总流量变化 Top5", session_map)
+        except Exception:
+            lines.append("- （生成失败）")
+
         # 本周行动清单：Top 3（每条必须包含：责任归属 + 关键证据 + 跳转链接）
         lines.append("")
         lines.append('<a id="weekly"></a>')
@@ -10323,7 +10741,7 @@ def write_dashboard_md(
             for it in weekly_actions[:3]:
                 lines.append("- " + str(it.get("line", "") or "").strip())
         else:
-            lines.append("- （暂无可收敛的本周行动清单；建议先看 [Action Board](../dashboard/action_board.csv) 与 [Watchlists](#watchlists)）")
+            lines.append("- （暂无可收敛的本周行动清单；建议先看快速入口）")
 
         # Campaign 优先排查：让运营先按“外层 campaign”收口，再下钻到词/ASIN
         lines.append("")
@@ -10359,10 +10777,15 @@ def write_dashboard_md(
                     delta_sales = _fmt_signed_usd(r.get("delta_sales_sum"))
                     delta_spend = _fmt_signed_usd(r.get("delta_spend_sum"))
                     top_asins_raw = str(r.get("top_asins", "") or "").strip()
-                    top_asins = ""
+                    top_products = ""
                     if top_asins_raw:
                         tops = [x for x in top_asins_raw.split(";") if x]
-                        top_asins = ";".join(tops[:2])
+                        labels: List[str] = []
+                        for a in tops[:2]:
+                            label = _compact_product_label(a, "")
+                            if label:
+                                labels.append(label)
+                        top_products = ";".join(labels)
 
                     parts = []
                     if ad_type:
@@ -10381,9 +10804,8 @@ def write_dashboard_md(
                         ev_parts.append(f"阻断=`{blocked_cnt}`")
                     if ev_parts:
                         parts.append(f"证据: {' | '.join(ev_parts)}")
-                    if top_asins:
-                        parts.append(f"TopASIN=`{top_asins}`")
-                    parts.append("[筛选表](../dashboard/campaign_action_view.csv)")
+                    if top_products:
+                        parts.append(f"Top产品=`{top_products}`")
                     lines.append("- " + " | ".join([p for p in parts if p]))
         except Exception:
             lines.append("- （暂无）")
@@ -14310,6 +14732,7 @@ def write_dashboard_outputs(
             lifecycle_board=lifecycle_board,
             lifecycle_windows=lifecycle_windows,
             policy=policy,
+            stage=stage,
             top_n=1000000,  # 足够大：用于映射与统计，不用于展示
         )
         # 2.0) 利润承受度字段前置（来自 diagnostics["asin_stages"]）
@@ -14317,6 +14740,14 @@ def write_dashboard_outputs(
             asin_focus_all = enrich_asin_focus_with_profit_capacity(
                 asin_focus_all=asin_focus_all,
                 asin_stages=(diagnostics.get("asin_stages") if isinstance(diagnostics, dict) else []) or [],
+            )
+        except Exception:
+            pass
+        try:
+            asin_focus_all = enrich_asin_focus_with_signal_scores(
+                asin_focus_all=asin_focus_all,
+                policy=policy,
+                stage=stage,
             )
         except Exception:
             pass

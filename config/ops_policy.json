@@ -170,6 +170,20 @@
       "_comment_gross_margin_signal_low_threshold": "毛利率偏低阈值（0~1）：gross_margin <= 该值触发（示例：0.15=15%）。",
       "gross_margin_signal_low_threshold": 0.15
     },
+    "signal_scoring": {
+      "_comment": "Sigmoid 多维评分（产品侧/广告侧），用于排序参考，不替代规则。权重越大越强调该信号。",
+      "_comment_product": "产品侧：销量/流量/自然销售 + 利润方向（reduce/hold/scale）",
+      "product_sales_weight": 0.4,
+      "product_sessions_weight": 0.2,
+      "product_organic_sales_weight": 0.3,
+      "product_profit_weight": 0.1,
+      "product_steepness": 4.0,
+      "_comment_ad": "广告侧：ACOS 风险 + CVR 风险 + 加花费无增量",
+      "ad_acos_weight": 0.6,
+      "ad_cvr_weight": 0.3,
+      "ad_spend_up_no_sales_weight": 0.1,
+      "ad_steepness": 4.0
+    },
     "stage_scoring": {
       "_comment": "阶段化指标权重（启动/成长/成熟）。启动/成长期关注 CTR/CVR/CPA；成熟期关注 CPA/ACOS/广告占比稳定与花费波动。",
       "_comment_phase_split": "可拆分 launch/growth；若不配 launch_phases/growth_phases，会回退到 new_phases 兼容旧口径。",
