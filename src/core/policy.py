@@ -128,6 +128,30 @@ class FocusScoringPolicy:
 
 
 @dataclass(frozen=True)
+class SignalScoringPolicy:
+    """
+    产品/广告侧 Sigmoid 信号评分（用于排序参考，可配置）。
+
+    说明：
+    - product_* 用于产品侧变化（销量/流量/自然/利润方向）
+    - ad_* 用于广告效率风险（ACoS/CVR/加花费无增量）
+    """
+
+    # 产品侧权重
+    product_sales_weight: float = 0.4
+    product_sessions_weight: float = 0.2
+    product_organic_sales_weight: float = 0.3
+    product_profit_weight: float = 0.1
+    product_steepness: float = 4.0
+
+    # 广告侧权重
+    ad_acos_weight: float = 0.6
+    ad_cvr_weight: float = 0.3
+    ad_spend_up_no_sales_weight: float = 0.1
+    ad_steepness: float = 4.0
+
+
+@dataclass(frozen=True)
 class InventorySigmoidPolicy:
     """
     库存调速（Sigmoid）建议：仅用于“建议/提示”，不直接改价与不影响排序。
@@ -410,6 +434,7 @@ class OpsPolicy:
     dashboard_compare_ignore_last_days: int = 0
     dashboard_scale_window: ScaleWindowPolicy = field(default_factory=ScaleWindowPolicy)
     dashboard_focus_scoring: FocusScoringPolicy = field(default_factory=FocusScoringPolicy)
+    dashboard_signal_scoring: SignalScoringPolicy = field(default_factory=SignalScoringPolicy)
     dashboard_stage_scoring: StageScoringPolicy = field(default_factory=StageScoringPolicy)
     dashboard_action_scoring: ActionScoringPolicy = field(default_factory=ActionScoringPolicy)
     dashboard_inventory_sigmoid: InventorySigmoidPolicy = field(default_factory=InventorySigmoidPolicy)
@@ -657,6 +682,48 @@ def load_ops_policy(path: Path) -> OpsPolicy:
                     1.0,
                     _to_float(fs_data.get("gross_margin_signal_low_threshold"), fs_base.gross_margin_signal_low_threshold),
                 ),
+            ),
+        )
+
+        # Sigmoid 多维评分（可配置；没有则用默认）
+        sigs_base = base.dashboard_signal_scoring
+        sigs_data = dash.get("signal_scoring") if isinstance(dash.get("signal_scoring"), dict) else {}
+        signal_scoring = SignalScoringPolicy(
+            product_sales_weight=max(
+                0.0,
+                _to_float(sigs_data.get("product_sales_weight"), sigs_base.product_sales_weight),
+            ),
+            product_sessions_weight=max(
+                0.0,
+                _to_float(sigs_data.get("product_sessions_weight"), sigs_base.product_sessions_weight),
+            ),
+            product_organic_sales_weight=max(
+                0.0,
+                _to_float(sigs_data.get("product_organic_sales_weight"), sigs_base.product_organic_sales_weight),
+            ),
+            product_profit_weight=max(
+                0.0,
+                _to_float(sigs_data.get("product_profit_weight"), sigs_base.product_profit_weight),
+            ),
+            product_steepness=max(
+                0.0,
+                _to_float(sigs_data.get("product_steepness"), sigs_base.product_steepness),
+            ),
+            ad_acos_weight=max(
+                0.0,
+                _to_float(sigs_data.get("ad_acos_weight"), sigs_base.ad_acos_weight),
+            ),
+            ad_cvr_weight=max(
+                0.0,
+                _to_float(sigs_data.get("ad_cvr_weight"), sigs_base.ad_cvr_weight),
+            ),
+            ad_spend_up_no_sales_weight=max(
+                0.0,
+                _to_float(sigs_data.get("ad_spend_up_no_sales_weight"), sigs_base.ad_spend_up_no_sales_weight),
+            ),
+            ad_steepness=max(
+                0.0,
+                _to_float(sigs_data.get("ad_steepness"), sigs_base.ad_steepness),
             ),
         )
 
@@ -995,6 +1062,7 @@ def load_ops_policy(path: Path) -> OpsPolicy:
             dashboard_compare_ignore_last_days=dash_ignore_last_days,
             dashboard_scale_window=scale_window,
             dashboard_focus_scoring=fs,
+            dashboard_signal_scoring=signal_scoring,
             dashboard_stage_scoring=stage_scoring,
             dashboard_action_scoring=action_scoring,
             dashboard_inventory_sigmoid=inventory_sigmoid,
@@ -1170,6 +1238,7 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
             "compare_ignore_last_days",
             "scale_window",
             "focus_scoring",
+            "signal_scoring",
             "stage_scoring",
             "action_scoring",
             "inventory_sigmoid",
@@ -1224,6 +1293,77 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
         "dashboard.focus_scoring",
         min_v=-1.0,
         max_v=1.0,
+    )
+
+    # ===== dashboard.signal_scoring =====
+    sigs = dash.get("signal_scoring")
+    if sigs is not None and not isinstance(sigs, dict):
+        warnings.append("类型不匹配：`dashboard.signal_scoring` 期望为 object/dict；将使用默认策略。")
+        sigs = {}
+    sigs = sigs if isinstance(sigs, dict) else {}
+    warn_unknown_keys(sigs, {f.name for f in fields(SignalScoringPolicy)}, "dashboard.signal_scoring")
+    check_float(
+        sigs,
+        "product_sales_weight",
+        base.dashboard_signal_scoring.product_sales_weight,
+        "dashboard.signal_scoring",
+        min_v=0.0,
+    )
+    check_float(
+        sigs,
+        "product_sessions_weight",
+        base.dashboard_signal_scoring.product_sessions_weight,
+        "dashboard.signal_scoring",
+        min_v=0.0,
+    )
+    check_float(
+        sigs,
+        "product_organic_sales_weight",
+        base.dashboard_signal_scoring.product_organic_sales_weight,
+        "dashboard.signal_scoring",
+        min_v=0.0,
+    )
+    check_float(
+        sigs,
+        "product_profit_weight",
+        base.dashboard_signal_scoring.product_profit_weight,
+        "dashboard.signal_scoring",
+        min_v=0.0,
+    )
+    check_float(
+        sigs,
+        "product_steepness",
+        base.dashboard_signal_scoring.product_steepness,
+        "dashboard.signal_scoring",
+        min_v=0.0,
+    )
+    check_float(
+        sigs,
+        "ad_acos_weight",
+        base.dashboard_signal_scoring.ad_acos_weight,
+        "dashboard.signal_scoring",
+        min_v=0.0,
+    )
+    check_float(
+        sigs,
+        "ad_cvr_weight",
+        base.dashboard_signal_scoring.ad_cvr_weight,
+        "dashboard.signal_scoring",
+        min_v=0.0,
+    )
+    check_float(
+        sigs,
+        "ad_spend_up_no_sales_weight",
+        base.dashboard_signal_scoring.ad_spend_up_no_sales_weight,
+        "dashboard.signal_scoring",
+        min_v=0.0,
+    )
+    check_float(
+        sigs,
+        "ad_steepness",
+        base.dashboard_signal_scoring.ad_steepness,
+        "dashboard.signal_scoring",
+        min_v=0.0,
     )
 
     # ===== dashboard.stage_scoring =====
@@ -1403,6 +1543,7 @@ def ops_policy_effective_to_dict(policy: OpsPolicy) -> Dict[str, object]:
                 "compare_ignore_last_days": int(policy.dashboard_compare_ignore_last_days),
                 "scale_window": asdict(policy.dashboard_scale_window),
                 "focus_scoring": asdict(policy.dashboard_focus_scoring),
+                "signal_scoring": asdict(policy.dashboard_signal_scoring),
                 "stage_scoring": asdict(policy.dashboard_stage_scoring),
                 "action_scoring": asdict(policy.dashboard_action_scoring),
                 "inventory_sigmoid": asdict(policy.dashboard_inventory_sigmoid),
@@ -1836,6 +1977,48 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
             ),
         )
 
+        # Sigmoid 多维评分（可配置；没有则用默认）
+        sigs_base = base.dashboard_signal_scoring
+        sigs_data = dash.get("signal_scoring") if isinstance(dash.get("signal_scoring"), dict) else {}
+        signal_scoring = SignalScoringPolicy(
+            product_sales_weight=max(
+                0.0,
+                _to_float(sigs_data.get("product_sales_weight"), sigs_base.product_sales_weight),
+            ),
+            product_sessions_weight=max(
+                0.0,
+                _to_float(sigs_data.get("product_sessions_weight"), sigs_base.product_sessions_weight),
+            ),
+            product_organic_sales_weight=max(
+                0.0,
+                _to_float(sigs_data.get("product_organic_sales_weight"), sigs_base.product_organic_sales_weight),
+            ),
+            product_profit_weight=max(
+                0.0,
+                _to_float(sigs_data.get("product_profit_weight"), sigs_base.product_profit_weight),
+            ),
+            product_steepness=max(
+                0.0,
+                _to_float(sigs_data.get("product_steepness"), sigs_base.product_steepness),
+            ),
+            ad_acos_weight=max(
+                0.0,
+                _to_float(sigs_data.get("ad_acos_weight"), sigs_base.ad_acos_weight),
+            ),
+            ad_cvr_weight=max(
+                0.0,
+                _to_float(sigs_data.get("ad_cvr_weight"), sigs_base.ad_cvr_weight),
+            ),
+            ad_spend_up_no_sales_weight=max(
+                0.0,
+                _to_float(sigs_data.get("ad_spend_up_no_sales_weight"), sigs_base.ad_spend_up_no_sales_weight),
+            ),
+            ad_steepness=max(
+                0.0,
+                _to_float(sigs_data.get("ad_steepness"), sigs_base.ad_steepness),
+            ),
+        )
+
         # 阶段化指标权重（可配置；没有则用默认）
         ss_base = base.dashboard_stage_scoring
         ss_data = dash.get("stage_scoring") if isinstance(dash.get("stage_scoring"), dict) else {}
@@ -2114,6 +2297,7 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
             dashboard_top_actions=dash_top_actions,
             dashboard_scale_window=scale_window,
             dashboard_focus_scoring=fs,
+            dashboard_signal_scoring=signal_scoring,
             dashboard_stage_scoring=stage_scoring,
             dashboard_action_scoring=action_scoring,
             dashboard_budget_transfer_opportunity=budget_transfer_opportunity,

@@ -3,8 +3,11 @@
   "new_cycle_oos_days": 14,
   "roll_days": 7,
   "launch_days": 14,
+  "min_mature_days": 21,
+  "min_mature_orders": 20,
+  "min_mature_sales": 200,
+  "min_peak_sales_roll": 10,
   "mature_ratio": 0.85,
   "decline_ratio": 0.65,
   "low_inventory": 20
 }
-

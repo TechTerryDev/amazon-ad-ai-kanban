@@ -171,3 +171,64 @@ def signal_confidence(actual_days: float, window_days: float) -> float:
         return max(0.0, min(1.0, a / w))
     except Exception:
         return 0.0
+
+
+def product_signal_score(
+    delta_sales_ratio: float,
+    delta_sessions_ratio: float,
+    delta_organic_sales_ratio: float,
+    profit_direction_score: float,
+    weights: Optional[Dict[str, float]] = None,
+    steepness: float = 4.0,
+) -> float:
+    """
+    产品侧信号评分（越高越需要关注，偏“风险/问题”排序）。
+    - ratio 为相对变化（recent-prev / max(prev,1)）
+    - profit_direction_score: reduce=1, hold=0, scale=-0.5
+    """
+    try:
+        w = {
+            "sales": 0.4,
+            "sessions": 0.2,
+            "organic_sales": 0.3,
+            "profit": 0.1,
+        }
+        if isinstance(weights, dict):
+            for k in w.keys():
+                if k in weights:
+                    w[k] = float(weights[k])
+
+        # 下降越多，风险越高
+        z = 0.0
+        z += w["sales"] * max(0.0, -_safe_float(delta_sales_ratio))
+        z += w["sessions"] * max(0.0, -_safe_float(delta_sessions_ratio))
+        z += w["organic_sales"] * max(0.0, -_safe_float(delta_organic_sales_ratio))
+        z += w["profit"] * max(0.0, _safe_float(profit_direction_score))
+        return _sigmoid(_safe_float(steepness, 4.0) * z)
+    except Exception:
+        return 0.0
+
+
+def ad_signal_score(
+    acos_risk: float,
+    cvr_risk: float,
+    spend_up_no_sales: float = 0.0,
+    weights: Optional[Dict[str, float]] = None,
+    steepness: float = 4.0,
+) -> float:
+    """
+    广告侧信号评分（越高越需要关注，偏“效率/浪费”排序）。
+    """
+    try:
+        w = {"acos": 0.6, "cvr": 0.3, "spend_up_no_sales": 0.1}
+        if isinstance(weights, dict):
+            for k in w.keys():
+                if k in weights:
+                    w[k] = float(weights[k])
+        z = 0.0
+        z += w["acos"] * max(0.0, _safe_float(acos_risk))
+        z += w["cvr"] * max(0.0, _safe_float(cvr_risk))
+        z += w["spend_up_no_sales"] * max(0.0, _safe_float(spend_up_no_sales))
+        return _sigmoid(_safe_float(steepness, 4.0) * z)
+    except Exception:
+        return 0.0
