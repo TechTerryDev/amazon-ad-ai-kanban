@@ -331,6 +331,7 @@ def _write_start_here(
     output_profile: str,
     render_dashboard_md: bool,
     render_full_report: bool,
+    policy: Optional[OpsPolicy] = None,
 ) -> None:
     """
     验收入口：把“要看哪个文件”明确出来，减少输出文件带来的困扰。
@@ -361,7 +362,60 @@ def _write_start_here(
                 f"- 再看 {L('dashboard/action_board.csv')}（可筛选/分派）",
                 f"- 最后按需下钻到 ASIN/类目/生命周期明细",
                 "",
+                "口径与提示（集中说明）：",
+                "- 未标注的累计指标=主窗口；标注 compare/Δ 的为近N天 vs 前N天（日期见表内 recent/prev）",
+                "- 表头含(7d/14d/30d)=近窗；含Δ=对比窗口；含roll=滚动窗口",
+                "- Drilldown：类目/ASIN/生命周期字段可点击跳转（Dashboard/Drilldown 均支持）",
+                "- Δ 指标默认 compare_7d（近7天 vs 前7天），如需换口径请看对应 CSV/字段",
+                "- HTML 支持目录/表头排序（离线可用），如需追溯口径请以 CSV/JSON 为准",
             ]
+            try:
+                ignore_last = int(getattr(policy, "dashboard_compare_ignore_last_days", 0) or 0) if policy is not None else 0
+                if ignore_last > 0:
+                    lines.append(f"- compare 忽略最近 {ignore_last} 天（规避归因滞后噪声）")
+            except Exception:
+                pass
+            try:
+                low_thr = 0.35
+                if isinstance(policy, OpsPolicy):
+                    asp = getattr(policy, "dashboard_action_scoring", None)
+                    if asp is not None:
+                        low_thr = float(getattr(asp, "low_hint_confidence_threshold", low_thr) or low_thr)
+                low_thr = max(0.0, min(1.0, float(low_thr)))
+                lines.append(
+                    f"- Action Board：`asin_hint` 为弱关联定位；当 `asin_hint_confidence<{low_thr:.2f}` 时建议先人工确认（可在 action_board.csv 里筛选/对照候选 ASIN）"
+                )
+            except Exception:
+                lines.append("- Action Board：`asin_hint` 为弱关联定位；低置信度时建议先人工确认")
+            try:
+                cover_days_thr = float(getattr(policy, "block_scale_when_cover_days_below", 7.0) or 7.0) if isinstance(policy, OpsPolicy) else 7.0
+                lines.append(f"- 库存告急仍投放：`inventory_cover_days_7d ≤ {int(cover_days_thr)}d` 且 `ad_spend_roll ≥ 10`")
+            except Exception:
+                pass
+            lines.append("- 库存调速（Sigmoid）：基于 `inventory_cover_days_7d` 计算调速系数，仅建议不自动执行")
+            lines.append("- 利润护栏（Break-even）：安全ACOS = 毛利率 - 目标净利率，超线仅提示")
+            lines.append("- 关键词主题：n-gram 会重复计数 spend；仅用于线索与聚焦，不做精确归因")
+            try:
+                dq_path = shop_dir / "ai" / "data_quality.md"
+                if dq_path.exists():
+                    hints: List[str] = []
+                    with dq_path.open("r", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            t = line.strip()
+                            if not t:
+                                continue
+                            if t.startswith("- "):
+                                hints.append(t[2:].strip())
+                            if len(hints) >= 2:
+                                break
+                    if hints:
+                        lines.append("- 数据质量提示（自动摘取）:")
+                        for h in hints:
+                            if h:
+                                lines.append(f"  - {h}")
+            except Exception:
+                pass
+            lines.append("")
         else:
             lines += [
                 "建议阅读顺序：",
@@ -373,6 +427,7 @@ def _write_start_here(
                 "",
             ]
         if render_dashboard_md:
+            lines.append("文件导航（Dashboard 常用）：")
             lines.append(f"- {L('reports/dashboard.html')}：聚焦版（HTML，更好读）")
             lines.append(f"- {L('reports/asin_drilldown.html')}：ASIN Drilldown（HTML）")
             lines.append(f"- {L('reports/category_drilldown.html')}：Category Drilldown（HTML）")
@@ -385,12 +440,17 @@ def _write_start_here(
         lines.append(f"- {L('dashboard/phase_cockpit.csv')}：生命周期总览（按 current_phase 汇总 focus/变化/动作量）")
         lines.append(f"- {L('dashboard/asin_focus.csv')}：ASIN Focus List（按 focus_score 排序，可筛选/分派）")
         lines.append(f"- {L('dashboard/asin_cockpit.csv')}：ASIN 总览（focus + drivers + 动作量汇总，一行一个 ASIN）")
+        lines.append(f"- {L('dashboard/compare_summary.csv')}：店铺环比摘要（7/14/30，销售/利润/花费/自然/转化）")
+        lines.append(f"- {L('dashboard/lifecycle_timeline.csv')}：生命周期时间轴摘要（每 ASIN 一行，供复盘/筛选）")
+        lines.append(f"- {L('dashboard/task_summary.csv')}：任务汇总（本周行动/Shop Alerts/Action Board 汇聚，可筛选复盘）")
         lines.append(f"- {L('dashboard/profit_reduce_watchlist.csv')}：利润控量 Watchlist（profit_direction=reduce 且仍在烧钱：优先止血/收口）")
         lines.append(f"- {L('dashboard/oos_with_ad_spend_watchlist.csv')}：断货仍烧钱 Watchlist（oos_with_ad_spend_days>0 且仍在投放：优先止损）")
         lines.append(f"- {L('dashboard/spend_up_no_sales_watchlist.csv')}：加花费但销量不增 Watchlist（delta_spend>0 且 delta_sales<=0：优先排查）")
         lines.append(f"- {L('dashboard/phase_down_recent_watchlist.csv')}：阶段走弱 Watchlist（近14天阶段走弱 down 且仍在花费：优先排查根因）")
         lines.append(f"- {L('dashboard/scale_opportunity_watchlist.csv')}：机会 Watchlist（可放量窗口/低花费高潜；用于预算迁移/加码）")
         lines.append(f"- {L('dashboard/opportunity_action_board.csv')}：机会→可执行动作（只保留 BID_UP/BUDGET_UP 且未阻断）")
+        lines.append(f"- {L('dashboard/inventory_sigmoid_watchlist.csv')}：库存调速建议（Sigmoid，仅建议，不影响排序）")
+        lines.append(f"- {L('dashboard/profit_guard_watchlist.csv')}：利润护栏 Watchlist（Break-even：安全ACOS/CPC 超线提示）")
         lines.append(f"- {L('dashboard/budget_transfer_plan.csv')}：预算迁移净表（估算金额；执行时以实际预算/花费节奏校准）")
         lines.append(f"- {L('dashboard/unlock_scale_tasks.csv')}：放量解锁任务表（可分工：广告/供应链/运营/美工）")
         lines.append(f"- {L('dashboard/unlock_scale_tasks_full.csv')}：放量解锁任务表全量（含更多任务/优先级，便于追溯）")
@@ -400,8 +460,10 @@ def _write_start_here(
         lines.append(f"- {L('dashboard/keyword_topics_action_hints.csv')}：关键词主题建议清单（Top 浪费→否词/降价；Top 贡献→加精确/提价；含 top_campaigns/top_ad_groups；scale 方向会标注/阻断库存风险）")
         lines.append(f"- {L('dashboard/keyword_topics_asin_context.csv')}：关键词主题→产品语境（只用高置信 term→asin；可看到类目/ASIN/生命周期/库存覆盖）")
         lines.append(f"- {L('dashboard/keyword_topics_category_phase_summary.csv')}：关键词主题→类目/生命周期汇总（先按类目/阶段看主题，再下钻到 ASIN）")
+        lines.append(f"- {L('dashboard/campaign_action_view.csv')}：Campaign 行动聚合（从 Action Board 归并，方便先按 campaign 排查）")
         lines.append(f"- {L('dashboard/action_board.csv')}：动作看板（去重后的运营视图；P0/P1 优先；可按类目/生命周期筛选）")
         lines.append(f"- {L('dashboard/action_board_full.csv')}：动作看板全量（含重复，便于追溯）")
+        lines.append(f"- {L('dashboard/shop_scorecard.json')}：店铺 KPI/诊断（结构化）")
         lines.append(f"- {L('ops/execution_log_template.xlsx')}：L0+ 执行回填模板（手工执行后回填，用于下次复盘）")
         if (shop_dir / "ops" / "action_review.csv").exists():
             lines.append(f"- {L('ops/action_review.csv')}：L0+ 动作复盘（已生成：基于历史 execution_log 复盘 7/14 天效果）")
@@ -1684,6 +1746,7 @@ def run(
             output_profile=output_profile,
             render_dashboard_md=bool(render_dashboard_md),
             render_full_report=bool(render_report),
+            policy=policy,
         )
 
         def pick(df: pd.DataFrame) -> pd.DataFrame:
@@ -2612,6 +2675,7 @@ def run(
             output_profile=output_profile,
             render_dashboard_md=bool(render_dashboard_md),
             render_full_report=bool(render_report),
+            policy=policy,
         )
 
     # run 级入口（方便你一次性查看所有店铺）
