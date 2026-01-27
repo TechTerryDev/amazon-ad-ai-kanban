@@ -28,14 +28,14 @@ import seaborn as sns
 import warnings
 import glob
 
-from ads.actions import ActionCandidate
-from analysis.temporal import build_windows, window_compare, _infer_shop_end_date
-from core.config import StageConfig
-from core.md import df_to_md_table
-from core.metrics import summarize
-from core.policy import OpsPolicy, load_ops_policy
-from core.schema import CAN
-from core.utils import safe_div
+from src.ads.actions import ActionCandidate
+from src.analysis.temporal import build_windows, window_compare, _infer_shop_end_date
+from src.core.config import StageConfig
+from src.core.md import df_to_md_table
+from src.core.metrics import summarize
+from src.core.policy import OpsPolicy, load_ops_policy
+from src.core.schema import CAN
+from src.core.utils import safe_div
 
 
 def _ensure_dirs(shop_dir: Path) -> Tuple[Path, Path, Path]:

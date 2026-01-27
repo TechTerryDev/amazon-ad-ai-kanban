@@ -10,11 +10,11 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from lifecycle.lifecycle import LifecycleConfig, build_lifecycle_for_shop, build_lifecycle_windows_for_shop
-from lifecycle.lifecycle_settings import load_lifecycle_config, merge_lifecycle_overrides
-from ingest.loader import load_product_analysis
-from core.md import df_to_md_table
-from core.schema import CAN
+from src.lifecycle.lifecycle import LifecycleConfig, build_lifecycle_for_shop, build_lifecycle_windows_for_shop
+from src.lifecycle.lifecycle_settings import load_lifecycle_config, merge_lifecycle_overrides
+from src.ingest.loader import load_product_analysis
+from src.core.md import df_to_md_table
+from src.core.schema import CAN
 
 
 def _parse_int_list(s: str, default: List[int]) -> List[int]:

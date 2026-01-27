@@ -20,8 +20,8 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from core.md import df_to_md_table
-from core.schema import CAN
+from src.core.md import df_to_md_table
+from src.core.schema import CAN
 
 
 def _safe_date_range(df: Optional[pd.DataFrame], date_col: str) -> Tuple[str, str]:

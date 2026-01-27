@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from ads.actions import (
+from src.ads.actions import (
     ActionCandidate,
     generate_campaign_budget_suggestions,
     generate_campaign_budget_actions_from_map,
@@ -28,10 +28,10 @@ from ads.actions import (
     generate_search_term_actions,
     generate_targeting_actions,
 )
-from core.config import StageConfig, get_stage_config
-from ingest.loader import LoadedReport, load_ad_reports, load_product_analysis, load_product_listing
-from core.metrics import summarize, to_summary_dict
-from analysis.diagnostics import (
+from src.core.config import StageConfig, get_stage_config
+from src.ingest.loader import LoadedReport, load_ad_reports, load_product_analysis, load_product_listing
+from src.core.metrics import summarize, to_summary_dict
+from src.analysis.diagnostics import (
     diagnose_asin_root_causes,
     diagnose_campaign_budget_map_from_asin,
     diagnose_campaign_trends,
@@ -42,21 +42,21 @@ from analysis.diagnostics import (
     infer_asin_stage_by_profit,
     summarize_profit_health,
 )
-from reporting.reporting import generate_shop_report
-from core.schema import CAN
-from core.utils import json_dumps, parse_date, to_float, is_paused_status
-from analysis.temporal import build_temporal_insights
-from lifecycle.lifecycle import build_lifecycle_for_shop, build_lifecycle_windows_for_shop, LifecycleConfig
-from ads.ad_linkage import (
+from src.reporting.reporting import generate_shop_report
+from src.core.schema import CAN
+from src.core.utils import json_dumps, parse_date, to_float, is_paused_status
+from src.analysis.temporal import build_temporal_insights
+from src.lifecycle.lifecycle import build_lifecycle_for_shop, build_lifecycle_windows_for_shop, LifecycleConfig
+from src.ads.ad_linkage import (
     allocate_detail_to_asin,
     build_ad_product_daily,
     build_asin_campaign_map,
     build_weight_join_specs,
     top_n_entities_by_asin,
 )
-from analysis.ai_bundle import build_ai_input_bundle
-from analysis.data_quality import build_data_quality_report, extract_data_quality_summary_lines, write_data_quality_files
-from core.policy import (
+from src.analysis.ai_bundle import build_ai_input_bundle
+from src.analysis.data_quality import build_data_quality_report, extract_data_quality_summary_lines, write_data_quality_files
+from src.core.policy import (
     OpsPolicy,
     OpsProfile,
     load_ops_policy,
@@ -66,8 +66,8 @@ from core.policy import (
     ops_profile_to_overrides,
     validate_ops_policy_path,
 )
-from dashboard.outputs import write_dashboard_outputs, write_report_html_from_md
-from dashboard.execution_review import load_execution_log, write_action_review, write_execution_log_template
+from src.dashboard.outputs import write_dashboard_outputs, write_report_html_from_md
+from src.dashboard.execution_review import load_execution_log, write_action_review, write_execution_log_template
 
 
 def _concat_reports(reports: List[LoadedReport], report_type: str) -> pd.DataFrame:
@@ -2300,7 +2300,7 @@ def run(
         #   LLM_MODEL=...
         try:
             if bool(ai_report) or bool(ai_prompt_only):
-                from analysis.ai_report import write_ai_suggestions_for_shop
+                from src.analysis.ai_report import write_ai_suggestions_for_shop
 
                 write_ai_suggestions_for_shop(
                     shop_dir=shop_dir,

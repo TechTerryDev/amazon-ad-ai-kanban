@@ -6,8 +6,8 @@ import argparse
 import datetime as dt
 from pathlib import Path
 
-from analysis.pipeline import run
-from lifecycle.lifecycle_settings import load_lifecycle_config, merge_lifecycle_overrides
+from src.analysis.pipeline import run
+from src.lifecycle.lifecycle_settings import load_lifecycle_config, merge_lifecycle_overrides
 
 
 def main() -> int:

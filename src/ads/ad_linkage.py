@@ -21,8 +21,8 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-from core.schema import CAN
-from core.utils import safe_div
+from src.core.schema import CAN
+from src.core.utils import safe_div
 
 
 _NUM_RE = re.compile(r"^\d+$")

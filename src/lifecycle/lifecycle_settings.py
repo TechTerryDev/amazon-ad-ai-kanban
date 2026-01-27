@@ -14,7 +14,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from lifecycle.lifecycle import LifecycleConfig
+from src.lifecycle.lifecycle import LifecycleConfig
 
 
 def load_lifecycle_config(path: Path) -> LifecycleConfig:

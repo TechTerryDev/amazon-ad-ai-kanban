@@ -22,9 +22,9 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from core.schema import CAN
-from core.risk_scoring import signal_confidence, trend_signal_label
-from core.utils import safe_div, to_float
+from src.core.schema import CAN
+from src.core.risk_scoring import signal_confidence, trend_signal_label
+from src.core.utils import safe_div, to_float
 
 
 @dataclass(frozen=True)
@@ -556,6 +556,13 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
         except Exception:
             first_sale_in_stock_date = None
         first_sale_date = first_sale_in_stock_date if first_sale_in_stock_date is not None else first_sale_any_date
+        first_stock_date = None
+        try:
+            if "FBA可售" in g.columns:
+                stock_idx = g.index[g["FBA可售"] > 0]
+                first_stock_date = g.loc[stock_idx[0], CAN.date] if len(stock_idx) > 0 else None
+        except Exception:
+            first_stock_date = None
 
         for _, r in g.iterrows():
             d = r[CAN.date]
@@ -573,6 +580,7 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
                     # 相对峰值比例（动态周期）
                     ratio = 0.0 if peak <= 0 else sales_r / peak
                     days_since_first_sale = (d - first_sale_date).days if isinstance(first_sale_date, dt.date) else 0
+                    days_since_first_stock = (d - first_stock_date).days if isinstance(first_stock_date, dt.date) else 0
                     cum_sales = float(r.get("cum_sales", 0.0) or 0.0)
                     cum_orders = float(r.get("cum_orders", 0.0) or 0.0)
 
@@ -580,6 +588,8 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
                     mature_gate = True
                     min_days = int(cfg.min_mature_days or 0)
                     if min_days > 0 and days_since_first_sale < min_days:
+                        mature_gate = False
+                    if min_days > 0 and isinstance(first_stock_date, dt.date) and days_since_first_stock < min_days:
                         mature_gate = False
                     min_orders = float(cfg.min_mature_orders or 0.0)
                     if min_orders > 0 and cum_orders < min_orders:
