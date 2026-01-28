@@ -976,6 +976,291 @@ def _normalize_ai_suggestions_body(md: str) -> str:
         return str(md or "").strip() + "\n"
 
 
+def _extract_json_from_text(text: str) -> Dict[str, Any]:
+    """
+    从模型输出中提取 JSON 对象。
+    - 支持 ```json ... ``` 代码块
+    - 失败时返回空 dict
+    """
+    try:
+        raw = str(text or "").strip()
+        if not raw:
+            return {}
+        # 优先尝试解析 ```json``` 代码块
+        m = re.search(r"```json\\s*([\\s\\S]+?)\\s*```", raw, flags=re.I)
+        if m:
+            candidate = str(m.group(1) or "").strip()
+            try:
+                return json.loads(candidate)
+            except Exception:
+                pass
+        # 尝试截取第一个 { ... } 作为 JSON
+        l = raw.find("{")
+        r = raw.rfind("}")
+        if l >= 0 and r > l:
+            candidate2 = raw[l : r + 1].strip()
+            try:
+                return json.loads(candidate2)
+            except Exception:
+                return {}
+        return {}
+    except Exception:
+        return {}
+
+
+def build_ai_dashboard_prompts(
+    shop: str,
+    stage: str,
+    run_context: Dict[str, Any],
+    data_quality_snippet_md: str,
+    asin_focus_csv_snippet: str,
+    action_board_csv_snippet: str,
+    keyword_topics_csv_snippet: str,
+) -> Tuple[str, str]:
+    """
+    面向 dashboard 的结构化建议提示词（要求 JSON 输出）。
+    """
+    system = (
+        "你是资深亚马逊广告与产品运营分析师。\\n"
+        "任务：基于输入数据生成 dashboard 用的结构化建议（JSON）。\\n"
+        "要求：\\n"
+        "1) 仅依据输入数据，不臆造不存在的指标；\\n"
+        "2) 建议必须可执行、可复盘，且清晰标注证据；\\n"
+        "3) 输出必须是严格 JSON（不包含多余文字）。\\n"
+        "4) 业务目标优先级：效率 > 利润 > 销量 > 自然 > 流量 > 转化。\\n"
+    )
+
+    schema = {
+        "decision_top5": [
+            {
+                "title": "string",
+                "priority": "P0|P1|P2",
+                "goal": "效率|利润|销量|自然|流量|转化",
+                "reason": "string",
+                "evidence": "string",
+            }
+        ],
+        "weekly_actions": [
+            {
+                "title": "string",
+                "priority": "P0|P1|P2",
+                "goal": "效率|利润|销量|自然|流量|转化",
+                "reason": "string",
+                "evidence": "string",
+            }
+        ],
+        "exceptions": [
+            {
+                "title": "string",
+                "priority": "P0|P1|P2",
+                "reason": "string",
+                "evidence": "string",
+            }
+        ],
+    }
+
+    user = (
+        "# 输出要求\\n"
+        "- 只输出 JSON，且严格符合 schema（不要输出任何解释性文字）。\\n"
+        "- decision_top5 最多 5 条；weekly_actions 最多 5 条；exceptions 最多 3 条。\\n"
+        "- 每条建议必须包含 reason 和 evidence（用简短可核验的字段描述）。\\n"
+        "\\n"
+        "# JSON Schema\\n"
+        "```json\\n"
+        + json.dumps(schema, ensure_ascii=False, indent=2)
+        + "\\n```\\n\\n"
+        "# 输入数据\\n"
+        "## run_context\\n"
+        "```json\\n"
+        + json.dumps(run_context or {}, ensure_ascii=False)
+        + "\\n```\\n\\n"
+        "## data_quality_snippet\\n"
+        "```markdown\\n"
+        + str(data_quality_snippet_md or "").strip()
+        + "\\n```\\n\\n"
+        "## asin_focus (top)\\n"
+        "```csv\\n"
+        + str(asin_focus_csv_snippet or "").strip()
+        + "\\n```\\n\\n"
+        "## action_board (top)\\n"
+        "```csv\\n"
+        + str(action_board_csv_snippet or "").strip()
+        + "\\n```\\n\\n"
+        "## keyword_topics_action_hints (top)\\n"
+        "```csv\\n"
+        + str(keyword_topics_csv_snippet or "").strip()
+        + "\\n```\\n"
+    )
+    return system, user
+
+
+def write_ai_dashboard_suggestions_for_shop(
+    shop_dir: Path,
+    stage: str,
+    prefix: str = "LLM",
+    max_asins: int = 40,
+    max_actions: int = 120,
+    timeout: int = 180,
+    prompt_only: bool = False,
+) -> bool:
+    """
+    为单店铺生成 ai/ai_dashboard_suggestions.json（双 Agent）。
+
+    失败策略：输出空结构（不抛异常），避免主流程中断。
+    """
+
+    def _write_empty(ai_dir: Path, status: str, reason: str = "") -> None:
+        try:
+            ai_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+                "status": status,
+                "reason": reason,
+                "decision_top5": [],
+                "weekly_actions": [],
+                "exceptions": [],
+            }
+            (ai_dir / "ai_dashboard_suggestions.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            return
+
+    try:
+        if shop_dir is None or not shop_dir.exists():
+            return False
+
+        repo_root = _repo_root()
+        _load_dotenv_if_present(repo_root / ".env")
+
+        ai_dir = shop_dir / "ai"
+        ai_bundle_path = ai_dir / "ai_input_bundle.json"
+        if not ai_bundle_path.exists():
+            ai_bundle_path = shop_dir / "ai_input_bundle.json"
+        bundle = _read_json(ai_bundle_path)
+        if not bundle:
+            _write_empty(ai_dir, status="failed", reason="ai_input_bundle 缺失")
+            return False
+
+        shop = str(bundle.get("shop") or shop_dir.name).strip()
+        dq_md = _read_text(ai_dir / "data_quality.md", max_chars=0)
+        dq_snippet = _extract_data_quality_snippet(dq_md, max_chars=6000)
+
+        run_ctx = _build_run_context_json(shop_dir=shop_dir)
+        asin_focus_snip = _asin_focus_snippet(shop_dir / "dashboard" / "asin_focus.csv", max_rows=int(max_asins or 0))
+        action_snippet = _action_board_snippet(shop_dir / "dashboard" / "action_board.csv", max_rows=int(max_actions or 0))
+        keyword_topics_snip = _keyword_topics_action_hints_snippet(
+            shop_dir / "dashboard" / "keyword_topics_action_hints.csv", top_reduce=8, top_scale=8
+        )
+
+        system_a, user_a = build_ai_dashboard_prompts(
+            shop=shop,
+            stage=str(stage or bundle.get("stage_profile") or "").strip(),
+            run_context=run_ctx,
+            data_quality_snippet_md=dq_snippet,
+            asin_focus_csv_snippet=asin_focus_snip,
+            action_board_csv_snippet=action_snippet,
+            keyword_topics_csv_snippet=keyword_topics_snip,
+        )
+
+        # prompt 留档
+        ai_dir.mkdir(parents=True, exist_ok=True)
+        prompt_md = (
+            "# AI Dashboard 双Agent 提示词（自动生成留档）\\n\\n"
+            f"- generated_at: `{dt.datetime.now().isoformat(timespec='seconds')}`\\n"
+            f"- env_prefix: `{prefix}`\\n\\n"
+            "## Agent A (生成) system\\n\\n```text\\n"
+            + system_a.strip()
+            + "\\n```\\n\\n"
+            "## Agent A (生成) user\\n\\n```text\\n"
+            + user_a.strip()
+            + "\\n```\\n\\n"
+        )
+        (ai_dir / "ai_dashboard_prompt.md").write_text(prompt_md, encoding="utf-8")
+
+        if bool(prompt_only):
+            _write_empty(ai_dir, status="skipped", reason="prompt_only=1")
+            return True
+
+        try:
+            from ai_providers import build_chat_provider  # type: ignore
+        except Exception:
+            _write_empty(ai_dir, status="failed", reason="未找到 ai_providers 模块")
+            return False
+
+        provider = build_chat_provider(prefix=str(prefix or "LLM").strip() or "LLM")
+        if provider is None:
+            _write_empty(ai_dir, status="failed", reason="Provider 构建失败")
+            return False
+
+        api_key = getattr(provider, "api_key", "") or ""
+        model = getattr(provider, "model", "") or ""
+        if not str(api_key).strip() or not str(model).strip():
+            _write_empty(ai_dir, status="failed", reason=f"未配置 {prefix}_API_KEY 或 {prefix}_MODEL")
+            return False
+
+        # Agent A
+        messages_a = [
+            {"role": "system", "content": system_a},
+            {"role": "user", "content": user_a},
+        ]
+        content_a = provider.generate(prompt=user_a, messages=messages_a, temperature=0.1, timeout=int(timeout or 180))
+        draft = _extract_json_from_text(str(content_a or ""))
+        if not draft:
+            _write_empty(ai_dir, status="failed", reason="Agent A 输出不可解析")
+            return False
+
+        # Agent B：复核/收敛
+        system_b = (
+            "你是严谨的复核编辑。\\n"
+            "任务：校验并收敛结构化 JSON 建议，删除重复与空项，保证条目清晰可执行。\\n"
+            "只输出 JSON，不附加解释。\\n"
+        )
+        user_b = (
+            "# 规则\\n"
+            "- 保持 schema 不变；\\n"
+            "- decision_top5/weekly_actions/exceptions 数量上限同上；\\n"
+            "- 去重、压缩表达；\\n"
+            "- reason/evidence 必填，优先使用可量化字段；\\n"
+            "\\n"
+            "# 输入（Agent A 输出）\\n"
+            "```json\\n"
+            + json.dumps(draft, ensure_ascii=False)
+            + "\\n```\\n\\n"
+            "# 输出\\n"
+            "- 仅输出 JSON\\n"
+        )
+        messages_b = [
+            {"role": "system", "content": system_b},
+            {"role": "user", "content": user_b},
+        ]
+        content_b = provider.generate(prompt=user_b, messages=messages_b, temperature=0.1, timeout=int(timeout or 180))
+        final_obj = _extract_json_from_text(str(content_b or ""))
+        if not final_obj:
+            _write_empty(ai_dir, status="failed", reason="Agent B 输出不可解析")
+            return False
+
+        payload = {
+            "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "status": "ok",
+            "provider": type(provider).__name__,
+            "model": str(model),
+            "decision_top5": final_obj.get("decision_top5", []) or [],
+            "weekly_actions": final_obj.get("weekly_actions", []) or [],
+            "exceptions": final_obj.get("exceptions", []) or [],
+        }
+        (ai_dir / "ai_dashboard_suggestions.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return True
+    except Exception:
+        try:
+            _write_empty(shop_dir / "ai", status="failed", reason="未知异常")
+        except Exception:
+            pass
+        return False
+
+
 def write_ai_suggestions_for_shop(
     shop_dir: Path,
     stage: str,

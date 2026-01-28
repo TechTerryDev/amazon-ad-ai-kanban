@@ -83,6 +83,12 @@ python main.py --input-dir data/input --out-dir data/output --only-shop US
 python main.py --input-dir data/input --out-dir data/output --ai-report
 ```
 
+### AI Dashboard 双Agent（可选）
+用于 dashboard 的“决策建议（Top5）”结构化输出（双Agent审校），不改核心口径。
+```bash
+python main.py --input-dir data/input --out-dir data/output --ai-dashboard
+```
+
 只想生成提示词不调用模型：
 ```bash
 python main.py --input-dir data/input --out-dir data/output --ai-prompt-only
@@ -121,4 +127,3 @@ python main.py --input-dir data/input --out-dir data/output --ai-prompt-only
 
 ## 许可证
 本项目采用 MIT License，详见 `LICENSE`。
-

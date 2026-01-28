@@ -1668,6 +1668,11 @@ tbody tr:hover td{background:rgba(37,99,235,.06);}
 	  box-shadow:var(--shadow-extruded);
 	  line-height:1.5;
 	}
+	.decision-meta{
+	  margin-top:4px;
+	  font-size:12px;
+	  color:var(--muted);
+	}
 	"""
 
         js = r"""
@@ -10968,6 +10973,47 @@ def write_dashboard_md(
             except Exception:
                 return text
 
+        def _load_ai_dashboard_decisions() -> Optional[List[Dict[str, str]]]:
+            """
+            读取 ai/ai_dashboard_suggestions.json 中的决策建议（可选）。
+            失败时返回空列表（不影响主流程）。
+            """
+            try:
+                ai_path = out_path.parent.parent / "ai" / "ai_dashboard_suggestions.json"
+                if not ai_path.exists():
+                    return []
+                obj = json.loads(ai_path.read_text(encoding="utf-8"))
+                if str(obj.get("status", "") or "").strip().lower() != "ok":
+                    return None
+                items = obj.get("decision_top5", []) or []
+                if not isinstance(items, list):
+                    return []
+                out: List[Dict[str, str]] = []
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    title = str(it.get("title", "") or it.get("text", "") or "").strip()
+                    if not title:
+                        continue
+                    priority = str(it.get("priority", "") or "").strip().upper()
+                    if priority not in {"P0", "P1", "P2"}:
+                        priority = ""
+                    goal = str(it.get("goal", "") or "").strip()
+                    reason = str(it.get("reason", "") or "").strip()
+                    evidence = str(it.get("evidence", "") or "").strip()
+                    out.append(
+                        {
+                            "priority": priority,
+                            "goal": goal,
+                            "title": title,
+                            "reason": reason,
+                            "evidence": evidence,
+                        }
+                    )
+                return out
+            except Exception:
+                return []
+
         def _parse_weekly_action_line(raw: str) -> Dict[str, str]:
             """
             解析本周行动展示行，提取优先级/类型/标题/证据/责任。
@@ -11856,7 +11902,12 @@ def write_dashboard_md(
 
         # 3) 决策建议（Top）
         lines.append("<div class=\"card-item\">")
-        lines.append("<div class=\"hero-title\">决策建议（Top 5）</div>")
+        # 若存在 AI 建议（双Agent），优先展示 AI 结果
+        ai_decisions = _load_ai_dashboard_decisions()
+        ai_failed = ai_decisions is None
+        use_ai_decisions = isinstance(ai_decisions, list) and len(ai_decisions) > 0
+        title_suffix = " · AI" if (use_ai_decisions or ai_failed) else ""
+        lines.append(f"<div class=\"hero-title\">决策建议（Top 5）{title_suffix}</div>")
         try:
             decision_items: List[Dict[str, str]] = []
             def _norm_text(x: str) -> str:
@@ -11865,27 +11916,45 @@ def write_dashboard_md(
                     return t
                 except Exception:
                     return str(x or "").strip().lower()
-            for it in (weekly_actions or [])[:3]:
-                raw = str(it.get("line", "") or "").strip()
-                if not raw:
-                    continue
-                p = ""
-                m = re.search(r"`(P[0-2])`", raw)
-                if m:
-                    p = m.group(1)
-                    raw = raw.replace(m.group(0), "").strip()
-                raw = _strip_md_links(raw)
-                raw = raw.replace("**", "").replace("`", "").strip()
-                if raw:
-                    decision_items.append({"priority": p, "text": raw, "goal": _infer_goal_tag(raw)})
-            for a in (picked_alerts or [])[:2]:
-                p = str(a.get("priority", "P1") or "P1").strip().upper()
-                title = str(a.get("title", "") or "").strip()
-                detail = str(a.get("detail", "") or "").strip()
-                if not title:
-                    continue
-                text = f"{title}（{detail}）" if detail else title
-                decision_items.append({"priority": p, "text": text, "goal": _infer_goal_tag(text)})
+            if use_ai_decisions and isinstance(ai_decisions, list):
+                for it in ai_decisions[:5]:
+                    title = str(it.get("title", "") or "").strip()
+                    if not title:
+                        continue
+                    reason = str(it.get("reason", "") or "").strip()
+                    text = title
+                    if reason:
+                        text = f"{title}（{_short_text(reason, 48)}）"
+                    decision_items.append(
+                        {
+                            "priority": it.get("priority", ""),
+                            "text": text,
+                            "goal": it.get("goal", ""),
+                            "evidence": str(it.get("evidence", "") or "").strip(),
+                        }
+                    )
+            elif not ai_failed:
+                for it in (weekly_actions or [])[:3]:
+                    raw = str(it.get("line", "") or "").strip()
+                    if not raw:
+                        continue
+                    p = ""
+                    m = re.search(r"`(P[0-2])`", raw)
+                    if m:
+                        p = m.group(1)
+                        raw = raw.replace(m.group(0), "").strip()
+                    raw = _strip_md_links(raw)
+                    raw = raw.replace("**", "").replace("`", "").strip()
+                    if raw:
+                        decision_items.append({"priority": p, "text": raw, "goal": _infer_goal_tag(raw), "evidence": ""})
+                for a in (picked_alerts or [])[:2]:
+                    p = str(a.get("priority", "P1") or "P1").strip().upper()
+                    title = str(a.get("title", "") or "").strip()
+                    detail = str(a.get("detail", "") or "").strip()
+                    if not title:
+                        continue
+                    text = f"{title}（{detail}）" if detail else title
+                    decision_items.append({"priority": p, "text": text, "goal": _infer_goal_tag(text), "evidence": ""})
 
             if not decision_items:
                 lines.append("<div class=\"hint\">（暂无可收敛的决策建议）</div>")
@@ -11911,6 +11980,7 @@ def write_dashboard_md(
                     p = it.get("priority", "")
                     text = it.get("text", "")
                     goal = it.get("goal", "")
+                    evidence = it.get("evidence", "")
                     tone = ""
                     if p == "P0":
                         tone = " tone-risk"
@@ -11920,7 +11990,10 @@ def write_dashboard_md(
                         tone = " tone-opp"
                     goal_tag = f' <span class="tag">目标:{html.escape(goal)}</span>' if goal else ""
                     badge = f"<code>{p}</code> " if p else ""
-                    lines.append(f"<div class=\"decision-item{tone}\">{badge}{html.escape(text)}{goal_tag}</div>")
+                    meta = ""
+                    if evidence:
+                        meta = f'<div class="decision-meta">证据: {html.escape(_short_text(evidence, 80))}</div>'
+                    lines.append(f"<div class=\"decision-item{tone}\">{badge}{html.escape(text)}{goal_tag}{meta}</div>")
                 lines.append("</div>")
                 lines.append("<div class=\"hint\">更多见：<a href=\"../dashboard/task_summary.csv\">任务汇总</a> / <a href=\"../dashboard/action_board.csv\">Action Board</a></div>")
         except Exception:

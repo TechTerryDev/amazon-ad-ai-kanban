@@ -1621,6 +1621,7 @@ def run(
     action_review_windows: Optional[List[int]] = None,
     ai_report: bool = False,
     ai_prompt_only: bool = False,
+    ai_dashboard: bool = False,
     ai_prefix: str = "LLM",
     ai_max_asins: int = 40,
     ai_max_actions: int = 200,
@@ -2318,6 +2319,23 @@ def run(
                         write_report_html_from_md(md_path=ai_dir / "ai_suggestions.md", out_path=ai_dir / "ai_suggestions.html")
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+        # ========= AI Dashboard 双Agent（可选，不影响主流程） =========
+        try:
+            if bool(ai_dashboard):
+                from src.analysis.ai_report import write_ai_dashboard_suggestions_for_shop
+
+                write_ai_dashboard_suggestions_for_shop(
+                    shop_dir=shop_dir,
+                    stage=str(stage or "").strip(),
+                    prefix=str(ai_prefix or "LLM").strip() or "LLM",
+                    max_asins=int(ai_max_asins or 0),
+                    max_actions=int(ai_max_actions or 0),
+                    timeout=int(ai_timeout or 180),
+                    prompt_only=bool(ai_prompt_only),
+                )
         except Exception:
             pass
 
