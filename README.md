@@ -89,6 +89,15 @@ python main.py --input-dir data/input --out-dir data/output --ai-report
 python main.py --input-dir data/input --out-dir data/output --ai-dashboard
 ```
 
+### AI Dashboard 多‑agent（LangGraph+Guardrails+Promptfoo，可选）
+用于 dashboard 的多轮思考与可评估输出，会生成：
+- `ai/ai_dashboard_suggestions.json`
+- `ai/ai_dashboard_eval.json`
+- `ai/ai_dashboard_promptfoo.yaml`（Promptfoo 模板）
+```bash
+python main.py --input-dir data/input --out-dir data/output --ai-dashboard-multiagent
+```
+
 只想生成提示词不调用模型：
 ```bash
 python main.py --input-dir data/input --out-dir data/output --ai-prompt-only

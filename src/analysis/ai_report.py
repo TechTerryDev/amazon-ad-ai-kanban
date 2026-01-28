@@ -1008,29 +1008,8 @@ def _extract_json_from_text(text: str) -> Dict[str, Any]:
         return {}
 
 
-def build_ai_dashboard_prompts(
-    shop: str,
-    stage: str,
-    run_context: Dict[str, Any],
-    data_quality_snippet_md: str,
-    asin_focus_csv_snippet: str,
-    action_board_csv_snippet: str,
-    keyword_topics_csv_snippet: str,
-) -> Tuple[str, str]:
-    """
-    面向 dashboard 的结构化建议提示词（要求 JSON 输出）。
-    """
-    system = (
-        "你是资深亚马逊广告与产品运营分析师。\\n"
-        "任务：基于输入数据生成 dashboard 用的结构化建议（JSON）。\\n"
-        "要求：\\n"
-        "1) 仅依据输入数据，不臆造不存在的指标；\\n"
-        "2) 建议必须可执行、可复盘，且清晰标注证据；\\n"
-        "3) 输出必须是严格 JSON（不包含多余文字）。\\n"
-        "4) 业务目标优先级：效率 > 利润 > 销量 > 自然 > 流量 > 转化。\\n"
-    )
-
-    schema = {
+def _ai_dashboard_schema() -> Dict[str, Any]:
+    return {
         "decision_top5": [
             {
                 "title": "string",
@@ -1058,6 +1037,180 @@ def build_ai_dashboard_prompts(
             }
         ],
     }
+
+
+def _validate_ai_dashboard_obj(obj: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    issues: List[str] = []
+    try:
+        if not isinstance(obj, dict):
+            return False, ["输出不是 JSON 对象"]
+        for key in ("decision_top5", "weekly_actions", "exceptions"):
+            val = obj.get(key, [])
+            if val is None:
+                val = []
+            if not isinstance(val, list):
+                issues.append(f"{key} 不是数组")
+                continue
+            for i, it in enumerate(val):
+                if not isinstance(it, dict):
+                    issues.append(f"{key}[{i}] 不是对象")
+                    continue
+                title = str(it.get("title", "") or it.get("text", "") or "").strip()
+                if not title:
+                    issues.append(f"{key}[{i}] 缺少 title")
+                if key != "exceptions":
+                    goal = str(it.get("goal", "") or "").strip()
+                    if not goal:
+                        issues.append(f"{key}[{i}] 缺少 goal")
+                reason = str(it.get("reason", "") or "").strip()
+                evidence = str(it.get("evidence", "") or "").strip()
+                if not reason:
+                    issues.append(f"{key}[{i}] 缺少 reason")
+                if not evidence:
+                    issues.append(f"{key}[{i}] 缺少 evidence")
+        return len(issues) == 0, issues
+    except Exception:
+        return False, ["校验异常"]
+
+
+def _guardrails_validate(schema: Dict[str, Any], text: str) -> Optional[Dict[str, Any]]:
+    """
+    使用 Guardrails 校验并解析 JSON（可选依赖）。
+    若不可用或失败，返回 None。
+    """
+    try:
+        from guardrails import Guard  # type: ignore
+    except Exception:
+        return None
+    try:
+        guard = None
+        if hasattr(Guard, "from_json_schema"):
+            guard = Guard.from_json_schema(schema)  # type: ignore
+        if guard is None:
+            return None
+        try:
+            parsed = guard.parse(text)  # type: ignore
+        except Exception:
+            parsed = guard.validate(text)  # type: ignore
+        if isinstance(parsed, dict):
+            return parsed
+        # guardrails 有时返回 GuardrailsOutput
+        if hasattr(parsed, "validated_output"):
+            out = getattr(parsed, "validated_output")
+            if isinstance(out, dict):
+                return out
+        return None
+    except Exception:
+        return None
+
+
+def _score_ai_dashboard_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    简单评分：用于 Promptfoo/复核输出（不影响主流程）。
+    """
+    try:
+        decision = obj.get("decision_top5", []) or []
+        weekly = obj.get("weekly_actions", []) or []
+        exceptions = obj.get("exceptions", []) or []
+        total = 0
+        miss_reason = 0
+        miss_evidence = 0
+        miss_goal = 0
+        for key, items in [("decision_top5", decision), ("weekly_actions", weekly), ("exceptions", exceptions)]:
+            if not isinstance(items, list):
+                continue
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                total += 1
+                if not str(it.get("reason", "") or "").strip():
+                    miss_reason += 1
+                if not str(it.get("evidence", "") or "").strip():
+                    miss_evidence += 1
+                if key != "exceptions" and not str(it.get("goal", "") or "").strip():
+                    miss_goal += 1
+        score = 100
+        score -= miss_reason * 8
+        score -= miss_evidence * 8
+        score -= miss_goal * 4
+        if len(decision) == 0:
+            score -= 20
+        if len(weekly) == 0:
+            score -= 15
+        if len(exceptions) == 0:
+            score -= 10
+        if score < 0:
+            score = 0
+        return {
+            "score": int(score),
+            "counts": {
+                "decision_top5": len(decision) if isinstance(decision, list) else 0,
+                "weekly_actions": len(weekly) if isinstance(weekly, list) else 0,
+                "exceptions": len(exceptions) if isinstance(exceptions, list) else 0,
+            },
+            "missing": {
+                "reason": miss_reason,
+                "evidence": miss_evidence,
+                "goal": miss_goal,
+            },
+        }
+    except Exception:
+        return {"score": 0, "counts": {}, "missing": {}}
+
+
+def _build_promptfoo_dashboard_config(system_prompt: str, user_prompt: str, schema: Dict[str, Any]) -> str:
+    """
+    生成 Promptfoo 模板配置（仅用于人工/CI 评测，不自动执行）。
+    """
+    schema_json = json.dumps(schema, ensure_ascii=False)
+    return (
+        "description: dashboard-multiagent-eval\n"
+        "providers:\n"
+        "  - id: ${PROMPTFOO_PROVIDER}\n"
+        "prompts:\n"
+        "  - id: dashboard_agent_a\n"
+        "    raw: |\n"
+        "      {{system}}\n"
+        "      {{user}}\n"
+        "tests:\n"
+        "  - vars:\n"
+        "      system: |\n"
+        + "\n".join([f"        {line}" for line in system_prompt.splitlines()])
+        + "\n"
+        "      user: |\n"
+        + "\n".join([f"        {line}" for line in user_prompt.splitlines()])
+        + "\n"
+        "    assert:\n"
+        "      - type: is-json\n"
+        "      - type: json-schema\n"
+        "        value: |\n"
+        f"          {schema_json}\n"
+    )
+
+
+def build_ai_dashboard_prompts(
+    shop: str,
+    stage: str,
+    run_context: Dict[str, Any],
+    data_quality_snippet_md: str,
+    asin_focus_csv_snippet: str,
+    action_board_csv_snippet: str,
+    keyword_topics_csv_snippet: str,
+) -> Tuple[str, str]:
+    """
+    面向 dashboard 的结构化建议提示词（要求 JSON 输出）。
+    """
+    system = (
+        "你是资深亚马逊广告与产品运营分析师。\\n"
+        "任务：基于输入数据生成 dashboard 用的结构化建议（JSON）。\\n"
+        "要求：\\n"
+        "1) 仅依据输入数据，不臆造不存在的指标；\\n"
+        "2) 建议必须可执行、可复盘，且清晰标注证据；\\n"
+        "3) 输出必须是严格 JSON（不包含多余文字）。\\n"
+        "4) 业务目标优先级：效率 > 利润 > 销量 > 自然 > 流量 > 转化。\\n"
+    )
+
+    schema = _ai_dashboard_schema()
 
     user = (
         "# 输出要求\\n"
@@ -1256,6 +1409,247 @@ def write_ai_dashboard_suggestions_for_shop(
     except Exception:
         try:
             _write_empty(shop_dir / "ai", status="failed", reason="未知异常")
+        except Exception:
+            pass
+        return False
+
+
+def write_ai_dashboard_multiagent_for_shop(
+    shop_dir: Path,
+    stage: str,
+    prefix: str = "LLM",
+    max_asins: int = 40,
+    max_actions: int = 120,
+    timeout: int = 180,
+    prompt_only: bool = False,
+    max_rounds: int = 2,
+) -> bool:
+    """
+    多‑agent 方案：LangGraph + Guardrails + Promptfoo（可选依赖）。
+    - 输出 ai/ai_dashboard_suggestions.json
+    - 输出 ai/ai_dashboard_eval.json（评分）
+    - 输出 ai/ai_dashboard_promptfoo.yaml（模板）
+    """
+
+    def _write_output(ai_dir: Path, status: str, payload: Dict[str, Any]) -> None:
+        try:
+            ai_dir.mkdir(parents=True, exist_ok=True)
+            base = {
+                "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+                "status": status,
+                "decision_top5": [],
+                "weekly_actions": [],
+                "exceptions": [],
+            }
+            base.update(payload or {})
+            (ai_dir / "ai_dashboard_suggestions.json").write_text(
+                json.dumps(base, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            return
+
+    def _write_eval(ai_dir: Path, eval_obj: Dict[str, Any]) -> None:
+        try:
+            ai_dir.mkdir(parents=True, exist_ok=True)
+            (ai_dir / "ai_dashboard_eval.json").write_text(
+                json.dumps(eval_obj or {}, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            return
+
+    try:
+        if shop_dir is None or not shop_dir.exists():
+            return False
+
+        repo_root = _repo_root()
+        _load_dotenv_if_present(repo_root / ".env")
+
+        ai_dir = shop_dir / "ai"
+        ai_bundle_path = ai_dir / "ai_input_bundle.json"
+        if not ai_bundle_path.exists():
+            ai_bundle_path = shop_dir / "ai_input_bundle.json"
+        bundle = _read_json(ai_bundle_path)
+        if not bundle:
+            _write_output(ai_dir, status="failed", payload={"reason": "ai_input_bundle 缺失"})
+            return False
+
+        shop = str(bundle.get("shop") or shop_dir.name).strip()
+        dq_md = _read_text(ai_dir / "data_quality.md", max_chars=0)
+        dq_snippet = _extract_data_quality_snippet(dq_md, max_chars=6000)
+
+        run_ctx = _build_run_context_json(shop_dir=shop_dir)
+        asin_focus_snip = _asin_focus_snippet(shop_dir / "dashboard" / "asin_focus.csv", max_rows=int(max_asins or 0))
+        action_snippet = _action_board_snippet(shop_dir / "dashboard" / "action_board.csv", max_rows=int(max_actions or 0))
+        keyword_topics_snip = _keyword_topics_action_hints_snippet(
+            shop_dir / "dashboard" / "keyword_topics_action_hints.csv", top_reduce=8, top_scale=8
+        )
+
+        system_a, user_a = build_ai_dashboard_prompts(
+            shop=shop,
+            stage=str(stage or bundle.get("stage_profile") or "").strip(),
+            run_context=run_ctx,
+            data_quality_snippet_md=dq_snippet,
+            asin_focus_csv_snippet=asin_focus_snip,
+            action_board_csv_snippet=action_snippet,
+            keyword_topics_csv_snippet=keyword_topics_snip,
+        )
+
+        # Prompt 留档 + Promptfoo 模板
+        ai_dir.mkdir(parents=True, exist_ok=True)
+        prompt_md = (
+            "# AI Dashboard MultiAgent 提示词（自动生成留档）\n\n"
+            f"- generated_at: `{dt.datetime.now().isoformat(timespec='seconds')}`\n"
+            f"- env_prefix: `{prefix}`\n\n"
+            "## Agent A (生成) system\n\n```text\n"
+            + system_a.strip()
+            + "\n```\n\n"
+            "## Agent A (生成) user\n\n```text\n"
+            + user_a.strip()
+            + "\n```\n\n"
+        )
+        (ai_dir / "ai_dashboard_multiagent_prompt.md").write_text(prompt_md, encoding="utf-8")
+        try:
+            schema = _ai_dashboard_schema()
+            promptfoo_yaml = _build_promptfoo_dashboard_config(system_a, user_a, schema)
+            (ai_dir / "ai_dashboard_promptfoo.yaml").write_text(promptfoo_yaml, encoding="utf-8")
+        except Exception:
+            pass
+
+        if bool(prompt_only):
+            _write_output(ai_dir, status="skipped", payload={"reason": "prompt_only=1"})
+            _write_eval(ai_dir, {"score": 0, "reason": "prompt_only=1"})
+            return True
+
+        try:
+            from ai_providers import build_chat_provider  # type: ignore
+        except Exception:
+            _write_output(ai_dir, status="failed", payload={"reason": "未找到 ai_providers 模块"})
+            _write_eval(ai_dir, {"score": 0, "reason": "no_provider"})
+            return False
+
+        provider = build_chat_provider(prefix=str(prefix or "LLM").strip() or "LLM")
+        if provider is None:
+            _write_output(ai_dir, status="failed", payload={"reason": "Provider 构建失败"})
+            _write_eval(ai_dir, {"score": 0, "reason": "provider_failed"})
+            return False
+
+        api_key = getattr(provider, "api_key", "") or ""
+        model = getattr(provider, "model", "") or ""
+        if not str(api_key).strip() or not str(model).strip():
+            _write_output(ai_dir, status="failed", payload={"reason": f"未配置 {prefix}_API_KEY 或 {prefix}_MODEL"})
+            _write_eval(ai_dir, {"score": 0, "reason": "missing_key_or_model"})
+            return False
+
+        schema = _ai_dashboard_schema()
+
+        def _agent_generate() -> Dict[str, Any]:
+            messages = [
+                {"role": "system", "content": system_a},
+                {"role": "user", "content": user_a},
+            ]
+            content = provider.generate(prompt=user_a, messages=messages, temperature=0.1, timeout=int(timeout or 180))
+            txt = str(content or "")
+            # Guardrails 优先
+            guarded = _guardrails_validate(schema, txt)
+            if guarded is not None:
+                return guarded
+            return _extract_json_from_text(txt)
+
+        def _agent_review(draft: Dict[str, Any]) -> Dict[str, Any]:
+            system_b = (
+                "你是严谨的复核编辑。\n"
+                "任务：校验并收敛结构化 JSON 建议，删除重复与空项，保证条目清晰可执行。\n"
+                "只输出 JSON，不附加解释。\n"
+            )
+            user_b = (
+                "# 规则\n"
+                "- 保持 schema 不变；\n"
+                "- decision_top5/weekly_actions/exceptions 数量上限同上；\n"
+                "- 去重、压缩表达；\n"
+                "- reason/evidence 必填，优先使用可量化字段；\n"
+                "\n"
+                "# 输入（Agent A 输出）\n"
+                "```json\n"
+                + json.dumps(draft, ensure_ascii=False)
+                + "\n```\n\n"
+                "# 输出\n"
+                "- 仅输出 JSON\n"
+            )
+            messages = [
+                {"role": "system", "content": system_b},
+                {"role": "user", "content": user_b},
+            ]
+            content = provider.generate(prompt=user_b, messages=messages, temperature=0.1, timeout=int(timeout or 180))
+            txt = str(content or "")
+            guarded = _guardrails_validate(schema, txt)
+            if guarded is not None:
+                return guarded
+            return _extract_json_from_text(txt)
+
+        # ===== LangGraph 可选编排 =====
+        final_obj: Dict[str, Any] = {}
+        try:
+            from langgraph.graph import StateGraph, END  # type: ignore
+
+            class _State(dict):
+                pass
+
+            def _node_generate(state: _State) -> _State:
+                state["draft"] = _agent_generate()
+                state["round"] = int(state.get("round", 0)) + 1
+                return state
+
+            def _node_review(state: _State) -> _State:
+                draft = state.get("draft") or {}
+                state["final"] = _agent_review(draft if isinstance(draft, dict) else {})
+                return state
+
+            def _should_retry(state: _State) -> str:
+                obj = state.get("final") or {}
+                valid, _ = _validate_ai_dashboard_obj(obj if isinstance(obj, dict) else {})
+                if valid:
+                    return "end"
+                if int(state.get("round", 0)) >= int(max_rounds or 1):
+                    return "end"
+                return "retry"
+
+            graph = StateGraph(_State)
+            graph.add_node("generate", _node_generate)
+            graph.add_node("review", _node_review)
+            graph.set_entry_point("generate")
+            graph.add_edge("generate", "review")
+            graph.add_conditional_edges("review", _should_retry, {"retry": "generate", "end": END})
+            app = graph.compile()
+            out_state = app.invoke({"round": 0})
+            final_obj = out_state.get("final") if isinstance(out_state, dict) else {}
+        except Exception:
+            # fallback：无 langgraph 时，串行两步
+            draft = _agent_generate()
+            final_obj = _agent_review(draft if isinstance(draft, dict) else {})
+
+        if not isinstance(final_obj, dict):
+            final_obj = {}
+
+        valid, issues = _validate_ai_dashboard_obj(final_obj)
+        if not valid:
+            _write_output(ai_dir, status="failed", payload={"reason": ";".join(issues)[:200]})
+            _write_eval(ai_dir, {"score": 0, "issues": issues})
+            return False
+
+        payload = {
+            "provider": type(provider).__name__,
+            "model": str(model),
+            "decision_top5": final_obj.get("decision_top5", []) or [],
+            "weekly_actions": final_obj.get("weekly_actions", []) or [],
+            "exceptions": final_obj.get("exceptions", []) or [],
+        }
+        _write_output(ai_dir, status="ok", payload=payload)
+        _write_eval(ai_dir, _score_ai_dashboard_obj(final_obj))
+        return True
+    except Exception:
+        try:
+            _write_output(shop_dir / "ai", status="failed", payload={"reason": "未知异常"})
+            _write_eval(shop_dir / "ai", {"score": 0, "reason": "unknown"})
         except Exception:
             pass
         return False
