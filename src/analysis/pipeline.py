@@ -2214,35 +2214,8 @@ def run(
         except Exception:
             action_review_df = pd.DataFrame()
 
-        # ========= dashboard 聚焦层输出（总是生成，解决“report.md 太长抓不到重点”） =========
-        try:
-            write_dashboard_outputs(
-                shop_dir=shop_dir,
-                shop=shop,
-                stage=str(cfg.name),
-                date_start=view_date_start_s,
-                date_end=view_date_end_s,
-                diagnostics=diagnostics,
-                product_analysis_shop=pa_shop,
-                lifecycle_board=lifecycle_board_df,
-                lifecycle_segments=lifecycle_segments_df,
-                lifecycle_windows=lifecycle_windows_df,
-                asin_campaign_map=asin_campaign_map_df,
-                asin_top_search_terms=asin_top_search_terms_df,
-                asin_top_targetings=asin_top_targetings_df,
-                asin_top_placements=asin_top_placements_df,
-                search_term_report=st,
-                actions=actions,
-                policy=policy,
-                render_md=bool(render_dashboard_md),
-                data_quality_hints=dq_hints,
-                action_review=action_review_df if (action_review_df is not None and not action_review_df.empty) else None,
-            )
-        except Exception:
-            pass
-
-        # ========= 输出（按档位控制，避免目录过乱） =========
-        # AI 输入包：无论 minimal/full 都生成（这是主文件）
+        # ========= AI 输入包 / 数据质量 / AI 建议（可选） =========
+        # 说明：这些文件在 dashboard 渲染前生成，确保 HTML 能读取 AI 结果。
         try:
             ai_dir = shop_dir / "ai"
             ai_dir.mkdir(parents=True, exist_ok=True)
@@ -2262,13 +2235,12 @@ def run(
                 asin_top_placements=asin_top_placements_df,
                 asin_limit=120,
             )
-            # 兼容旧路径：根目录也保留一份（便于脚本/工具直接读取）
             (shop_dir / "ai_input_bundle.json").write_text(json_dumps(ai_bundle), encoding="utf-8")
             (ai_dir / "ai_input_bundle.json").write_text(json_dumps(ai_bundle), encoding="utf-8")
         except Exception:
             pass
 
-        # 数据质量/维度覆盖：给 AI/分析用（总是生成，不依赖 report.md）
+        # 数据质量/维度覆盖文件（AI 与 dashboard 口径提示）
         try:
             ai_dir = shop_dir / "ai"
             ai_dir.mkdir(parents=True, exist_ok=True)
@@ -2285,7 +2257,6 @@ def run(
                 lifecycle_board=lifecycle_board_df,
             )
             write_data_quality_files(ai_dir=ai_dir, report=dq)
-            # 展示层：生成 HTML（更好读，不改变口径）
             try:
                 write_report_html_from_md(md_path=ai_dir / "data_quality.md", out_path=ai_dir / "data_quality.html")
             except Exception:
@@ -2293,13 +2264,7 @@ def run(
         except Exception:
             pass
 
-        # ========= AI 建议报告 / 提示词留档（可选，不影响主流程） =========
-        # 说明：
-        # - 这里默认不开启，避免误耗 token；
-        # - 你启用后，需要配置环境变量（默认前缀 LLM_），例如：
-        #   LLM_PROVIDER=oai_http
-        #   LLM_API_KEY=...
-        #   LLM_MODEL=...
+        # AI 建议报告 / 提示词留档（可选，不影响主流程）
         try:
             if bool(ai_report) or bool(ai_prompt_only):
                 from src.analysis.ai_report import write_ai_suggestions_for_shop
@@ -2313,7 +2278,6 @@ def run(
                     timeout=int(ai_timeout or 180),
                     prompt_only=bool(ai_prompt_only),
                 )
-                # 展示层：生成 HTML（更好读，不改变口径）
                 try:
                     ai_dir = shop_dir / "ai"
                     if (ai_dir / "ai_suggestions.md").exists():
@@ -2323,7 +2287,7 @@ def run(
         except Exception:
             pass
 
-        # ========= AI Dashboard 双Agent（可选，不影响主流程） =========
+        # AI Dashboard（双Agent / 多‑agent）
         try:
             if bool(ai_dashboard_multiagent):
                 from src.analysis.ai_report import write_ai_dashboard_multiagent_for_shop
@@ -2349,6 +2313,33 @@ def run(
                     timeout=int(ai_timeout or 180),
                     prompt_only=bool(ai_prompt_only),
                 )
+        except Exception:
+            pass
+
+        # ========= dashboard 聚焦层输出（总是生成，解决“report.md 太长抓不到重点”） =========
+        try:
+            write_dashboard_outputs(
+                shop_dir=shop_dir,
+                shop=shop,
+                stage=str(cfg.name),
+                date_start=view_date_start_s,
+                date_end=view_date_end_s,
+                diagnostics=diagnostics,
+                product_analysis_shop=pa_shop,
+                lifecycle_board=lifecycle_board_df,
+                lifecycle_segments=lifecycle_segments_df,
+                lifecycle_windows=lifecycle_windows_df,
+                asin_campaign_map=asin_campaign_map_df,
+                asin_top_search_terms=asin_top_search_terms_df,
+                asin_top_targetings=asin_top_targetings_df,
+                asin_top_placements=asin_top_placements_df,
+                search_term_report=st,
+                actions=actions,
+                policy=policy,
+                render_md=bool(render_dashboard_md),
+                data_quality_hints=dq_hints,
+                action_review=action_review_df if (action_review_df is not None and not action_review_df.empty) else None,
+            )
         except Exception:
             pass
 
