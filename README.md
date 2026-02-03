@@ -83,6 +83,12 @@ python main.py --input-dir data/input --out-dir data/output --only-shop US
 python main.py --input-dir data/input --out-dir data/output --ai-report
 ```
 
+### AI 报告多‑Agent（更全面，可选）
+用于 `ai/ai_suggestions.md` 的三角色裁决版（Analyst/Challenger/Judge）：
+```bash
+python main.py --input-dir data/input --out-dir data/output --ai-report-multiagent
+```
+
 ### AI Dashboard 双Agent（可选）
 用于 dashboard 的“决策建议（Top5）”结构化输出（双Agent审校），不改核心口径。
 ```bash

@@ -36,7 +36,10 @@ class ArkProvider(ChatProvider):
                 content.append({"type": "image_url", "image_url": {"url": img}})
             payload["messages"] = [{"role": "user", "content": content}]
 
-        resp = self.client.chat.completions.create(**payload)
+        try:
+            resp = self.client.chat.completions.create(timeout=int(timeout or 180), **payload)
+        except TypeError:
+            resp = self.client.chat.completions.create(**payload)
         if hasattr(resp, 'choices') and resp.choices:
             return resp.choices[0].message.content
         return str(resp)

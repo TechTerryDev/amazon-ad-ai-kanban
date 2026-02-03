@@ -1673,6 +1673,52 @@ tbody tr:hover td{background:rgba(37,99,235,.06);}
 	  font-size:12px;
 	  color:var(--muted);
 	}
+	.ai-panel{
+	  margin-top:12px;
+	  padding:10px 12px;
+	  border-radius:var(--radius-md);
+	  background:var(--bg);
+	  box-shadow:var(--shadow-inset);
+	  color:var(--muted);
+	  font-size:12px;
+	}
+	.ai-panel summary{
+	  cursor:pointer;
+	  font-weight:800;
+	  color:var(--muted);
+	  list-style:none;
+	  text-transform:uppercase;
+	  letter-spacing:.04em;
+	}
+	.ai-panel summary::-webkit-details-marker{display:none;}
+	.ai-panel summary:before{content:'▶';display:inline-block;margin-right:6px;color:var(--muted);}
+	.ai-panel[open] summary:before{content:'▼';}
+	.ai-panel .decision-item{
+	  background:transparent;
+	  box-shadow:none;
+	  padding:6px 0;
+	  font-size:12px;
+	}
+	.decision-dual{
+	  display:grid;
+	  grid-template-columns:repeat(2,minmax(0,1fr));
+	  gap:16px;
+	}
+	.decision-col{
+	  display:flex;
+	  flex-direction:column;
+	  gap:8px;
+	}
+	.decision-subtitle{
+	  font-size:12px;
+	  font-weight:800;
+	  color:var(--muted);
+	  text-transform:uppercase;
+	  letter-spacing:.04em;
+	}
+	@media (max-width: 900px){
+	  .decision-dual{grid-template-columns:1fr;}
+	}
 	"""
 
         js = r"""
@@ -10973,6 +11019,17 @@ def write_dashboard_md(
             except Exception:
                 return text
 
+        def _rel_doc_link(doc_path: Path) -> str:
+            """
+            生成相对 dashboard.md 的本地文档链接，避免路径包含空格导致打不开。
+            """
+            try:
+                rel = os.path.relpath(str(doc_path), start=str(out_path.parent))
+                rel = rel.replace(os.sep, "/")
+                return rel.replace(" ", "%20")
+            except Exception:
+                return str(doc_path)
+
         def _load_ai_dashboard_decisions() -> Optional[List[Dict[str, str]]]:
             """
             读取 ai/ai_dashboard_suggestions.json 中的决策建议（可选）。
@@ -11143,6 +11200,13 @@ def write_dashboard_md(
         except Exception:
             scale_opportunity_all = pd.DataFrame()
 
+        project_root = Path(__file__).resolve().parents[2]
+        amc_info_doc = project_root / ".docs/项目文档/AMC/AMC全盘模板_信息图.html"
+        amc_plan_doc = project_root / ".docs/项目文档/AMC/AMC全盘模板.md"
+        amc_info_link = _rel_doc_link(amc_info_doc) if amc_info_doc.exists() else ""
+        amc_plan_link = _rel_doc_link(amc_plan_doc) if amc_plan_doc.exists() else ""
+        amc_doc_ready = bool(amc_info_link or amc_plan_link)
+
         lines.append("## 1) 首屏聚焦（生命周期 × 环比 × 决策）")
         lines.append("")
         # 快速入口：有复盘时加一个入口（更贴近“当下执行意义”）
@@ -11158,6 +11222,8 @@ def write_dashboard_md(
         quick_links.append("[Campaign筛选表](../dashboard/campaign_action_view.csv)")
         if isinstance(action_review, pd.DataFrame) and (not action_review.empty):
             quick_links.append("[执行复盘](#review)")
+        if amc_doc_ready:
+            quick_links.append("[AMC执行建议](#amc-plan)")
         quick_links += [
             "[Watchlists](#watchlists)",
             "[生命周期闭环](./lifecycle_overview.md#loop)",
@@ -11902,14 +11968,13 @@ def write_dashboard_md(
 
         # 3) 决策建议（Top）
         lines.append("<div class=\"card-item\">")
-        # 若存在 AI 建议（双Agent），优先展示 AI 结果
         ai_decisions = _load_ai_dashboard_decisions()
         ai_failed = ai_decisions is None
         use_ai_decisions = isinstance(ai_decisions, list) and len(ai_decisions) > 0
-        title_suffix = " · AI" if (use_ai_decisions or ai_failed) else ""
-        lines.append(f"<div class=\"hero-title\">决策建议（Top 5）{title_suffix}</div>")
+        lines.append("<div class=\"hero-title\">决策建议（Top 5）</div>")
         try:
-            decision_items: List[Dict[str, str]] = []
+            rule_items: List[Dict[str, str]] = []
+            ai_items: List[Dict[str, str]] = []
             def _norm_text(x: str) -> str:
                 try:
                     t = re.sub(r"[^a-zA-Z0-9\\u4e00-\\u9fff]+", "", str(x or "").lower())
@@ -11925,7 +11990,7 @@ def write_dashboard_md(
                     text = title
                     if reason:
                         text = f"{title}（{_short_text(reason, 48)}）"
-                    decision_items.append(
+                    ai_items.append(
                         {
                             "priority": it.get("priority", ""),
                             "text": text,
@@ -11933,37 +11998,32 @@ def write_dashboard_md(
                             "evidence": str(it.get("evidence", "") or "").strip(),
                         }
                     )
-            elif not ai_failed:
-                for it in (weekly_actions or [])[:3]:
-                    raw = str(it.get("line", "") or "").strip()
-                    if not raw:
-                        continue
-                    p = ""
-                    m = re.search(r"`(P[0-2])`", raw)
-                    if m:
-                        p = m.group(1)
-                        raw = raw.replace(m.group(0), "").strip()
-                    raw = _strip_md_links(raw)
-                    raw = raw.replace("**", "").replace("`", "").strip()
-                    if raw:
-                        decision_items.append({"priority": p, "text": raw, "goal": _infer_goal_tag(raw), "evidence": ""})
-                for a in (picked_alerts or [])[:2]:
-                    p = str(a.get("priority", "P1") or "P1").strip().upper()
-                    title = str(a.get("title", "") or "").strip()
-                    detail = str(a.get("detail", "") or "").strip()
-                    if not title:
-                        continue
-                    text = f"{title}（{detail}）" if detail else title
-                    decision_items.append({"priority": p, "text": text, "goal": _infer_goal_tag(text), "evidence": ""})
+            for it in (weekly_actions or [])[:3]:
+                raw = str(it.get("line", "") or "").strip()
+                if not raw:
+                    continue
+                p = ""
+                m = re.search(r"`(P[0-2])`", raw)
+                if m:
+                    p = m.group(1)
+                    raw = raw.replace(m.group(0), "").strip()
+                raw = _strip_md_links(raw)
+                raw = raw.replace("**", "").replace("`", "").strip()
+                if raw:
+                    rule_items.append({"priority": p, "text": raw, "goal": _infer_goal_tag(raw), "evidence": ""})
+            for a in (picked_alerts or [])[:2]:
+                p = str(a.get("priority", "P1") or "P1").strip().upper()
+                title = str(a.get("title", "") or "").strip()
+                detail = str(a.get("detail", "") or "").strip()
+                if not title:
+                    continue
+                text = f"{title}（{detail}）" if detail else title
+                rule_items.append({"priority": p, "text": text, "goal": _infer_goal_tag(text), "evidence": ""})
 
-            if not decision_items:
-                lines.append("<div class=\"hint\">（暂无可收敛的决策建议）</div>")
-            else:
-                lines.append("<div class=\"decision-list\">")
-                # 去重 + 排序：优先级 → 业务目标
+            def _normalize_items(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
                 uniq: List[Dict[str, str]] = []
                 seen: set[str] = set()
-                for it in decision_items:
+                for it in items:
                     key = _norm_text(it.get("text", ""))
                     if not key or key in seen:
                         continue
@@ -11976,11 +12036,20 @@ def write_dashboard_md(
                     )
                 except Exception:
                     pass
-                for it in uniq[:5]:
+                return uniq[:5]
+
+            rule_items = _normalize_items(rule_items)
+            ai_items = _normalize_items(ai_items)
+
+            # 规则建议（主）
+            if not rule_items:
+                lines.append("<div class=\"hint\">（暂无规则建议）</div>")
+            else:
+                lines.append("<div class=\"decision-list\">")
+                for it in rule_items:
                     p = it.get("priority", "")
                     text = it.get("text", "")
                     goal = it.get("goal", "")
-                    evidence = it.get("evidence", "")
                     tone = ""
                     if p == "P0":
                         tone = " tone-risk"
@@ -11990,12 +12059,35 @@ def write_dashboard_md(
                         tone = " tone-opp"
                     goal_tag = f' <span class="tag">目标:{html.escape(goal)}</span>' if goal else ""
                     badge = f"<code>{p}</code> " if p else ""
-                    meta = ""
-                    if evidence:
-                        meta = f'<div class="decision-meta">证据: {html.escape(_short_text(evidence, 80))}</div>'
-                    lines.append(f"<div class=\"decision-item{tone}\">{badge}{html.escape(text)}{goal_tag}{meta}</div>")
+                    lines.append(f"<div class=\"decision-item{tone}\">{badge}{html.escape(text)}{goal_tag}</div>")
                 lines.append("</div>")
-                lines.append("<div class=\"hint\">更多见：<a href=\"../dashboard/task_summary.csv\">任务汇总</a> / <a href=\"../dashboard/action_board.csv\">Action Board</a></div>")
+
+            # AI 建议（弱提示、默认折叠）
+            lines.append("<details class=\"ai-panel\">")
+            lines.append("<summary>AI 建议（仅供参考）</summary>")
+            if ai_failed:
+                lines.append("<div class=\"hint\">（AI 建议生成失败）</div>")
+            elif not ai_items:
+                lines.append("<div class=\"hint\">（暂无 AI 建议）</div>")
+            else:
+                lines.append("<div class=\"decision-list\">")
+                for it in ai_items[:2]:
+                    p = it.get("priority", "")
+                    text = it.get("text", "")
+                    goal = it.get("goal", "")
+                    tone = ""
+                    if p == "P0":
+                        tone = " tone-risk"
+                    elif p == "P1":
+                        tone = " tone-hint"
+                    elif p == "P2":
+                        tone = " tone-opp"
+                    goal_tag = f' <span class="tag">目标:{html.escape(goal)}</span>' if goal else ""
+                    badge = f"<code>{p}</code> " if p else ""
+                    lines.append(f"<div class=\"decision-item{tone}\">{badge}{html.escape(text)}{goal_tag}</div>")
+                lines.append("</div>")
+            lines.append("</details>")
+            lines.append("<div class=\"hint\">更多见：<a href=\"../dashboard/task_summary.csv\">任务汇总</a> / <a href=\"../dashboard/action_board.csv\">Action Board</a></div>")
         except Exception:
             lines.append("<div class=\"hint\">（决策建议生成失败）</div>")
         lines.append("</div>")
@@ -12251,10 +12343,7 @@ def write_dashboard_md(
                     lines.append('</div>')
 
                 # 全量视图：有类目分组时默认折叠，避免重复占屏
-                if not use_group:
-                    lines.append(f'<details class="timeline-group" open>')
-                else:
-                    lines.append(f'<details class="timeline-group">')
+                lines.append(f'<details class="timeline-group" open>')
                 lines.append(f'<summary>全部产品 <span class="muted">({len(lt)})</span>{chips_all_inline}</summary>')
                 lines.append('<div class="timeline-rows">')
                 last_phase = None
@@ -12350,7 +12439,7 @@ def write_dashboard_md(
                     for idx, (gname, group_df) in enumerate(groups):
                         phase_counts = group_df.get("phase_label", pd.Series(dtype=str)).astype(str).str.lower().value_counts()
                         risk_cnt = int(phase_counts.get("decline", 0) or 0) + int(phase_counts.get("inactive", 0) or 0)
-                        open_attr = " open" if idx < 3 else ""
+                        open_attr = " open"
                         lines.append(f'<details class="timeline-group"{open_attr}>')
                         chips = []
                         for ph in phase_order_list:
@@ -12582,6 +12671,21 @@ def write_dashboard_md(
                 lines.append("- （暂无阶段化指标数据）")
         except Exception:
             lines.append("- （阶段化指标生成失败）")
+
+        # AMC 执行建议（模板对照，不改变现有口径）
+        lines.append("")
+        lines.append('<a id="amc-plan"></a>')
+        lines.append("### AMC 执行建议（模板，对照用）")
+        lines.append("")
+        lines.append("- 说明：不改变现有阶段口径，仅作为执行对照；阶段切换指标见信息图底部快查。")
+        lines.append("- 认知期：优先 SBV + SP_Expand（先铺量）｜人群：搜索未购 / 类目浏览未购 / 相似受众")
+        lines.append("- 考虑期：优先 SP_Core + SD（稳排名与拦截）｜人群：点击未购 / 浏览未购 / 加购未购（中窗）")
+        lines.append("- 转化期：优先 SP_Core + SB（收割）｜人群：加购未购（短窗）/ 高意向")
+        lines.append("- 复购期：优先 SD + SB 防御（利润）｜人群：品牌购买者 / 高价值复购")
+        if amc_info_link:
+            lines.append(f"- 参考信息图：[{amc_info_doc.name}]({amc_info_link})")
+        if amc_plan_link:
+            lines.append(f"- 参考模板：[{amc_plan_doc.name}]({amc_plan_link})")
 
         # 产品侧变化摘要（自然/流量）
         lines.append("")

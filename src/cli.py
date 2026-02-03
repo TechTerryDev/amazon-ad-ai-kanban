@@ -49,6 +49,11 @@ def main() -> int:
         help="生成 ai/ai_suggestions.md（需要配置 LLM_* 环境变量；默认不启用，避免误耗 token）",
     )
     ap.add_argument(
+        "--ai-report-multiagent",
+        action="store_true",
+        help="生成 ai/ai_suggestions.md（多Agent裁决，更全面；可选）",
+    )
+    ap.add_argument(
         "--ai-dashboard",
         action="store_true",
         help="生成 ai/ai_dashboard_suggestions.json（双Agent；用于 dashboard 决策建议，可选）",
@@ -137,6 +142,7 @@ def main() -> int:
         ops_log_root=Path(str(args.ops_log_root).strip()) if str(args.ops_log_root).strip() else None,
         action_review_windows=review_windows or [7, 14],
         ai_report=bool(args.ai_report),
+        ai_report_multiagent=bool(args.ai_report_multiagent),
         ai_prompt_only=bool(args.ai_prompt_only),
         ai_dashboard=bool(args.ai_dashboard),
         ai_dashboard_multiagent=bool(args.ai_dashboard_multiagent),

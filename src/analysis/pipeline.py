@@ -711,7 +711,13 @@ def _write_ops_policy_snapshot(
         return
 
 
-def _write_run_start_here(out_dir: Path, shops: List[str], render_dashboard_md: bool, ai_report: bool) -> None:
+def _write_run_start_here(
+    out_dir: Path,
+    shops: List[str],
+    render_dashboard_md: bool,
+    ai_report: bool,
+    ai_report_multiagent: bool,
+) -> None:
     """
     run 级入口：方便你在 output/<run>/ 下快速找到每个店铺的 dashboard 与 AI 输出。
     """
@@ -1620,6 +1626,7 @@ def run(
     ops_log_root: Optional[Path] = None,
     action_review_windows: Optional[List[int]] = None,
     ai_report: bool = False,
+    ai_report_multiagent: bool = False,
     ai_prompt_only: bool = False,
     ai_dashboard: bool = False,
     ai_dashboard_multiagent: bool = False,
@@ -2264,29 +2271,6 @@ def run(
         except Exception:
             pass
 
-        # AI 建议报告 / 提示词留档（可选，不影响主流程）
-        try:
-            if bool(ai_report) or bool(ai_prompt_only):
-                from src.analysis.ai_report import write_ai_suggestions_for_shop
-
-                write_ai_suggestions_for_shop(
-                    shop_dir=shop_dir,
-                    stage=str(stage or "").strip(),
-                    prefix=str(ai_prefix or "LLM").strip() or "LLM",
-                    max_asins=int(ai_max_asins or 0),
-                    max_actions=int(ai_max_actions or 0),
-                    timeout=int(ai_timeout or 180),
-                    prompt_only=bool(ai_prompt_only),
-                )
-                try:
-                    ai_dir = shop_dir / "ai"
-                    if (ai_dir / "ai_suggestions.md").exists():
-                        write_report_html_from_md(md_path=ai_dir / "ai_suggestions.md", out_path=ai_dir / "ai_suggestions.html")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
         # AI Dashboard（双Agent / 多‑agent）
         try:
             if bool(ai_dashboard_multiagent):
@@ -2340,6 +2324,43 @@ def run(
                 data_quality_hints=dq_hints,
                 action_review=action_review_df if (action_review_df is not None and not action_review_df.empty) else None,
             )
+        except Exception:
+            pass
+
+        # AI 建议报告 / 提示词留档（可选，不影响主流程）
+        # 放在 dashboard 之后：确保 action_board/asin_focus/keyword_topics 等证据表可用
+        try:
+            if bool(ai_report) or bool(ai_report_multiagent) or bool(ai_prompt_only):
+                if bool(ai_report_multiagent):
+                    from src.analysis.ai_report import write_ai_suggestions_multiagent_for_shop
+
+                    write_ai_suggestions_multiagent_for_shop(
+                        shop_dir=shop_dir,
+                        stage=str(stage or "").strip(),
+                        prefix=str(ai_prefix or "LLM").strip() or "LLM",
+                        max_asins=int(ai_max_asins or 0),
+                        max_actions=int(ai_max_actions or 0),
+                        timeout=int(ai_timeout or 180),
+                        prompt_only=bool(ai_prompt_only),
+                    )
+                else:
+                    from src.analysis.ai_report import write_ai_suggestions_for_shop
+
+                    write_ai_suggestions_for_shop(
+                        shop_dir=shop_dir,
+                        stage=str(stage or "").strip(),
+                        prefix=str(ai_prefix or "LLM").strip() or "LLM",
+                        max_asins=int(ai_max_asins or 0),
+                        max_actions=int(ai_max_actions or 0),
+                        timeout=int(ai_timeout or 180),
+                        prompt_only=bool(ai_prompt_only),
+                    )
+                try:
+                    ai_dir = shop_dir / "ai"
+                    if (ai_dir / "ai_suggestions.md").exists():
+                        write_report_html_from_md(md_path=ai_dir / "ai_suggestions.md", out_path=ai_dir / "ai_suggestions.html")
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2707,6 +2728,7 @@ def run(
             shops=shops,
             render_dashboard_md=bool(render_dashboard_md),
             ai_report=bool(ai_report),
+            ai_report_multiagent=bool(ai_report_multiagent),
         )
     except Exception:
         pass

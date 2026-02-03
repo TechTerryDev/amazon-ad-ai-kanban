@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import signal
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -88,6 +89,52 @@ def _read_json(path: Path) -> Dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _call_with_timeout(fn, seconds: int) -> str:
+    """
+    尝试使用 SIGALRM 强制超时（Unix 可用）。超时返回空字符串。
+    Windows 环境会直接调用并返回（不做信号超时）。
+    """
+    try:
+        sec = int(seconds or 0)
+        if sec <= 0:
+            return str(fn())
+        if not hasattr(signal, "SIGALRM"):
+            return str(fn())
+
+        def _handler(_signum, _frame):
+            raise TimeoutError("timeout")
+
+        old_handler = signal.signal(signal.SIGALRM, _handler)
+        try:
+            signal.setitimer(signal.ITIMER_REAL, sec)
+            return str(fn())
+        except TimeoutError:
+            return ""
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
+    except Exception:
+        return ""
+
+
+def _multiagent_worker(q, args) -> None:
+    """
+    子进程入口：执行多‑Agent 报告并返回布尔结果。
+    注意：必须是顶层函数，保证 spawn 模式可 pickle。
+    """
+    try:
+        ok = _write_ai_suggestions_multiagent_body(*args)
+        try:
+            q.put(bool(ok))
+        except Exception:
+            pass
+    except Exception:
+        try:
+            q.put(False)
+        except Exception:
+            pass
 
 
 def _extract_data_quality_snippet(md_text: str, max_chars: int = 6000) -> str:
@@ -828,6 +875,483 @@ def build_ai_suggestions_prompt(
     return system_prompt, user_prompt
 
 
+def _write_ai_suggestions_multiagent_body(
+    shop_dir: Path,
+    stage: str,
+    prefix: str = "LLM",
+    max_asins: int = 40,
+    max_actions: int = 200,
+    timeout: int = 180,
+    prompt_only: bool = False,
+    max_rounds: int = 1,
+) -> bool:
+    """
+    为单店铺生成 ai/ai_suggestions.md（双Agent：Analyst→Judge，分段生成）。
+
+    失败策略：输出占位说明（不抛异常），避免主流程中断。
+    """
+
+    def _write_skipped(ai_dir: Path, reason: str) -> None:
+        try:
+            ai_dir.mkdir(parents=True, exist_ok=True)
+            msg = (
+                "# AI 建议报告（未生成）\n\n"
+                f"- generated_at: `{dt.datetime.now().isoformat(timespec='seconds')}`\n"
+                f"- reason: {reason}\n\n"
+                "## 如何启用\n\n"
+                "1) 复制并填写 `.env.example`：\n\n"
+                "```bash\n"
+                "cp .env.example .env\n"
+                "# 编辑 .env：填入 LLM_API_KEY / LLM_MODEL\n"
+                "```\n\n"
+                "2) 重新运行（示例）：\n\n"
+                "```bash\n"
+                "python main.py --input-dir reports --out-dir output --ai-report-multiagent\n"
+                "```\n\n"
+                "> 注意：本文件仅说明“未生成原因”。当配置齐全后，会被真实的 AI 输出覆盖。\n"
+            )
+            (ai_dir / "ai_suggestions.md").write_text(msg, encoding="utf-8")
+        except Exception:
+            return
+
+    try:
+        if shop_dir is None or not shop_dir.exists():
+            return False
+
+        repo_root = _repo_root()
+        _load_dotenv_if_present(repo_root / ".env")
+
+        ai_dir = shop_dir / "ai"
+        ai_bundle_path = ai_dir / "ai_input_bundle.json"
+        if not ai_bundle_path.exists():
+            ai_bundle_path = shop_dir / "ai_input_bundle.json"
+        bundle = _read_json(ai_bundle_path)
+        if not bundle:
+            return False
+
+        shop = str(bundle.get("shop") or shop_dir.name).strip()
+
+        dq_md = _read_text(ai_dir / "data_quality.md", max_chars=0)
+        dq_snippet = _extract_data_quality_snippet(dq_md, max_chars=6000)
+
+        # 构建更“短而有效”的输入包（避免 token 爆炸）
+        run_ctx = _build_run_context_json(shop_dir=shop_dir)
+        asin_focus_snip = _asin_focus_snippet(shop_dir / "dashboard" / "asin_focus.csv", max_rows=int(max_asins or 0))
+        unlock_tasks_snip = _unlock_scale_tasks_snippet(shop_dir / "dashboard" / "unlock_scale_tasks.csv", max_rows=30)
+        budget_transfer_snip = _budget_transfer_plan_snippet(shop_dir / "dashboard" / "budget_transfer_plan.csv", max_rows=25)
+        keyword_topics_snip = _keyword_topics_action_hints_snippet(
+            shop_dir / "dashboard" / "keyword_topics_action_hints.csv", top_reduce=8, top_scale=8
+        )
+        action_snippet = _action_board_snippet(shop_dir / "dashboard" / "action_board.csv", max_rows=int(max_actions or 0))
+
+        section_headers = {
+            "0": "## 0) 口径与数据覆盖",
+            "1": "## 1) 关键结论（<=5）",
+            "2": "## 2) P0 动作清单（先做）",
+            "3": "## 3) P1 动作清单（随后做）",
+            "4": "## 4) 关键词主题（n-gram）抓重点",
+            "5": "## 5) 风险与回滚条件",
+        }
+
+        def _data_block(key: str) -> str:
+            blocks = {
+                "run_context": (
+                    "【run_context（结构化摘要）】\n"
+                    "```json\n"
+                    + json.dumps(run_ctx or {}, ensure_ascii=False)
+                    + "\n```\n"
+                ),
+                "data_quality": (
+                    "【ai/data_quality.md】\n"
+                    "```md\n"
+                    + (dq_snippet or "").strip()
+                    + "\n```\n"
+                ),
+                "asin_focus": (
+                    "【dashboard/asin_focus.csv】\n"
+                    "```csv\n"
+                    + (asin_focus_snip or "").strip()
+                    + "\n```\n"
+                ),
+                "unlock_tasks": (
+                    "【dashboard/unlock_scale_tasks.csv】\n"
+                    "```csv\n"
+                    + (unlock_tasks_snip or "").strip()
+                    + "\n```\n"
+                ),
+                "budget_transfer": (
+                    "【dashboard/budget_transfer_plan.csv】\n"
+                    "```csv\n"
+                    + (budget_transfer_snip or "").strip()
+                    + "\n```\n"
+                ),
+                "keyword_topics": (
+                    "【dashboard/keyword_topics_action_hints.csv】\n"
+                    "```csv\n"
+                    + (keyword_topics_snip or "").strip()
+                    + "\n```\n"
+                ),
+                "action_board": (
+                    "【dashboard/action_board.csv】\n"
+                    "```csv\n"
+                    + (action_snippet or "").strip()
+                    + "\n```\n"
+                ),
+            }
+            return blocks.get(key, "")
+
+        section_specs = [
+            {
+                "name": "context_and_core_actions",
+                "sections": ["0", "1", "2"],
+                "blocks": ["run_context", "data_quality", "asin_focus", "action_board"],
+            },
+            {
+                "name": "followup_and_keywords",
+                "sections": ["3", "4"],
+                "blocks": ["action_board", "keyword_topics"],
+            },
+            {
+                "name": "risk",
+                "sections": ["5"],
+                "blocks": ["data_quality", "asin_focus"],
+            },
+        ]
+
+        segment_system = (
+            "你是一个“亚马逊广告运营分析助手”。你的任务是基于给定数据输出指定小节，不能输出其它小节。\n"
+            "硬性规则：\n"
+            "1) 只使用输入里出现的字段与数值，不得臆造缺失维度。\n"
+            "2) 不参与算数；如需数值，只能引用输入中现成的数值。\n"
+            "3) 必须遵守 data_quality 的缺口提示；证据不足时输出“待人工确认/需补报表”。\n"
+            "4) 每条 bullet 必须紧跟一行证据：以 `  证据：` 开头，包含 `来源文件:字段=数值`（带 `=`）。\n"
+            "5) 输出只包含指定小节标题，禁止输出其它标题/前言/分隔线。\n"
+        )
+        segment_user_template = (
+            "请只输出以下小节（按顺序）：\n"
+            "{{sections}}\n\n"
+            "- 每个小节必须是 Markdown 无序列表（以 `- ` 开头）。\n"
+            "- 每条 bullet 紧跟一行证据（以 `  证据：` 开头，至少含 1 个 `=`）。\n"
+            "- 不得输出其它小节或额外标题。\n\n"
+            "店铺信息：\n"
+            f"- shop: {shop}\n"
+            f"- stage_profile: {str(stage or bundle.get('stage_profile') or '').strip()}\n\n"
+            "输入数据：\n"
+            "{{data_block}}\n"
+        )
+
+        system_judge = (
+            "你是最终裁决者（Judge）。\n"
+            "任务：对 Analyst 报告进行保守校对，只做删改/合并/去重，不新增任何事实与指标。\n"
+            "要求：\n"
+            "1) 输出必须保留 6 个小节标题（## 0) ~ ## 5)；\n"
+            "2) 每条 bullet 后必须有证据行；\n"
+            "3) 如果发现证据不足，改为“待人工确认/需补报表”。\n"
+        )
+        user_judge_template = (
+            "请基于 Analyst 报告输出最终版本（更保守、更可执行）。\n"
+            "输出必须严格包含 6 个小节标题（## 0) ~ ## 5)）。\n\n"
+            "# Analyst 报告\n"
+            "```md\n"
+            "{{analyst_report}}\n"
+            "```\n"
+        )
+
+        def _filter_sections(md: str, allow_sections: List[str]) -> str:
+            allowed = {str(s) for s in allow_sections}
+            out: List[str] = []
+            keep = False
+            for raw in str(md or "").splitlines():
+                line = str(raw or "").rstrip()
+                m = re.match(r"^##\s*([0-5])\)", line.strip())
+                if m:
+                    keep = m.group(1) in allowed
+                if keep:
+                    out.append(line)
+            return "\n".join(out).strip()
+
+        def _ensure_all_sections(md: str) -> str:
+            text = str(md or "").strip()
+            placeholder = "ai/data_quality.md:missing_evidence=1（需人工确认）"
+            for key, title in section_headers.items():
+                if title not in text:
+                    text = (
+                        text
+                        + "\n\n"
+                        + title
+                        + "\n"
+                        + "- 待人工确认：该小节未生成或证据不足\n"
+                        + "  证据："
+                        + placeholder
+                    )
+            return _normalize_ai_suggestions_body(text)
+
+        # Prompt 留档（多Agent）
+        ai_dir.mkdir(parents=True, exist_ok=True)
+        prompt_md = (
+            "# AI 建议报告（多‑Agent）提示词留档\n\n"
+            f"- generated_at: `{dt.datetime.now().isoformat(timespec='seconds')}`\n"
+            f"- env_prefix: `{prefix}`\n\n"
+            "## Analyst (分段) system\n\n```text\n"
+            + segment_system.strip()
+            + "\n```\n\n"
+            "## Analyst (分段) user (template)\n\n```text\n"
+            + segment_user_template.strip()
+            + "\n```\n\n"
+            "## Judge system\n\n```text\n"
+            + system_judge.strip()
+            + "\n```\n\n"
+            "## Judge user (template)\n\n```text\n"
+            + user_judge_template.strip()
+            + "\n```\n"
+        )
+        (ai_dir / "ai_suggestions_multiagent_prompt.md").write_text(prompt_md, encoding="utf-8")
+
+        if bool(prompt_only):
+            _write_skipped(ai_dir, reason="prompt_only=1（本次仅生成提示词留档，不调用 LLM）")
+            return True
+
+        try:
+            from ai_providers import build_chat_provider  # type: ignore
+        except Exception:
+            _write_skipped(ai_dir, reason="未找到 ai_providers 模块（请确认仓库根目录存在 ai_providers/）")
+            return False
+
+        provider = build_chat_provider(prefix=str(prefix or "LLM").strip() or "LLM")
+        if provider is None:
+            _write_skipped(ai_dir, reason="Provider 构建失败（请检查 LLM_PROVIDER 配置）")
+            return False
+
+        api_key = getattr(provider, "api_key", "") or ""
+        model = getattr(provider, "model", "") or ""
+        if not str(api_key).strip() or not str(model).strip():
+            _write_skipped(ai_dir, reason=f"未配置 {prefix}_API_KEY 或 {prefix}_MODEL")
+            return False
+
+        # 针对部分 SDK（如 Ark/Dashscope/OpenAI SDK）可能忽略 timeout，优先走更轻量的分段配置
+        slow_providers = {"ArkProvider", "DashscopeProvider", "OpenAISDKProvider"}
+        if type(provider).__name__ in slow_providers:
+            section_specs = [
+                {
+                    "name": "full_report_fast",
+                    "sections": ["0", "1", "2", "3", "4", "5"],
+                    "blocks": ["run_context", "data_quality", "asin_focus", "action_board", "keyword_topics"],
+                }
+            ]
+
+        max_rounds_local = max(int(max_rounds or 1), 1)
+        total_steps = max(len(section_specs) + 1, 1)  # Analyst 分段 + Judge
+        per_call_timeout = max(30, int((timeout or 180) // total_steps)) if int(timeout or 0) > 0 else 120
+
+        def _agent_analyst_segment(spec: Dict[str, Any]) -> str:
+            sections = spec.get("sections") or []
+            blocks = spec.get("blocks") or []
+            titles = [section_headers.get(str(s), "") for s in sections if section_headers.get(str(s), "")]
+            data_block = "\n\n".join([_data_block(k) for k in blocks if _data_block(k)]).strip()
+            user_seg = (
+                segment_user_template
+                .replace("{{sections}}", "\n".join(titles).strip())
+                .replace("{{data_block}}", data_block)
+            )
+            messages = [
+                {"role": "system", "content": segment_system},
+                {"role": "user", "content": user_seg},
+            ]
+            def _do_call() -> str:
+                return provider.generate(
+                    prompt=user_seg,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=1200,
+                    timeout=int(per_call_timeout),
+                )
+
+            content = _call_with_timeout(_do_call, int(per_call_timeout))
+            cleaned = _normalize_ai_suggestions_body(str(content or ""))
+            return _filter_sections(cleaned, sections)
+
+        def _agent_analyst() -> str:
+            parts: List[str] = []
+            for spec in section_specs:
+                part = _agent_analyst_segment(spec)
+                if part:
+                    parts.append(part.strip())
+            merged = "\n\n".join([p for p in parts if p]).strip()
+            if not merged:
+                return ""
+            return _ensure_all_sections(merged)
+
+        def _agent_judge(analyst_report: str) -> str:
+            user_j = user_judge_template.replace("{{analyst_report}}", analyst_report)
+            messages = [
+                {"role": "system", "content": system_judge},
+                {"role": "user", "content": user_j},
+            ]
+            def _do_call() -> str:
+                return provider.generate(
+                    prompt=user_j,
+                    messages=messages,
+                    temperature=0.1,
+                    max_tokens=900,
+                    timeout=int(per_call_timeout),
+                )
+
+            content = _call_with_timeout(_do_call, int(per_call_timeout))
+            return _ensure_all_sections(_normalize_ai_suggestions_body(str(content or "")))
+
+        def _run_with_langgraph() -> str:
+            from langgraph.graph import StateGraph, END  # type: ignore
+
+            class _State(dict):
+                pass
+
+            def _node_analyst(state: _State) -> _State:
+                state["analyst_report"] = _agent_analyst()
+                state["round"] = int(state.get("round", 0)) + 1
+                return state
+
+            def _node_judge(state: _State) -> _State:
+                analyst_report = str(state.get("analyst_report") or "")
+                state["final_report"] = _agent_judge(analyst_report)
+                return state
+
+            def _should_retry(state: _State) -> str:
+                final_report = str(state.get("final_report") or "")
+                if _validate_ai_suggestions_body(final_report):
+                    return "end"
+                if int(state.get("round", 0)) >= max_rounds_local:
+                    return "end"
+                return "retry"
+
+            graph = StateGraph(_State)
+            graph.add_node("analyst", _node_analyst)
+            graph.add_node("judge", _node_judge)
+            graph.set_entry_point("analyst")
+            graph.add_edge("analyst", "judge")
+            graph.add_conditional_edges("judge", _should_retry, {"retry": "analyst", "end": END})
+            app = graph.compile()
+            out_state = app.invoke({"round": 0})
+            return str(out_state.get("final_report") or "")
+
+        def _run_sequential() -> str:
+            final_report = ""
+            last_good = ""
+            for _ in range(max_rounds_local):
+                analyst_report = _agent_analyst()
+                final_report = _agent_judge(analyst_report)
+                if _validate_ai_suggestions_body(final_report):
+                    last_good = final_report
+                    break
+                if final_report:
+                    last_good = final_report
+            return last_good or final_report
+
+        try:
+            report_body = _run_with_langgraph()
+        except Exception:
+            report_body = _run_sequential()
+
+        report_body = _ensure_all_sections(_normalize_ai_suggestions_body(report_body))
+        if not _validate_ai_suggestions_body(report_body):
+            report_body = _ensure_all_sections(_agent_analyst())
+
+        report_md = f"# {shop} AI 建议报告（多‑Agent）\n\n" + report_body
+        (ai_dir / "ai_suggestions.md").write_text(report_md, encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def write_ai_suggestions_multiagent_for_shop(
+    shop_dir: Path,
+    stage: str,
+    prefix: str = "LLM",
+    max_asins: int = 40,
+    max_actions: int = 200,
+    timeout: int = 180,
+    prompt_only: bool = False,
+    max_rounds: int = 1,
+) -> bool:
+    """
+    多‑Agent 报告入口（带进程级硬超时）。
+    - prompt_only 时直接执行（避免多进程开销）
+    - 其余情况走子进程，超时则终止并写入占位说明
+    """
+    if bool(prompt_only):
+        return _write_ai_suggestions_multiagent_body(
+            shop_dir=shop_dir,
+            stage=stage,
+            prefix=prefix,
+            max_asins=max_asins,
+            max_actions=max_actions,
+            timeout=timeout,
+            prompt_only=prompt_only,
+            max_rounds=max_rounds,
+        )
+
+    hard_timeout = max(60, int(timeout or 180))
+
+    def _write_timeout_placeholder(reason: str) -> None:
+        try:
+            ai_dir = shop_dir / "ai"
+            ai_dir.mkdir(parents=True, exist_ok=True)
+            msg = (
+                "# AI 建议报告（未生成）\n\n"
+                f"- generated_at: `{dt.datetime.now().isoformat(timespec='seconds')}`\n"
+                f"- reason: {reason}\n\n"
+                "## 如何启用\n\n"
+                "1) 可尝试增加 --ai-timeout，例如 240/300。\n"
+                "2) 或改用 openai 兼容 HTTP Provider（oai_http）。\n\n"
+                "> 注意：本文件仅说明“未生成原因”。当配置齐全后，会被真实的 AI 输出覆盖。\n"
+            )
+            (ai_dir / "ai_suggestions.md").write_text(msg, encoding="utf-8")
+        except Exception:
+            return
+
+    try:
+        import multiprocessing as mp
+
+        ctx = mp.get_context("spawn")
+        q = ctx.Queue()
+        args = (
+            shop_dir,
+            stage,
+            prefix,
+            max_asins,
+            max_actions,
+            timeout,
+            prompt_only,
+            max_rounds,
+        )
+        p = ctx.Process(target=_multiagent_worker, args=(q, args))
+        p.start()
+        p.join(hard_timeout)
+        if p.is_alive():
+            p.terminate()
+            p.join(5)
+            _write_timeout_placeholder(f"超时中断（>{hard_timeout}s）")
+            return False
+        try:
+            return bool(q.get_nowait())
+        except Exception:
+            return False
+    except Exception:
+        # 子进程失败时回退为单进程
+        try:
+            return _write_ai_suggestions_multiagent_body(
+                shop_dir=shop_dir,
+                stage=stage,
+                prefix=prefix,
+                max_asins=max_asins,
+                max_actions=max_actions,
+                timeout=timeout,
+                prompt_only=prompt_only,
+                max_rounds=max_rounds,
+            )
+        except Exception:
+            return False
+
+
 def _normalize_ai_suggestions_body(md: str) -> str:
     """
     轻量“清洗”AI输出，避免：
@@ -974,6 +1498,22 @@ def _normalize_ai_suggestions_body(md: str) -> str:
         return cleaned + "\n"
     except Exception:
         return str(md or "").strip() + "\n"
+
+
+def _validate_ai_suggestions_body(md: str) -> bool:
+    """
+    轻量校验 AI 报告是否包含必须的小节标题。
+    """
+    try:
+        if not md:
+            return False
+        text = str(md)
+        for i in range(6):
+            if f"## {i})" not in text:
+                return False
+        return True
+    except Exception:
+        return False
 
 
 def _extract_json_from_text(text: str) -> Dict[str, Any]:
@@ -1425,7 +1965,8 @@ def write_ai_dashboard_multiagent_for_shop(
     max_rounds: int = 2,
 ) -> bool:
     """
-    多‑agent 方案：LangGraph + Guardrails + Promptfoo（可选依赖）。
+    多‑agent 方案（3 Agent）：Analyst → Challenger → Judge。
+    依赖：LangGraph + Guardrails + Promptfoo（可选）。
     - 输出 ai/ai_dashboard_suggestions.json
     - 输出 ai/ai_dashboard_eval.json（评分）
     - 输出 ai/ai_dashboard_promptfoo.yaml（模板）
@@ -1494,22 +2035,116 @@ def write_ai_dashboard_multiagent_for_shop(
             keyword_topics_csv_snippet=keyword_topics_snip,
         )
 
+        schema = _ai_dashboard_schema()
+        schema_json = json.dumps(schema, ensure_ascii=False, indent=2)
+        evidence_block = (
+            "## run_context\n"
+            "```json\n"
+            + json.dumps(run_ctx or {}, ensure_ascii=False)
+            + "\n```\n\n"
+            "## data_quality_snippet\n"
+            "```markdown\n"
+            + str(dq_snippet or "").strip()
+            + "\n```\n\n"
+            "## asin_focus (top)\n"
+            "```csv\n"
+            + str(asin_focus_snip or "").strip()
+            + "\n```\n\n"
+            "## action_board (top)\n"
+            "```csv\n"
+            + str(action_snippet or "").strip()
+            + "\n```\n\n"
+            "## keyword_topics_action_hints (top)\n"
+            "```csv\n"
+            + str(keyword_topics_snip or "").strip()
+            + "\n```\n"
+        )
+
+        system_b = (
+            "你是审慎的反对者（Challenger）。\n"
+            "任务：质疑 Analyst 的结论，指出证据不足/潜在风险/执行代价，并给出替代或更保守的建议。\n"
+            "要求：\n"
+            "1) 仅依据输入证据与 Analyst 输出，不臆造指标；\n"
+            "2) 输出必须严格 JSON（不含解释文字）；\n"
+            "3) 目标优先级：效率 > 利润 > 销量 > 自然 > 流量 > 转化。\n"
+        )
+        user_b_template = (
+            "# 输出要求\n"
+            "- 仅输出 JSON，严格符合 schema。\n"
+            "- decision_top5/weekly_actions/exceptions 数量上限同上。\n"
+            "- reason/evidence 必填，优先给出可量化证据。\n"
+            "\n"
+            "# JSON Schema\n"
+            "```json\n"
+            + schema_json
+            + "\n```\n\n"
+            "# 证据\n"
+            + evidence_block
+            + "\n"
+            "# Analyst 输出（供反证/校验）\n"
+            "```json\n"
+            "{{analyst_output_json}}\n"
+            "```\n"
+        )
+
+        system_c = (
+            "你是最终裁决者（Judge）。\n"
+            "任务：综合 Analyst 与 Challenger 的观点，在证据范围内给出最终可执行建议。\n"
+            "要求：\n"
+            "1) 仅依据证据与两方输出，不臆造指标；\n"
+            "2) 输出必须严格 JSON（不含解释文字）；\n"
+            "3) 必要时用更保守的建议替换争议项。\n"
+        )
+        user_c_template = (
+            "# 输出要求\n"
+            "- 仅输出 JSON，严格符合 schema。\n"
+            "- decision_top5/weekly_actions/exceptions 数量上限同上。\n"
+            "- reason/evidence 必填，优先给出可量化证据。\n"
+            "\n"
+            "# JSON Schema\n"
+            "```json\n"
+            + schema_json
+            + "\n```\n\n"
+            "# 证据\n"
+            + evidence_block
+            + "\n"
+            "# Analyst 输出\n"
+            "```json\n"
+            "{{analyst_output_json}}\n"
+            "```\n\n"
+            "# Challenger 输出\n"
+            "```json\n"
+            "{{challenger_output_json}}\n"
+            "```\n"
+        )
+
         # Prompt 留档 + Promptfoo 模板
         ai_dir.mkdir(parents=True, exist_ok=True)
         prompt_md = (
             "# AI Dashboard MultiAgent 提示词（自动生成留档）\n\n"
             f"- generated_at: `{dt.datetime.now().isoformat(timespec='seconds')}`\n"
             f"- env_prefix: `{prefix}`\n\n"
-            "## Agent A (生成) system\n\n```text\n"
+            "## Agent Analyst (生成) system\n\n```text\n"
             + system_a.strip()
             + "\n```\n\n"
-            "## Agent A (生成) user\n\n```text\n"
+            "## Agent Analyst (生成) user\n\n```text\n"
             + user_a.strip()
+            + "\n```\n\n"
+            "## Agent Challenger system\n\n```text\n"
+            + system_b.strip()
+            + "\n```\n\n"
+            "## Agent Challenger user (template)\n\n```text\n"
+            + user_b_template.strip()
+            + "\n```\n\n"
+            "## Agent Judge system\n\n```text\n"
+            + system_c.strip()
+            + "\n```\n\n"
+            "## Agent Judge user (template)\n\n```text\n"
+            + user_c_template.strip()
             + "\n```\n\n"
         )
         (ai_dir / "ai_dashboard_multiagent_prompt.md").write_text(prompt_md, encoding="utf-8")
         try:
-            schema = _ai_dashboard_schema()
             promptfoo_yaml = _build_promptfoo_dashboard_config(system_a, user_a, schema)
             (ai_dir / "ai_dashboard_promptfoo.yaml").write_text(promptfoo_yaml, encoding="utf-8")
         except Exception:
@@ -1540,9 +2175,9 @@ def write_ai_dashboard_multiagent_for_shop(
             _write_eval(ai_dir, {"score": 0, "reason": "missing_key_or_model"})
             return False
 
-        schema = _ai_dashboard_schema()
+        max_rounds_local = max(int(max_rounds or 1), 1)
 
-        def _agent_generate() -> Dict[str, Any]:
+        def _agent_analyst() -> Dict[str, Any]:
             messages = [
                 {"role": "system", "content": system_a},
                 {"role": "user", "content": user_a},
@@ -1555,26 +2190,8 @@ def write_ai_dashboard_multiagent_for_shop(
                 return guarded
             return _extract_json_from_text(txt)
 
-        def _agent_review(draft: Dict[str, Any]) -> Dict[str, Any]:
-            system_b = (
-                "你是严谨的复核编辑。\n"
-                "任务：校验并收敛结构化 JSON 建议，删除重复与空项，保证条目清晰可执行。\n"
-                "只输出 JSON，不附加解释。\n"
-            )
-            user_b = (
-                "# 规则\n"
-                "- 保持 schema 不变；\n"
-                "- decision_top5/weekly_actions/exceptions 数量上限同上；\n"
-                "- 去重、压缩表达；\n"
-                "- reason/evidence 必填，优先使用可量化字段；\n"
-                "\n"
-                "# 输入（Agent A 输出）\n"
-                "```json\n"
-                + json.dumps(draft, ensure_ascii=False)
-                + "\n```\n\n"
-                "# 输出\n"
-                "- 仅输出 JSON\n"
-            )
+        def _agent_challenger(draft: Dict[str, Any]) -> Dict[str, Any]:
+            user_b = user_b_template.replace("{{analyst_output_json}}", json.dumps(draft, ensure_ascii=False))
             messages = [
                 {"role": "system", "content": system_b},
                 {"role": "user", "content": user_b},
@@ -1586,22 +2203,46 @@ def write_ai_dashboard_multiagent_for_shop(
                 return guarded
             return _extract_json_from_text(txt)
 
-        # ===== LangGraph 可选编排 =====
-        final_obj: Dict[str, Any] = {}
-        try:
+        def _agent_judge(draft: Dict[str, Any], challenge: Dict[str, Any]) -> Dict[str, Any]:
+            user_c = (
+                user_c_template
+                .replace("{{analyst_output_json}}", json.dumps(draft, ensure_ascii=False))
+                .replace("{{challenger_output_json}}", json.dumps(challenge, ensure_ascii=False))
+            )
+            messages = [
+                {"role": "system", "content": system_c},
+                {"role": "user", "content": user_c},
+            ]
+            content = provider.generate(prompt=user_c, messages=messages, temperature=0.1, timeout=int(timeout or 180))
+            txt = str(content or "")
+            guarded = _guardrails_validate(schema, txt)
+            if guarded is not None:
+                return guarded
+            return _extract_json_from_text(txt)
+
+        def _run_with_langgraph() -> Dict[str, Any]:
             from langgraph.graph import StateGraph, END  # type: ignore
 
             class _State(dict):
                 pass
 
-            def _node_generate(state: _State) -> _State:
-                state["draft"] = _agent_generate()
+            def _node_analyst(state: _State) -> _State:
+                state["analyst"] = _agent_analyst()
                 state["round"] = int(state.get("round", 0)) + 1
                 return state
 
-            def _node_review(state: _State) -> _State:
-                draft = state.get("draft") or {}
-                state["final"] = _agent_review(draft if isinstance(draft, dict) else {})
+            def _node_challenger(state: _State) -> _State:
+                draft = state.get("analyst") or {}
+                state["challenger"] = _agent_challenger(draft if isinstance(draft, dict) else {})
+                return state
+
+            def _node_judge(state: _State) -> _State:
+                draft = state.get("analyst") or {}
+                challenge = state.get("challenger") or {}
+                state["final"] = _agent_judge(
+                    draft if isinstance(draft, dict) else {},
+                    challenge if isinstance(challenge, dict) else {},
+                )
                 return state
 
             def _should_retry(state: _State) -> str:
@@ -1609,23 +2250,47 @@ def write_ai_dashboard_multiagent_for_shop(
                 valid, _ = _validate_ai_dashboard_obj(obj if isinstance(obj, dict) else {})
                 if valid:
                     return "end"
-                if int(state.get("round", 0)) >= int(max_rounds or 1):
+                if int(state.get("round", 0)) >= max_rounds_local:
                     return "end"
                 return "retry"
 
             graph = StateGraph(_State)
-            graph.add_node("generate", _node_generate)
-            graph.add_node("review", _node_review)
-            graph.set_entry_point("generate")
-            graph.add_edge("generate", "review")
-            graph.add_conditional_edges("review", _should_retry, {"retry": "generate", "end": END})
+            graph.add_node("analyst", _node_analyst)
+            graph.add_node("challenger", _node_challenger)
+            graph.add_node("judge", _node_judge)
+            graph.set_entry_point("analyst")
+            graph.add_edge("analyst", "challenger")
+            graph.add_edge("challenger", "judge")
+            graph.add_conditional_edges("judge", _should_retry, {"retry": "analyst", "end": END})
             app = graph.compile()
             out_state = app.invoke({"round": 0})
-            final_obj = out_state.get("final") if isinstance(out_state, dict) else {}
+            return out_state.get("final") if isinstance(out_state, dict) else {}
+
+        def _run_sequential() -> Dict[str, Any]:
+            final_obj: Dict[str, Any] = {}
+            last_good: Dict[str, Any] = {}
+            for _ in range(max_rounds_local):
+                draft = _agent_analyst()
+                challenge = _agent_challenger(draft if isinstance(draft, dict) else {})
+                final_obj = _agent_judge(
+                    draft if isinstance(draft, dict) else {},
+                    challenge if isinstance(challenge, dict) else {},
+                )
+                if isinstance(final_obj, dict):
+                    last_good = final_obj
+                ok, _ = _validate_ai_dashboard_obj(final_obj if isinstance(final_obj, dict) else {})
+                if ok:
+                    break
+            if not isinstance(final_obj, dict) and last_good:
+                final_obj = last_good
+            return final_obj
+
+        # ===== LangGraph 优先编排；失败回退串行 =====
+        final_obj: Dict[str, Any] = {}
+        try:
+            final_obj = _run_with_langgraph()
         except Exception:
-            # fallback：无 langgraph 时，串行两步
-            draft = _agent_generate()
-            final_obj = _agent_review(draft if isinstance(draft, dict) else {})
+            final_obj = _run_sequential()
 
         if not isinstance(final_obj, dict):
             final_obj = {}
