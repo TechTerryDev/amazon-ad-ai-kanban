@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 import csv
+import base64
 import hashlib
 import html
 import json
@@ -639,6 +640,8 @@ def write_report_html_from_md(md_path: Path, out_path: Path) -> None:
         # 展示增强：展开/收起全部（不影响口径与算数，只是更好阅读）
         nav_links.append('<button class="btn" id="btnExpandAll" type="button" title="展开所有可折叠区块/表格">展开全部</button>')
         nav_links.append('<button class="btn" id="btnCollapseAll" type="button" title="收起所有可折叠区块/表格">收起全部</button>')
+        if name_lower == "dashboard.html":
+            nav_links.append('<button class="btn" id="btnToggleToc" type="button" title="折叠/展开目录">目录</button>')
         nav_html = "\n".join(nav_links)
 
         css = """
@@ -708,13 +711,15 @@ a:hover{text-decoration:underline;}
 }
 .btn:hover{text-decoration:none;border-color:rgba(37,99,235,.45);}
 .btn:active{transform:translateY(1px);}
-.layout{
-  display:grid;
-  grid-template-columns:300px 1fr;
-  gap:14px;
-  align-items:start;
-}
-.layout.single{grid-template-columns:1fr;}
+  .layout{
+    display:grid;
+    grid-template-columns:300px 1fr;
+    gap:14px;
+    align-items:start;
+  }
+  .layout.single{grid-template-columns:1fr;}
+  .layout.toc-collapsed{grid-template-columns:1fr;}
+  .layout.toc-collapsed .toc{display:none;}
 @media (max-width: 980px){
   .layout{grid-template-columns:1fr;}
 }
@@ -1720,6 +1725,347 @@ tbody tr:hover td{background:rgba(37,99,235,.06);}
 	  .decision-dual{grid-template-columns:1fr;}
 	}
 	"""
+
+        extra_head = ""
+        extra_css = ""
+        extra_js = ""
+        if name_lower == "dashboard.html":
+            extra_head = """
+  <link rel="stylesheet" href="https://unpkg.com/vis-timeline@7.7.2/styles/vis-timeline-graph2d.min.css">
+  <script src="https://unpkg.com/vis-timeline@7.7.2/standalone/umd/vis-timeline-graph2d.min.js"></script>
+"""
+            extra_css = """
+  .timeline-vis{
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    background:var(--card);
+    min-height:260px;
+  }
+  .timeline-controls{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    margin:10px 0 12px;
+    font-size:12px;
+    color:var(--muted);
+  }
+  .timeline-legend{
+    display:flex;
+    flex-wrap:wrap;
+    gap:8px;
+    margin:8px 0 0;
+    font-size:12px;
+    color:var(--muted);
+  }
+  .timeline-legend .lg-item{
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    padding:4px 8px;
+    border-radius:999px;
+    border:1px solid var(--border);
+    background:rgba(255,255,255,.6);
+    cursor:pointer;
+  }
+  .timeline-legend .lg-item.active{
+    border-color:#2563eb;
+    box-shadow:0 0 0 2px rgba(37,99,235,.15);
+  }
+  @media (prefers-color-scheme: dark){
+    .timeline-legend .lg-item{background:rgba(2,6,23,.35);}
+  }
+  .timeline-legend .dot{
+    width:10px;
+    height:10px;
+    border-radius:50%;
+    border:1px solid rgba(0,0,0,.1);
+  }
+  .timeline-controls .ctl{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    padding:6px 10px;
+    border-radius:10px;
+    border:1px solid var(--border);
+    background:rgba(255,255,255,.7);
+  }
+  @media (prefers-color-scheme: dark){
+    .timeline-controls .ctl{background:rgba(2,6,23,.4);}
+  }
+  .timeline-controls input,
+  .timeline-controls select{
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:4px 8px;
+    font:inherit;
+    color:var(--text);
+    background:transparent;
+  }
+  .timeline-panel{
+    margin-top:10px;
+    padding:10px 12px;
+    border-radius:12px;
+    border:1px dashed var(--border);
+    color:var(--muted);
+    font-size:12px;
+  }
+  .timeline-panel .label{
+    font-weight:700;
+    color:var(--text);
+    margin-bottom:6px;
+  }
+  .vis-item.phase-launch{border-color:#22c55e;background:#dcfce7;}
+  .vis-item.phase-growth{border-color:#16a34a;background:#bbf7d0;}
+  .vis-item.phase-stable{border-color:#3b82f6;background:#dbeafe;}
+  .vis-item.phase-mature{border-color:#6366f1;background:#e0e7ff;}
+  .vis-item.phase-decline{border-color:#f97316;background:#ffedd5;}
+  .vis-item.phase-inactive{border-color:#ef4444;background:#fee2e2;}
+  .vis-item.phase-unknown{border-color:#94a3b8;background:#e2e8f0;}
+  .vis-item.phase-multi{
+    color:#111827;
+    border-width:1px;
+  }
+  .vis-item.phase-multi .vis-item-content{
+    font-weight:600;
+  }
+  .vis-label.group-product{
+    border:none !important;
+    background:transparent !important;
+    box-shadow:none !important;
+  }
+  .vis-label.group-product .vis-inner{display:none;}
+"""
+            extra_js = r"""
+function _visDecode(b64){
+  try{
+    const bytes=Uint8Array.from(atob(b64), c=>c.charCodeAt(0));
+    return new TextDecoder('utf-8').decode(bytes);
+  }catch(e){return '';}
+}
+function _visShowFallback(reason){
+  const panel=_qs('#visTimelinePanel');
+  if(panel){
+    panel.innerHTML='<div class="label">提示</div><div>'+reason+'</div>';
+  }
+}
+function _initVisTimeline(){
+  const host=_qs('#visTimeline');
+  if(!host){return;}
+  if(!(window.vis && window.vis.Timeline)){
+    _visShowFallback('CDN 加载失败，请检查网络');
+    return;
+  }
+  const dataB64=host.getAttribute('data-vis') || '';
+  if(!dataB64){
+    _visShowFallback('暂无时间轴数据');
+    return;
+  }
+  let payload=null;
+  try{ payload=JSON.parse(_visDecode(dataB64) || '{}'); }catch(e){ payload=null; }
+  if(!payload || !payload.items || payload.items.length===0){
+    _visShowFallback('暂无时间轴数据');
+    return;
+  }
+  const itemsRaw=payload.items || [];
+  const groupsRaw=payload.groups || [];
+  const meta=payload.meta || {};
+  const categories=meta.categories || [];
+  const phases=meta.phases || [];
+  function _visEsc(s){
+    return String(s||'')
+      .replace(/&/g,'&amp;')
+      .replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;')
+      .replace(/'/g,'&#39;');
+  }
+
+  const controls=_qs('#visTimelineControls');
+  if(controls){
+    const maxScore=Math.max.apply(null, itemsRaw.map(it=>Number(it.score||0)));
+    const scoreMax = Number.isFinite(maxScore) ? Math.ceil(maxScore) : 0;
+    controls.innerHTML=[
+      '<div class="ctl"><label>视图</label><select id="visView"><option value="category">类目分组</option><option value="all">全部产品一行</option></select></div>',
+      '<div class="ctl"><label>类目</label><select id="visCategory"><option value="all">全部</option>' + categories.map(c=>'<option value="'+_visEsc(c)+'">'+_visEsc(c)+'</option>').join('') + '</select></div>',
+      '<div class="ctl"><label>阶段</label><select id="visPhase"><option value="all">全部</option>' + phases.map(p=>'<option value="'+_visEsc(p)+'">'+_visEsc(p)+'</option>').join('') + '</select></div>',
+      '<div class="ctl"><label>搜索</label><input id="visQuery" placeholder="产品名/ASIN" /></div>',
+      (scoreMax>0 ? '<div class="ctl"><label>评分≥</label><input id="visScore" type="number" min="0" max="'+scoreMax+'" value="0" style="width:70px;" /></div>' : ''),
+      '<div class="ctl"><button class="btn" id="visReset" type="button">重置</button></div>'
+    ].join('');
+  }
+  const panel=_qs('#visTimelinePanel');
+  if(panel){
+    panel.innerHTML='<div class="label">详情</div><div>点击条目查看详情</div>';
+  }
+  if(controls){
+    const legendHtml = [
+      '<div class="timeline-legend">',
+      '<span class="lg-item" data-phase="pre_launch"><span class="dot" style="background:#fef9c3"></span>pre</span>',
+      '<span class="lg-item" data-phase="launch"><span class="dot" style="background:#dcfce7"></span>launch</span>',
+      '<span class="lg-item" data-phase="growth"><span class="dot" style="background:#bbf7d0"></span>growth</span>',
+      '<span class="lg-item" data-phase="stable"><span class="dot" style="background:#dbeafe"></span>stable</span>',
+      '<span class="lg-item" data-phase="mature"><span class="dot" style="background:#e0e7ff"></span>mature</span>',
+      '<span class="lg-item" data-phase="decline"><span class="dot" style="background:#ffedd5"></span>decline</span>',
+      '<span class="lg-item" data-phase="inactive"><span class="dot" style="background:#fee2e2"></span>inactive</span>',
+      '<span class="lg-item" data-phase="unknown"><span class="dot" style="background:#e2e8f0"></span>unknown</span>',
+      '</div>'
+    ].join('');
+    controls.insertAdjacentHTML('beforeend', legendHtml);
+  }
+
+  const dataset=new vis.DataSet([]);
+  const groupset=new vis.DataSet([]);
+  const options={
+    stack:false,
+    zoomMin: 1000*60*60*24*3,
+    zoomMax: 1000*60*60*24*730,
+    margin:{item:8, axis:10},
+    orientation:'top',
+    showNestedGroups: true,
+    order:function(a,b){ return (Number(b.score||0) - Number(a.score||0)); }
+  };
+  const timeline=new vis.Timeline(host, dataset, groupset, options);
+
+  function _getCtl(id){ return document.getElementById(id); }
+  function _buildGroupsForCategory(cat){
+    if(!groupsRaw || groupsRaw.length===0){ return []; }
+    if(cat==='all'){ return groupsRaw.slice(); }
+    const allowed=new Set();
+    groupsRaw.forEach(g=>{
+      if(g.type==='category' && g.category===cat){ allowed.add(g.id); }
+      if(g.type==='product' && g.category===cat){ allowed.add(g.id); }
+    });
+    const out=[];
+    groupsRaw.forEach(g=>{
+      if(!allowed.has(g.id)) return;
+      if(g.type==='category' && Array.isArray(g.nestedGroups)){
+        const nested=g.nestedGroups.filter(id=>allowed.has(id));
+        if(nested.length===0){ return; }
+        out.push(Object.assign({}, g, {nestedGroups: nested}));
+      }else{
+        out.push(g);
+      }
+    });
+    return out;
+  }
+  function _applyFilters(){
+    const viewSel=_getCtl('visView');
+    const catSel=_getCtl('visCategory');
+    const phaseSel=_getCtl('visPhase');
+    const queryEl=_getCtl('visQuery');
+    const scoreEl=_getCtl('visScore');
+    const view = viewSel ? viewSel.value : 'category';
+    const cat = catSel ? catSel.value : 'all';
+    const phase = phaseSel ? phaseSel.value : 'all';
+    const query = (queryEl ? queryEl.value : '').trim().toLowerCase();
+    const minScore = scoreEl ? Number(scoreEl.value || 0) : 0;
+
+    let filtered = itemsRaw.filter(it=>{
+      if(cat!=='all' && it.category!==cat){ return false; }
+      if(phase!=='all'){
+        const curPhase=String(it.current_phase||it.phase||'').trim();
+        if(curPhase && curPhase!==phase){ return false; }
+        if(!curPhase && String(it.phase||'')!==phase){ return false; }
+      }
+      if(minScore && Number(it.score||0) < minScore){ return false; }
+      if(query){
+        const hay=(String(it.name||'')+' '+String(it.asin||'')).toLowerCase();
+        if(hay.indexOf(query)<0) return false;
+      }
+      return true;
+    });
+    if(view==='all'){
+      const allGroup=[{id:'ALL', content:'全部产品'}];
+      filtered = filtered.map(it=>{
+        const phaseShort = it.current_phase || it.phase_short || it.phase || '';
+        const labelShort = it.label_short || it.name || '';
+        const content = labelShort ? (labelShort + (phaseShort ? (' · ' + phaseShort) : '')) : phaseShort;
+        return Object.assign({}, it, {group:'ALL', content: content});
+      });
+      groupset.clear(); groupset.add(allGroup);
+    }else{
+      const allowedGroups=new Set(filtered.map(it=>it.group));
+      let groupsView = _buildGroupsForCategory(cat);
+      groupsView = groupsView.filter(g=>{
+        if(g.type==='product'){ return allowedGroups.has(g.id); }
+        if(g.type==='category'){
+          const nested=(g.nestedGroups||[]).filter(id=>allowedGroups.has(id));
+          if(nested.length===0){ return false; }
+          g.nestedGroups = nested;
+          return true;
+        }
+        return true;
+      });
+      groupset.clear(); groupset.add(groupsView);
+    }
+    dataset.clear();
+    dataset.add(filtered);
+  }
+
+  const controlsRoot=_qs('#visTimelineControls');
+  if(controlsRoot){
+    controlsRoot.addEventListener('change', _applyFilters);
+    controlsRoot.addEventListener('input', _applyFilters);
+    controlsRoot.addEventListener('click', (e)=>{
+      const target = e.target && e.target.closest ? e.target.closest('.lg-item') : null;
+      if(!target) return;
+      const ph = target.getAttribute('data-phase') || '';
+      const phaseSel=_getCtl('visPhase');
+      if(!phaseSel) return;
+      const cur = phaseSel.value;
+      if(cur === ph){
+        phaseSel.value = 'all';
+      }else{
+        phaseSel.value = ph;
+      }
+      controlsRoot.querySelectorAll('.timeline-legend .lg-item').forEach(el=>el.classList.remove('active'));
+      if(phaseSel.value !== 'all'){
+        target.classList.add('active');
+      }
+      _applyFilters();
+    });
+    const resetBtn=_getCtl('visReset');
+    if(resetBtn){
+      resetBtn.addEventListener('click', ()=>{
+        const viewSel=_getCtl('visView'); if(viewSel) viewSel.value='category';
+        const catSel=_getCtl('visCategory'); if(catSel) catSel.value='all';
+        const phaseSel=_getCtl('visPhase'); if(phaseSel) phaseSel.value='all';
+        const queryEl=_getCtl('visQuery'); if(queryEl) queryEl.value='';
+        const scoreEl=_getCtl('visScore'); if(scoreEl) scoreEl.value='0';
+        controlsRoot.querySelectorAll('.timeline-legend .lg-item').forEach(el=>el.classList.remove('active'));
+        _applyFilters();
+      });
+    }
+  }
+  timeline.on('select', (props)=>{
+    if(!panel) return;
+    const id = props.items && props.items.length>0 ? props.items[0] : null;
+    if(!id){
+      panel.innerHTML='<div class="label">详情</div><div>点击条目查看详情</div>';
+      return;
+    }
+    const item=dataset.get(id);
+    if(!item){ return; }
+    const phaseLine = item.phase_short || item.phase || '-';
+    const infoLines = [
+      '<div class="label">'+(item.name || item.asin || '')+'</div>',
+      '<div>当前阶段：'+(item.current_phase||item.phase||'-')+'</div>',
+      '<div>阶段序列：'+phaseLine+'</div>',
+      '<div>类目：'+(item.category||'-')+'</div>',
+      '<div>周期：'+(item.start||'-')+' ~ '+(item.end||'-')+'</div>',
+      '<div>评分：'+(item.score!=null?item.score:'-')+'</div>',
+    ];
+    if(item.title){
+      infoLines.push('<div style="margin-top:6px;color:var(--muted)">'+item.title+'</div>');
+    }
+    panel.innerHTML=infoLines.join('');
+  });
+
+  _applyFilters();
+}
+"""
+        if extra_css:
+            css = css + "\n" + extra_css
 
         js = r"""
 function _qs(sel, root){return (root||document).querySelector(sel);}
@@ -3106,6 +3452,25 @@ function _decorateBadges(){
 function _safe(fn){
   try{ if(typeof fn==='function'){ fn(); } }catch(e){}
 }
+function _initTocToggle(){
+  const btn=_qs('#btnToggleToc');
+  const layout=_qs('.layout');
+  if(!btn || !layout) return;
+  const key='dash_toc_collapsed';
+  const apply=(v)=>{
+    if(v){ layout.classList.add('toc-collapsed'); }
+    else{ layout.classList.remove('toc-collapsed'); }
+  };
+  try{
+    const saved=localStorage.getItem(key);
+    apply(saved==='1');
+  }catch(e){}
+  btn.addEventListener('click', ()=>{
+    const next=!layout.classList.contains('toc-collapsed');
+    apply(next);
+    try{ localStorage.setItem(key, next ? '1' : '0'); }catch(e){}
+  });
+}
 
 document.addEventListener('DOMContentLoaded', ()=>{
   _safe(_initTableSort);
@@ -3115,6 +3480,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   _safe(_buildOwnerKanban);
   _safe(_decorateQuickEntry);
   _safe(_initTocActive);
+  _safe(_initTocToggle);
   _safe(_cardizeKeyLists);
   _safe(_buildDashboardHero);
   _safe(_collapseDenseH3Blocks);
@@ -3123,6 +3489,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   _safe(_decorateBadges);
   _safe(_decorateCardPriority);
   _safe(_renderTimelines);
+  _safe(_initVisTimeline);
   _safe(_bindTimelineRerender);
   _safe(_autoStyleTables);
   _safe(_initToTop);
@@ -3145,6 +3512,9 @@ window.addEventListener('load', ()=>{
 });
 """
 
+        if extra_js:
+            js = js + "\n" + extra_js
+
         toc_hint_html = '<div class="hint">提示：点击目录/表头可跳转与排序（离线可用）。</div>' if show_global_hints else ""
         footer_hint_html = (
             '<div class="hint">本页由程序从 Markdown 自动生成（离线可打开）。如需编辑/追溯口径，请以同目录的 .md/.csv 为准。</div>'
@@ -3159,6 +3529,7 @@ window.addEventListener('load', ()=>{
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>{html.escape(title)}</title>
   <style>{css}</style>
+{extra_head}
 </head>
   <body class="{ 'neu-theme' if is_neu else '' }">
   <div class="topbar">
@@ -11259,6 +11630,246 @@ def write_dashboard_md(
         except Exception:
             lifecycle_table = pd.DataFrame()
 
+        # 生命周期时间轴可视化数据（用于 vis-timeline）
+        vis_timeline_b64 = ""
+        try:
+            lt_vis = lifecycle_table.copy() if isinstance(lifecycle_table, pd.DataFrame) else pd.DataFrame()
+            if lt_vis is not None and (not lt_vis.empty):
+                if "asin" in lt_vis.columns:
+                    lt_vis["asin"] = lt_vis["asin"].astype(str).fillna("").str.upper().str.strip()
+                if "product_name" not in lt_vis.columns:
+                    lt_vis["product_name"] = ""
+                if "product_category" in lt_vis.columns:
+                    lt_vis["product_category"] = lt_vis["product_category"].astype(str).fillna("").str.strip().replace({"": "（未分类）"})
+                else:
+                    lt_vis["product_category"] = "（未分类）"
+                if "phase_label" not in lt_vis.columns:
+                    if "current_phase" in lt_vis.columns:
+                        lt_vis["phase_label"] = lt_vis["current_phase"].astype(str).fillna("").str.lower()
+                    else:
+                        lt_vis["phase_label"] = "unknown"
+                if "cycle_range" not in lt_vis.columns:
+                    lt_vis["cycle_range"] = ""
+
+                def _parse_cycle_dates(range_text: str) -> Tuple[Optional[dt.date], Optional[dt.date]]:
+                    try:
+                        s = str(range_text or "").strip()
+                        if not s:
+                            return None, None
+                        dates = re.findall(r"\\d{4}-\\d{2}-\\d{2}", s)
+                        if not dates:
+                            return None, None
+                        start = dt.datetime.strptime(dates[0], "%Y-%m-%d").date() if dates else None
+                        end = dt.datetime.strptime(dates[1], "%Y-%m-%d").date() if len(dates) > 1 else None
+                        return start, end
+                    except Exception:
+                        return None, None
+
+                def _parse_timeline_segments(tl_text: str) -> List[Tuple[str, int]]:
+                    try:
+                        s = str(tl_text or "").strip()
+                        if not s:
+                            return []
+                        if s.startswith("tl:"):
+                            s = s[3:]
+                        s = s.split("|", 1)[0]
+                        parts = [p for p in s.split(";") if p]
+                        segs: List[Tuple[str, int]] = []
+                        for part in parts:
+                            if "=" not in part:
+                                continue
+                            ph, days = part.split("=", 1)
+                            ph2 = _norm_phase(ph)
+                            d = _safe_int(days)
+                            if d <= 0:
+                                continue
+                            segs.append((ph2, int(d)))
+                        return segs
+                    except Exception:
+                        return []
+
+                def _extract_total_days(range_text: str, tl_text: str) -> int:
+                    try:
+                        segs = _parse_timeline_segments(tl_text)
+                        if segs:
+                            return int(sum(int(d) for _, d in segs if int(d) > 0))
+                    except Exception:
+                        pass
+                    try:
+                        s = str(range_text or "")
+                        m = re.search(r"\\((\\d+)\\s*d\\)", s)
+                        if m:
+                            return int(m.group(1))
+                    except Exception:
+                        pass
+                    return 0
+
+                phase_short_map = {
+                    "pre_launch": "pre",
+                    "launch": "launch",
+                    "growth": "growth",
+                    "stable": "stable",
+                    "mature": "mature",
+                    "decline": "decline",
+                    "inactive": "inactive",
+                    "unknown": "unknown",
+                }
+                phase_color_map = {
+                    "pre_launch": "#fef9c3",
+                    "launch": "#dcfce7",
+                    "growth": "#bbf7d0",
+                    "stable": "#dbeafe",
+                    "mature": "#e0e7ff",
+                    "decline": "#ffedd5",
+                    "inactive": "#fee2e2",
+                    "unknown": "#e2e8f0",
+                }
+
+                category_groups: Dict[str, Dict[str, object]] = {}
+                product_groups: Dict[str, Dict[str, object]] = {}
+                items = []
+                phase_set: set[str] = set()
+                for idx, r in lt_vis.iterrows():
+                    asin_val = str(r.get("asin", "") or "").strip().upper()
+                    name_val = str(r.get("product_name", "") or "").strip()
+                    cat_val = str(r.get("product_category", "") or "（未分类）").strip() or "（未分类）"
+                    phase_val = str(r.get("phase_label", "") or "unknown").strip().lower() or "unknown"
+                    cycle = str(r.get("cycle_range", "") or "").strip()
+                    tl_text = str(r.get("timeline", "") or "")
+                    segments = _parse_timeline_segments(tl_text)
+                    total_days = _extract_total_days(cycle, tl_text)
+                    start_dt, end_dt = _parse_cycle_dates(cycle)
+                    if not start_dt:
+                        if total_days > 0:
+                            end_dt = dt.date.today()
+                            start_dt = end_dt - dt.timedelta(days=int(total_days))
+                        else:
+                            continue
+                    if not end_dt:
+                        end_dt = start_dt
+                    label = name_val or asin_val or str(r.get("product_display", "") or "").strip()
+                    if not label:
+                        label = f"ASIN_{idx+1}"
+                    label_short = label if len(label) <= 18 else (label[:16] + "…")
+                    group_label = label
+                    if asin_val and name_val:
+                        group_label = f"{name_val} ({asin_val})"
+                    group_label_short = group_label if len(group_label) <= 26 else (group_label[:24] + "…")
+                    prod_id = f"prod::{asin_val or idx}"
+                    if cat_val not in category_groups:
+                        category_groups[cat_val] = {
+                            "id": f"cat::{cat_val}",
+                            "content": str(cat_val),
+                            "type": "category",
+                            "category": cat_val,
+                            "nestedGroups": [],
+                            "className": "group-category",
+                        }
+                    if prod_id not in product_groups:
+                        product_groups[prod_id] = {
+                            "id": prod_id,
+                            "content": "",
+                            "title": group_label,
+                            "type": "product",
+                            "category": cat_val,
+                            "className": "group-product",
+                        }
+                        category_groups[cat_val]["nestedGroups"].append(prod_id)
+                    try:
+                        score = float(pd.to_numeric(r.get("focus_score", None), errors="coerce"))
+                    except Exception:
+                        score = 0.0
+                    if pd.isna(score):
+                        score = 0.0
+                    sales7 = _fmt_usd_safe(r.get("sales_recent_7d"), nd=1)
+                    dsales = _fmt_signed_usd_safe(r.get("delta_sales"), nd=1)
+                    spend = _fmt_usd_safe(r.get("ad_spend_roll"), nd=1)
+                    chg_days = ""
+                    try:
+                        chg = r.get("phase_change_days_ago", "")
+                        if chg is not None and str(chg).strip() != "":
+                            chg_days = str(int(float(chg)))
+                    except Exception:
+                        chg_days = ""
+                    if not segments:
+                        if total_days <= 0:
+                            total_days = max(int((end_dt - start_dt).days) + 1, 1)
+                        segments = [(phase_val, int(total_days))]
+                    total_days = max(int(sum(int(d) for _, d in segments if int(d) > 0)), 1)
+                    phase_seq = [ph for ph, _ in segments]
+                    phase_unique = []
+                    for ph in phase_seq:
+                        if ph not in phase_unique:
+                            phase_unique.append(ph)
+                    phase_set.update(phase_unique)
+                    gradient_parts: List[str] = []
+                    cur_pct = 0.0
+                    for ph, days in segments:
+                        pct = (float(days) / float(total_days)) * 100.0 if total_days > 0 else 0.0
+                        start_pct = cur_pct
+                        end_pct = cur_pct + pct
+                        cur_pct = end_pct
+                        color = phase_color_map.get(ph, phase_color_map.get("unknown", "#e2e8f0"))
+                        gradient_parts.append(f"{color} {start_pct:.2f}%, {color} {end_pct:.2f}%")
+                    gradient = "linear-gradient(90deg, " + ", ".join(gradient_parts) + ")"
+                    phase_short_seq = [phase_short_map.get(ph, ph) for ph in phase_unique]
+                    phase_list_text = "/".join([p for p in phase_short_seq if p])
+                    phase_detail = "; ".join([f"{phase_short_map.get(ph, ph)} {int(days)}d" for ph, days in segments])
+                    title_parts = [
+                        f"{label}",
+                        f"ASIN: {asin_val}" if asin_val else "",
+                        f"类目: {cat_val}" if cat_val else "",
+                        f"当前阶段: {phase_short_map.get(phase_val, phase_val)}" if phase_val else "",
+                        f"阶段序列: {phase_detail}" if phase_detail else "",
+                        f"周期: {cycle}" if cycle else "",
+                        f"Sales7d: {sales7}" if sales7 else "",
+                        f"ΔSales: {dsales}" if dsales else "",
+                        f"AdSpend: {spend}" if spend else "",
+                        f"变更: {chg_days}d" if chg_days else "",
+                    ]
+                    title = "<br/>".join([t for t in title_parts if t])
+                    end_exclusive = end_dt + dt.timedelta(days=1)
+                    items.append(
+                        {
+                            "id": f"item_{idx}",
+                            "group": prod_id,
+                            "content": html.escape(label_short),
+                            "start": start_dt.isoformat(),
+                            "end": end_exclusive.isoformat(),
+                            "title": title,
+                            "phase": phase_val,
+                            "phase_short": phase_list_text,
+                            "phase_list": ",".join(phase_unique),
+                            "current_phase": phase_val,
+                            "category": cat_val,
+                            "asin": asin_val,
+                            "name": label,
+                            "label_short": label_short,
+                            "score": score,
+                            "className": "phase-multi",
+                            "style": f"background: {gradient}; border-color: {phase_color_map.get(phase_val, '#94a3b8')};",
+                        }
+                    )
+
+                if items:
+                    categories = sorted(list(category_groups.keys()))
+                    groups: List[Dict[str, object]] = []
+                    for c in categories:
+                        groups.append(category_groups[c])
+                        prod_ids = list(category_groups[c].get("nestedGroups", []))
+                        for pid in prod_ids:
+                            if pid in product_groups:
+                                groups.append(product_groups[pid])
+                    vis_payload = {
+                        "items": items,
+                        "groups": groups,
+                        "meta": {"categories": categories, "phases": sorted(list(phase_set))},
+                    }
+                    vis_json = json.dumps(vis_payload, ensure_ascii=False)
+                    vis_timeline_b64 = base64.b64encode(vis_json.encode("utf-8")).decode("ascii")
+        except Exception:
+            vis_timeline_b64 = ""
+
         biz_kpi = (scorecard.get("biz_kpi") if isinstance(scorecard, dict) else {}) if scorecard else {}
         kpi_items: List[Dict[str, str]] = []
         if isinstance(biz_kpi, dict) and biz_kpi:
@@ -12099,444 +12710,20 @@ def write_dashboard_md(
         lines.append("")
         lines.append("## 生命周期追踪（时间轴）")
         lines.append("")
-# 生命周期时间轴（全量）
+
+        # 生命周期时间轴（交互版：vis-timeline）
         lines.append('<div class="card-item">')
-        lines.append('<div class="hero-title">生命周期时间轴（全量）</div>')
-        try:
-            lt = lifecycle_table.copy() if isinstance(lifecycle_table, pd.DataFrame) else pd.DataFrame()
-            if lt is None or lt.empty:
-                lines.append('<div class="hint">（暂无生命周期时间轴数据）</div>')
-            else:
-                lt = lt.copy()
-                if 'asin' in lt.columns:
-                    lt['asin'] = lt['asin'].astype(str).fillna('').str.upper().str.strip()
-                else:
-                    lt['asin'] = ''
-                if 'product_category' in lt.columns:
-                    lt['product_category'] = lt['product_category'].astype(str).fillna('').str.strip().replace({'': '（未分类）'})
-                else:
-                    lt['product_category'] = '（未分类）'
-                if 'phase_label' not in lt.columns:
-                    if 'current_phase' in lt.columns:
-                        lt['phase_label'] = lt['current_phase'].astype(str).fillna('').str.lower()
-                    else:
-                        lt['phase_label'] = 'unknown'
-                if 'product_display' not in lt.columns:
-                    if 'asin' in lt.columns:
-                        lt['product_display'] = lt['asin'].astype(str)
-                    else:
-                        lt['product_display'] = lt.index.to_series().astype(str)
-                if 'cycle_range' in lt.columns:
-                    lt['cycle_range'] = lt['cycle_range'].astype(str).fillna('').str.strip()
-                else:
-                    lt['cycle_range'] = ''
-                phase_order = {
-                    'pre_launch': 0,
-                    'launch': 1,
-                    'growth': 2,
-                    'stable': 3,
-                    'mature': 4,
-                    'decline': 5,
-                    'inactive': 6,
-                    'unknown': 9,
-                }
-                lt['_phase_order'] = lt['phase_label'].map(lambda x: phase_order.get(str(x), 9))
-                if 'focus_score' in lt.columns:
-                    lt['_focus'] = pd.to_numeric(lt['focus_score'], errors='coerce').fillna(0.0)
-                else:
-                    lt['_focus'] = 0.0
-                if 'ad_spend_roll' in lt.columns:
-                    lt['_spend'] = pd.to_numeric(lt['ad_spend_roll'], errors='coerce').fillna(0.0)
-                else:
-                    lt['_spend'] = 0.0
-                lt = lt.sort_values(['_phase_order', '_focus', '_spend', 'asin'], ascending=[True, False, False, True]).copy()
-
-                if 'sales_recent_7d' in lt.columns:
-                    lt['sales_recent_7d'] = lt['sales_recent_7d'].map(lambda x: _fmt_usd_safe(x, nd=1))
-                else:
-                    lt['sales_recent_7d'] = ''
-                if 'ad_spend_roll' in lt.columns:
-                    lt['ad_spend_roll'] = lt['ad_spend_roll'].map(lambda x: _fmt_usd_safe(x, nd=1))
-                else:
-                    lt['ad_spend_roll'] = ''
-                if 'delta_sales' in lt.columns:
-                    lt['delta_sales'] = lt['delta_sales'].map(lambda x: _fmt_signed_usd_safe(x, nd=1))
-                else:
-                    lt['delta_sales'] = ''
-                if 'inventory_cover_days_7d' in lt.columns:
-                    lt['inventory_cover_days_7d'] = lt['inventory_cover_days_7d'].map(
-                        lambda x: (f"{_fmt_num_safe(x, nd=1)}d" if _fmt_num_safe(x, nd=1) else '')
-                    )
-                else:
-                    lt['inventory_cover_days_7d'] = ''
-
-                
-                # 阶段统计（用于类目头部快速摘要）
-                phase_order_list = [
-                    "pre_launch",
-                    "launch",
-                    "growth",
-                    "stable",
-                    "mature",
-                    "decline",
-                    "inactive",
-                    "unknown",
-                ]
-                phase_label_map = {
-                    "pre_launch": "pre",
-                    "launch": "launch",
-                    "growth": "growth",
-                    "stable": "stable",
-                    "mature": "mature",
-                    "decline": "decline",
-                    "inactive": "inactive",
-                    "unknown": "unknown",
-                }
-                def _phase_chip(ph: str) -> str:
-                    try:
-                        raw = str(ph or "").strip().lower()
-                        cls = re.sub(r"[^a-z0-9_\\-]+", "", raw) or "unknown"
-                        return f'<span class="phase-badge phase-{cls}">{html.escape(raw)}</span>'
-                    except Exception:
-                        return f'<span class="phase-badge phase-unknown">{html.escape(str(ph or ""))}</span>'
-                def _meta_chip(text: str) -> str:
-                    return f'<span class="meta-chip">{html.escape(str(text or ""))}</span>'
-
-                use_group = ('product_category' in lt.columns and lt['product_category'].nunique(dropna=True) > 0)
-                # 全局阶段分布摘要（用于板块头部）
-                phase_counts_all = lt.get("phase_label", pd.Series(dtype=str)).astype(str).str.lower().value_counts()
-                chips_all = []
-                for ph in phase_order_list:
-                    cnt = int(phase_counts_all.get(ph, 0) or 0)
-                    if cnt <= 0:
-                        continue
-                    label = phase_label_map.get(ph, ph)
-                    chips_all.append(f'<span class="phase-chip phase-{ph}">{html.escape(label)} {cnt}</span>')
-                chips_all_html = ''
-                chips_all_inline = ''
-                if chips_all:
-                    chips_all_html = '<div class="phase-chips">' + ''.join(chips_all) + '</div>'
-                    chips_all_inline = '<span class="phase-chips">' + ''.join(chips_all) + '</span>'
-                total_cnt = int(len(lt))
-                risk_cnt = int(phase_counts_all.get("decline", 0) or 0) + int(phase_counts_all.get("inactive", 0) or 0)
-                active_cnt = max(total_cnt - risk_cnt, 0)
-                range_text = ''
-                axis_html = ''
-                tick_step_pct = 0.0
-                global_start = None
-                global_end = None
-                if 'cycle_range' in lt.columns:
-                    starts = []
-                    ends = []
-                    for _r in lt['cycle_range'].astype(str).fillna(''):
-                        s = str(_r or '').strip()
-                        if '~' not in s:
-                            continue
-                        left, right = s.split('~', 1)
-                        start = left.strip().split(' ')[0].strip()
-                        end = right.strip().split(' ')[0].strip()
-                        try:
-                            if start:
-                                starts.append(dt.datetime.strptime(start, "%Y-%m-%d").date())
-                        except Exception:
-                            pass
-                        try:
-                            if end:
-                                ends.append(dt.datetime.strptime(end, "%Y-%m-%d").date())
-                        except Exception:
-                            pass
-                    if starts and ends:
-                        global_start = min(starts)
-                        global_end = max(ends)
-                        range_text = f'{global_start.isoformat()}~{global_end.isoformat()}'
-                if range_text and global_start and global_end and global_start <= global_end:
-                    try:
-                        d0 = global_start
-                        d1 = global_end
-                        r0 = d0.isoformat()
-                        r1 = d1.isoformat()
-                        total_days = max(int((d1 - d0).days), 1)
-                        tick_step_days = 7
-                        if total_days > 240:
-                            tick_step_days = 60
-                        elif total_days > 120:
-                            tick_step_days = 30
-                        elif total_days > 60:
-                            tick_step_days = 14
-                        tick_step_pct = max(2.0, min(100.0, (tick_step_days / total_days) * 100.0))
-
-                        ticks = []
-                        cur = d0
-                        while cur <= d1:
-                            ticks.append(cur)
-                            cur = cur + dt.timedelta(days=int(tick_step_days))
-                        if ticks and ticks[-1] != d1:
-                            ticks.append(d1)
-
-                        label_every = 1
-                        if total_days > 180:
-                            label_every = 3
-                        elif total_days > 90:
-                            label_every = 2
-
-                        tick_spans = []
-                        for i, td in enumerate(ticks):
-                            pos = ((td - d0).days / total_days) * 100.0 if total_days > 0 else 0.0
-                            if (i % label_every == 0 or td == d0 or td == d1):
-                                if td != d0 and td != d1:
-                                    label = td.strftime("%m-%d")
-                                else:
-                                    label = td.isoformat()
-                            else:
-                                label = ""
-                            tick_spans.append(
-                                f'<span class="axis-tick" style="--pos:{pos:.2f}%">{html.escape(label)}</span>'
-                            )
-                        axis_html = (
-                            '<div class="timeline-axis">'
-                            f'<div class="axis-range"><span class="axis-start">{html.escape(r0)}</span>'
-                            f'<span class="axis-end">{html.escape(r1)}</span></div>'
-                            '<div class="axis-ticks">' + ''.join(tick_spans) + '</div>'
-                            '</div>'
-                        )
-                    except Exception:
-                        axis_html = ''
-                board_style = f' style="--tick-step:{tick_step_pct:.2f}%;"' if tick_step_pct > 0 else ''
-                lines.append(f'<div class="timeline-board"{board_style}>')
-                lines.append('<div class="timeline-summary">')
-                lines.append(f'<div class="summary-item"><div class="k">ASIN</div><div class="v">{total_cnt}</div></div>')
-                lines.append(f'<div class="summary-item tone-opp"><div class="k">Active</div><div class="v">{active_cnt}</div></div>')
-                lines.append(f'<div class="summary-item tone-risk"><div class="k">Risk</div><div class="v">{risk_cnt}</div></div>')
-                if range_text:
-                    lines.append(f'<div class="summary-item"><div class="k">周期</div><div class="v">{html.escape(range_text)}</div></div>')
-                if chips_all_html:
-                    lines.append(chips_all_html)
-                
-                # 阶段汇总卡片（更直观看结构）
-                phase_cards = []
-                phase_card_order = ["launch", "growth", "stable", "mature", "decline", "inactive"]
-                for ph in phase_card_order:
-                    cnt = int(phase_counts_all.get(ph, 0) or 0)
-                    if cnt <= 0:
-                        continue
-                    label = phase_label_map.get(ph, ph)
-                    share = ""
-                    try:
-                        share = f"{round((cnt / total_cnt) * 100)}%" if total_cnt > 0 else ""
-                    except Exception:
-                        share = ""
-                    phase_cards.append(
-                        f'<div class="phase-card phase-{ph}"><div class="k">{html.escape(label)}</div><div class="v">{cnt}</div><div class="s">{html.escape(share)}</div></div>'
-                    )
-                if phase_cards:
-                    lines.append('<div class="phase-cards">' + ''.join(phase_cards) + '</div>')
-
-                lines.append('</div>')
-
-                # 时间轴头部（全局对齐）
-                if axis_html:
-                    lines.append('<div class="timeline-header">')
-                    lines.append('<div class="timeline-header-left">产品</div>')
-                    lines.append('<div class="timeline-header-right">')
-                    lines.append(axis_html)
-                    lines.append('</div>')
-                    lines.append('</div>')
-
-                # 全量视图：有类目分组时默认折叠，避免重复占屏
-                lines.append(f'<details class="timeline-group" open>')
-                lines.append(f'<summary>全部产品 <span class="muted">({len(lt)})</span>{chips_all_inline}</summary>')
-                lines.append('<div class="timeline-rows">')
-                last_phase = None
-                for _, r in lt.iterrows():
-                    cat = str(r.get('product_category', '') or '').strip()
-                    asin_val = str(r.get('asin', '') or '').strip().upper()
-                    pname_val = r.get('product_name', '') or r.get('product_display', '')
-                    name = _compact_label(asin_val, pname_val)
-                    if not name:
-                        name = str(r.get('product_display', '') or r.get('asin', '') or '').strip()
-                    phase = str(r.get('phase_label', '') or r.get('current_phase', '') or '').strip()
-                    if phase and phase != last_phase:
-                        lines.append(f'<div class=\"timeline-phase\">阶段 {html.escape(phase)}</div>')
-                        last_phase = phase
-                    cycle = str(r.get('cycle_range', '') or '').strip()
-                    tl = str(r.get('timeline', '') or '').strip()
-                    sales7 = str(r.get('sales_recent_7d', '') or '').strip()
-                    ds = str(r.get('delta_sales', '') or '').strip()
-                    spend = str(r.get('ad_spend_roll', '') or '').strip()
-                    cover = str(r.get('inventory_cover_days_7d', '') or '').strip()
-                    chg_days = ""
-                    try:
-                        chg_val = r.get("phase_change_days_ago", "")
-                        if chg_val is not None and str(chg_val).strip() != "":
-                            chg_days = str(int(float(chg_val)))
-                    except Exception:
-                        chg_days = ""
-                    meta_parts = []
-                    if cat:
-                        meta_parts.append(_meta_chip(f'类目 {cat}'))
-                    if phase:
-                        meta_parts.append(_phase_chip(phase))
-                    if sales7:
-                        meta_parts.append(_meta_chip(f'Sales7d {sales7}'))
-                    if ds:
-                        meta_parts.append(_meta_chip(f'ΔSales {ds}'))
-                    if spend:
-                        meta_parts.append(_meta_chip(f'AdSpend {spend}'))
-                    if cover:
-                        meta_parts.append(_meta_chip(f'cover {cover}'))
-                    if chg_days:
-                        meta_parts.append(_meta_chip(f'变更{chg_days}d'))
-                    meta = ''.join(meta_parts)
-
-                    timeline_label = f'<div class="timeline-range">{html.escape(cycle)}</div>' if cycle else ''
-                    if tl:
-                        timeline_content = f'<code>{html.escape(tl)}</code>'
-                    else:
-                        timeline_content = '<span class="muted">-</span>'
-                    start_pct = 0.0
-                    width_pct = 100.0
-                    if cycle and global_start and global_end and global_start <= global_end:
-                        try:
-                            left, right = cycle.split("~", 1)
-                            s0 = left.strip()
-                            s1 = right.strip().split(" ")[0].strip()
-                            d0 = dt.datetime.strptime(s0, "%Y-%m-%d").date()
-                            d1 = dt.datetime.strptime(s1, "%Y-%m-%d").date()
-                            span = max((global_end - global_start).days, 1)
-                            start_pct = max(0.0, min(100.0, ((d0 - global_start).days / span) * 100.0))
-                            width_pct = max(2.0, min(100.0, ((d1 - d0).days + 1) / span * 100.0))
-                        except Exception:
-                            start_pct = 0.0
-                            width_pct = 100.0
-                    tl_html = (
-                        f'{timeline_label}<div class="timeline-track">'
-                        f'<div class="timeline-bar" style="--start:{start_pct:.2f}%;--width:{width_pct:.2f}%;">'
-                        f'{timeline_content}</div></div>'
-                    )
-
-                    row_cls = 'timeline-row'
-                    if phase in ('decline','inactive'):
-                        row_cls += ' tone-risk'
-                    elif phase in ('launch','growth'):
-                        row_cls += ' tone-opp'
-                    lines.append(f'<div class="{row_cls}">')
-                    lines.append('<div class="timeline-info">')
-                    lines.append(f'<div class="name">{html.escape(name)}</div>')
-                    if meta:
-                        lines.append(f'<div class="meta meta-chips">{meta}</div>')
-                    lines.append('</div>')
-                    lines.append(f'<div class="timeline-wrap">{tl_html}</div>')
-                    lines.append('</div>')
-                lines.append('</div>')
-                lines.append('</details>')
-
-                if use_group:
-                    groups = []
-                    for group_name, group_df in lt.groupby('product_category', dropna=False):
-                        gname = str(group_name or '（未分类）').strip() or '（未分类）'
-                        groups.append((gname, group_df.copy()))
-                    groups = sorted(groups, key=lambda g: len(g[1]), reverse=True)
-                    for idx, (gname, group_df) in enumerate(groups):
-                        phase_counts = group_df.get("phase_label", pd.Series(dtype=str)).astype(str).str.lower().value_counts()
-                        risk_cnt = int(phase_counts.get("decline", 0) or 0) + int(phase_counts.get("inactive", 0) or 0)
-                        open_attr = " open"
-                        lines.append(f'<details class="timeline-group"{open_attr}>')
-                        chips = []
-                        for ph in phase_order_list:
-                            cnt = int(phase_counts.get(ph, 0) or 0)
-                            if cnt <= 0:
-                                continue
-                            label = phase_label_map.get(ph, ph)
-                            chips.append(f'<span class="phase-chip phase-{ph}">{html.escape(label)} {cnt}</span>')
-                        chips_html = ''
-                        if chips:
-                            chips_html = '<span class="phase-chips">' + ''.join(chips) + '</span>'
-                        lines.append(f'<summary>{html.escape(gname)} <span class="muted">({len(group_df)})</span>{chips_html}</summary>')
-
-                        lines.append('<div class="timeline-rows">')
-                        last_phase = None
-                        for _, r in group_df.iterrows():
-                            asin_val = str(r.get('asin', '') or '').strip().upper()
-                            pname_val = r.get('product_name', '') or r.get('product_display', '')
-                            name = _compact_product_label(asin_val, pname_val)
-                            if not name:
-                                name = str(r.get('product_display', '') or r.get('asin', '') or '').strip()
-                            phase = str(r.get('phase_label', '') or r.get('current_phase', '') or '').strip()
-                            if phase and phase != last_phase:
-                                lines.append(f'<div class=\"timeline-phase\">阶段 {html.escape(phase)}</div>')
-                                last_phase = phase
-                            cycle = str(r.get('cycle_range', '') or '').strip()
-                            tl = str(r.get('timeline', '') or '').strip()
-                            sales7 = str(r.get('sales_recent_7d', '') or '').strip()
-                            ds = str(r.get('delta_sales', '') or '').strip()
-                            spend = str(r.get('ad_spend_roll', '') or '').strip()
-                            cover = str(r.get('inventory_cover_days_7d', '') or '').strip()
-                            chg_days = ""
-                            try:
-                                chg_val = r.get("phase_change_days_ago", "")
-                                if chg_val is not None and str(chg_val).strip() != "":
-                                    chg_days = str(int(float(chg_val)))
-                            except Exception:
-                                chg_days = ""
-                            meta_parts = []
-                            if phase:
-                                meta_parts.append(_phase_chip(phase))
-                            if sales7:
-                                meta_parts.append(_meta_chip(f'Sales7d {sales7}'))
-                            if ds:
-                                meta_parts.append(_meta_chip(f'ΔSales {ds}'))
-                            if spend:
-                                meta_parts.append(_meta_chip(f'AdSpend {spend}'))
-                            if cover:
-                                meta_parts.append(_meta_chip(f'cover {cover}'))
-                            if chg_days:
-                                meta_parts.append(_meta_chip(f'变更{chg_days}d'))
-                            meta = ''.join(meta_parts)
-                            timeline_label = f'<div class="timeline-range">{html.escape(cycle)}</div>' if cycle else ''
-                            if tl:
-                                timeline_content = f'<code>{html.escape(tl)}</code>'
-                            else:
-                                timeline_content = '<span class="muted">-</span>'
-                            start_pct = 0.0
-                            width_pct = 100.0
-                            if cycle and global_start and global_end and global_start <= global_end:
-                                try:
-                                    left, right = cycle.split("~", 1)
-                                    s0 = left.strip()
-                                    s1 = right.strip().split(" ")[0].strip()
-                                    d0 = dt.datetime.strptime(s0, "%Y-%m-%d").date()
-                                    d1 = dt.datetime.strptime(s1, "%Y-%m-%d").date()
-                                    span = max((global_end - global_start).days, 1)
-                                    start_pct = max(0.0, min(100.0, ((d0 - global_start).days / span) * 100.0))
-                                    width_pct = max(2.0, min(100.0, ((d1 - d0).days + 1) / span * 100.0))
-                                except Exception:
-                                    start_pct = 0.0
-                                    width_pct = 100.0
-                            tl_html = (
-                                f'{timeline_label}<div class="timeline-track">'
-                                f'<div class="timeline-bar" style="--start:{start_pct:.2f}%;--width:{width_pct:.2f}%;">'
-                                f'{timeline_content}</div></div>'
-                            )
-                            row_cls = 'timeline-row'
-                            if phase in ('decline','inactive'):
-                                row_cls += ' tone-risk'
-                            elif phase in ('launch','growth'):
-                                row_cls += ' tone-opp'
-                            lines.append(f'<div class="{row_cls}">')
-                            lines.append('<div class="timeline-info">')
-                            lines.append(f'<div class="name">{html.escape(name)}</div>')
-                            if meta:
-                                lines.append(f'<div class="meta meta-chips">{meta}</div>')
-                            lines.append('</div>')
-                            lines.append(f'<div class="timeline-wrap">{tl_html}</div>')
-                            lines.append('</div>')
-                        lines.append('</div>')
-                        lines.append('</details>')
-                lines.append('</div>')
-                lines.append('<div class="hint">排序：阶段 → focus_score → 花费；时间轴为展示层</div>')
-        except Exception:
-            lines.append('<div class="hint">（生命周期时间轴生成失败）</div>')
-        lines.append('</div>')
+        lines.append('<div class="hero-title">生命周期时间轴（交互）</div>')
+        lines.append('<div class="hint">支持缩放、筛选、详情查看；类目分组为默认视图。</div>')
+        if vis_timeline_b64:
+            lines.append('<div id="visTimelineControls" class="timeline-controls"></div>')
+            lines.append(
+                f'<div id="visTimeline" class="timeline-vis" data-vis="{vis_timeline_b64}" data-default-view="category"></div>'
+            )
+            lines.append('<div id="visTimelinePanel" class="timeline-panel"></div>')
+        else:
+            lines.append('<div class="hint">（暂无生命周期时间轴数据）</div>')
+        lines.append("</div>")
         lines.append("## 2) 阶段化指标（启动/成长/成熟）")
         lines.append("")
         lines.append("- 启动期/成长期：优先看 CTR/CVR/CPA（订单口径）与流量")
