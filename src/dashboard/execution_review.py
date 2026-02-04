@@ -20,9 +20,9 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from ads.actions import ActionCandidate
-from core.schema import CAN
-from core.utils import parse_date, safe_div
+from src.ads.actions import ActionCandidate
+from src.core.schema import CAN
+from src.core.utils import parse_date, safe_div
 
 
 def _safe_str(x: object) -> str:

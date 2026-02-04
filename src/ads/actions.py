@@ -14,9 +14,9 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from core.config import StageConfig
-from core.schema import CAN
-from core.utils import json_dumps, safe_div
+from src.core.config import StageConfig
+from src.core.schema import CAN
+from src.core.utils import json_dumps, safe_div
 
 
 @dataclass(frozen=True)

@@ -9,8 +9,8 @@ from typing import Dict, List
 
 import pandas as pd
 
-from core.schema import CAN
-from core.utils import safe_div
+from src.core.schema import CAN
+from src.core.utils import safe_div
 
 
 def add_core_metrics(df: pd.DataFrame) -> pd.DataFrame:

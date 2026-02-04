@@ -4,7 +4,14 @@
     "_comment": "库存相关（用于放量阻断/止损）。low_inventory_threshold=“低库存阈值(件)”。block_scale_when_* 为 true 时：会对放量类动作（BID_UP/BUDGET_UP 等）做阻断，避免断货/库存不足时误加码。提示：该阈值也会影响关键词主题建议（dashboard/keyword_topics_action_hints.csv）的 scale 阻断（blocked/blocked_reason）。",
     "low_inventory_threshold": 20,
     "block_scale_when_low_inventory": true,
-    "block_scale_when_cover_days_below": 14
+    "block_scale_when_cover_days_below": 14,
+    "_comment_category_default": "品类差异化库存阈值（可选）：当 category_overrides 未命中时，使用该默认。留空则回退全局阈值。",
+    "category_default": {
+      "low_inventory_threshold": 20,
+      "block_scale_when_cover_days_below": 14
+    },
+    "_comment_category_overrides": "按品类覆盖（可选）：match 为关键词数组（大小写不敏感，命中任意关键词即可）。示例：{\"name\":\"fast_moving\",\"match\":[\"beauty\",\"grocery\"],\"low_inventory_threshold\":50,\"block_scale_when_cover_days_below\":21}",
+    "category_overrides": []
   },
   "keyword_funnel": {
     "_comment": "关键词漏斗：用于输出 TopN 关键词/搜索词（只影响展示规模，不影响核心口径）。",
@@ -118,7 +125,13 @@
       "exclude_phases": ["decline", "inactive"],
       "require_no_oos": true,
       "require_no_low_inventory": true,
-      "require_oos_with_ad_spend_days_zero": true
+      "require_oos_with_ad_spend_days_zero": true,
+      "_comment_category_default": "品类差异化放量窗口（可选）：未命中覆盖时使用该默认。留空则回退全局阈值。",
+      "category_default": {
+        "min_inventory_cover_days_7d": 30.0
+      },
+      "_comment_category_overrides": "按品类覆盖（可选）：match 为关键词数组（大小写不敏感，命中任意关键词即可）。示例：{\"name\":\"slow_moving\",\"match\":[\"furniture\"],\"min_inventory_cover_days_7d\":21,\"min_sales_per_day_7d\":0.5}",
+      "category_overrides": []
     },
     "focus_scoring": {
       "_comment": "ASIN Focus 评分（0~100左右）：只用于“排序抓重点”，不是预测。base_* 控制“花费越高越先看”；weight_* 控制各类风险/异常对优先级的加权。",

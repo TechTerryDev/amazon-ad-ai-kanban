@@ -3,3 +3,6 @@ numpy>=2,<3
 openpyxl>=3.1,<4
 matplotlib>=3.8,<4
 seaborn>=0.13,<1
+pydantic>=2,<3
+langgraph>=0.2,<1
+guardrails-ai>=0.5,<1

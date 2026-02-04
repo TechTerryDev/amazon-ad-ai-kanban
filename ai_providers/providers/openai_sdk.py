@@ -38,8 +38,13 @@ class OpenAISDKProvider(ChatProvider):
             payload["messages"] = messages or [{"role": "user", "content": prompt}]
 
         try:
-            resp = self.client.chat.completions.create(**payload)
+            client = self.client
+            try:
+                # 兼容新版 SDK：支持 per-call timeout
+                client = self.client.with_options(timeout=int(timeout or 180))
+            except Exception:
+                client = self.client
+            resp = client.chat.completions.create(**payload)
             return resp.choices[0].message.content
         except Exception as e:
             return f"OpenAI SDK 调用失败: {e}"
-

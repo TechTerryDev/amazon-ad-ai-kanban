@@ -6,8 +6,8 @@ import argparse
 import datetime as dt
 from pathlib import Path
 
-from analysis.pipeline import run
-from lifecycle.lifecycle_settings import load_lifecycle_config, merge_lifecycle_overrides
+from src.analysis.pipeline import run
+from src.lifecycle.lifecycle_settings import load_lifecycle_config, merge_lifecycle_overrides
 
 
 def main() -> int:
@@ -49,9 +49,24 @@ def main() -> int:
         help="生成 ai/ai_suggestions.md（需要配置 LLM_* 环境变量；默认不启用，避免误耗 token）",
     )
     ap.add_argument(
+        "--ai-report-multiagent",
+        action="store_true",
+        help="生成 ai/ai_suggestions.md（多Agent裁决，更全面；可选）",
+    )
+    ap.add_argument(
+        "--ai-dashboard",
+        action="store_true",
+        help="生成 ai/ai_dashboard_suggestions.json（双Agent；用于 dashboard 决策建议，可选）",
+    )
+    ap.add_argument(
+        "--ai-dashboard-multiagent",
+        action="store_true",
+        help="生成 ai/ai_dashboard_suggestions.json（LangGraph+Guardrails+Promptfoo 方案；多轮思考）",
+    )
+    ap.add_argument(
         "--ai-prompt-only",
         action="store_true",
-        help="仅生成 ai/ai_suggestions_prompt.md（提示词留档，不调用 LLM；适合先调提示词，最后再验收 AI 输出）",
+        help="仅生成 AI 提示词留档（ai/ai_suggestions_prompt.md / ai_dashboard_prompt.md / ai_dashboard_multiagent_prompt.md），不调用 LLM",
     )
     ap.add_argument("--ai-prefix", default="LLM", help="AI 环境变量前缀（默认 LLM；对应 {PREFIX}_API_KEY/{PREFIX}_MODEL 等）")
     ap.add_argument("--ai-max-asins", type=int, default=40, help="喂给 AI 的 ASIN 数量上限（默认 40）")
@@ -127,7 +142,10 @@ def main() -> int:
         ops_log_root=Path(str(args.ops_log_root).strip()) if str(args.ops_log_root).strip() else None,
         action_review_windows=review_windows or [7, 14],
         ai_report=bool(args.ai_report),
+        ai_report_multiagent=bool(args.ai_report_multiagent),
         ai_prompt_only=bool(args.ai_prompt_only),
+        ai_dashboard=bool(args.ai_dashboard),
+        ai_dashboard_multiagent=bool(args.ai_dashboard_multiagent),
         ai_prefix=str(args.ai_prefix or "LLM").strip() or "LLM",
         ai_max_asins=int(args.ai_max_asins or 0),
         ai_max_actions=int(args.ai_max_actions or 0),

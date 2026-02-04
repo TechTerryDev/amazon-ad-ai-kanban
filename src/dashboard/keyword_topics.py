@@ -19,11 +19,11 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
-from core.config import get_stage_config
-from core.policy import KeywordTopicsPolicy
-from core.rules import is_waste_spend
-from core.schema import CAN
-from core.utils import safe_div
+from src.core.config import get_stage_config
+from src.core.policy import KeywordTopicsPolicy
+from src.core.rules import is_waste_spend
+from src.core.schema import CAN
+from src.core.utils import safe_div
 
 
 _RE_WORD = re.compile(r"[a-z0-9]+", flags=re.IGNORECASE)

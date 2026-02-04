@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from ads.actions import (
+from src.ads.actions import (
     ActionCandidate,
     generate_campaign_budget_suggestions,
     generate_campaign_budget_actions_from_map,
@@ -28,10 +28,10 @@ from ads.actions import (
     generate_search_term_actions,
     generate_targeting_actions,
 )
-from core.config import StageConfig, get_stage_config
-from ingest.loader import LoadedReport, load_ad_reports, load_product_analysis, load_product_listing
-from core.metrics import summarize, to_summary_dict
-from analysis.diagnostics import (
+from src.core.config import StageConfig, get_stage_config
+from src.ingest.loader import LoadedReport, load_ad_reports, load_product_analysis, load_product_listing
+from src.core.metrics import summarize, to_summary_dict
+from src.analysis.diagnostics import (
     diagnose_asin_root_causes,
     diagnose_campaign_budget_map_from_asin,
     diagnose_campaign_trends,
@@ -42,21 +42,21 @@ from analysis.diagnostics import (
     infer_asin_stage_by_profit,
     summarize_profit_health,
 )
-from reporting.reporting import generate_shop_report
-from core.schema import CAN
-from core.utils import json_dumps, parse_date, to_float, is_paused_status
-from analysis.temporal import build_temporal_insights
-from lifecycle.lifecycle import build_lifecycle_for_shop, build_lifecycle_windows_for_shop, LifecycleConfig
-from ads.ad_linkage import (
+from src.reporting.reporting import generate_shop_report
+from src.core.schema import CAN
+from src.core.utils import json_dumps, parse_date, to_float, is_paused_status
+from src.analysis.temporal import build_temporal_insights
+from src.lifecycle.lifecycle import build_lifecycle_for_shop, build_lifecycle_windows_for_shop, LifecycleConfig
+from src.ads.ad_linkage import (
     allocate_detail_to_asin,
     build_ad_product_daily,
     build_asin_campaign_map,
     build_weight_join_specs,
     top_n_entities_by_asin,
 )
-from analysis.ai_bundle import build_ai_input_bundle
-from analysis.data_quality import build_data_quality_report, extract_data_quality_summary_lines, write_data_quality_files
-from core.policy import (
+from src.analysis.ai_bundle import build_ai_input_bundle
+from src.analysis.data_quality import build_data_quality_report, extract_data_quality_summary_lines, write_data_quality_files
+from src.core.policy import (
     OpsPolicy,
     OpsProfile,
     load_ops_policy,
@@ -66,8 +66,8 @@ from core.policy import (
     ops_profile_to_overrides,
     validate_ops_policy_path,
 )
-from dashboard.outputs import write_dashboard_outputs, write_report_html_from_md
-from dashboard.execution_review import load_execution_log, write_action_review, write_execution_log_template
+from src.dashboard.outputs import write_dashboard_outputs, write_report_html_from_md
+from src.dashboard.execution_review import load_execution_log, write_action_review, write_execution_log_template
 
 
 def _concat_reports(reports: List[LoadedReport], report_type: str) -> pd.DataFrame:
@@ -331,6 +331,7 @@ def _write_start_here(
     output_profile: str,
     render_dashboard_md: bool,
     render_full_report: bool,
+    policy: Optional[OpsPolicy] = None,
 ) -> None:
     """
     验收入口：把“要看哪个文件”明确出来，减少输出文件带来的困扰。
@@ -361,7 +362,60 @@ def _write_start_here(
                 f"- 再看 {L('dashboard/action_board.csv')}（可筛选/分派）",
                 f"- 最后按需下钻到 ASIN/类目/生命周期明细",
                 "",
+                "口径与提示（集中说明）：",
+                "- 未标注的累计指标=主窗口；标注 compare/Δ 的为近N天 vs 前N天（日期见表内 recent/prev）",
+                "- 表头含(7d/14d/30d)=近窗；含Δ=对比窗口；含roll=滚动窗口",
+                "- Drilldown：类目/ASIN/生命周期字段可点击跳转（Dashboard/Drilldown 均支持）",
+                "- Δ 指标默认 compare_7d（近7天 vs 前7天），如需换口径请看对应 CSV/字段",
+                "- HTML 支持目录/表头排序（离线可用），如需追溯口径请以 CSV/JSON 为准",
             ]
+            try:
+                ignore_last = int(getattr(policy, "dashboard_compare_ignore_last_days", 0) or 0) if policy is not None else 0
+                if ignore_last > 0:
+                    lines.append(f"- compare 忽略最近 {ignore_last} 天（规避归因滞后噪声）")
+            except Exception:
+                pass
+            try:
+                low_thr = 0.35
+                if isinstance(policy, OpsPolicy):
+                    asp = getattr(policy, "dashboard_action_scoring", None)
+                    if asp is not None:
+                        low_thr = float(getattr(asp, "low_hint_confidence_threshold", low_thr) or low_thr)
+                low_thr = max(0.0, min(1.0, float(low_thr)))
+                lines.append(
+                    f"- Action Board：`asin_hint` 为弱关联定位；当 `asin_hint_confidence<{low_thr:.2f}` 时建议先人工确认（可在 action_board.csv 里筛选/对照候选 ASIN）"
+                )
+            except Exception:
+                lines.append("- Action Board：`asin_hint` 为弱关联定位；低置信度时建议先人工确认")
+            try:
+                cover_days_thr = float(getattr(policy, "block_scale_when_cover_days_below", 7.0) or 7.0) if isinstance(policy, OpsPolicy) else 7.0
+                lines.append(f"- 库存告急仍投放：`inventory_cover_days_7d ≤ {int(cover_days_thr)}d` 且 `ad_spend_roll ≥ 10`")
+            except Exception:
+                pass
+            lines.append("- 库存调速（Sigmoid）：基于 `inventory_cover_days_7d` 计算调速系数，仅建议不自动执行")
+            lines.append("- 利润护栏（Break-even）：安全ACOS = 毛利率 - 目标净利率，超线仅提示")
+            lines.append("- 关键词主题：n-gram 会重复计数 spend；仅用于线索与聚焦，不做精确归因")
+            try:
+                dq_path = shop_dir / "ai" / "data_quality.md"
+                if dq_path.exists():
+                    hints: List[str] = []
+                    with dq_path.open("r", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            t = line.strip()
+                            if not t:
+                                continue
+                            if t.startswith("- "):
+                                hints.append(t[2:].strip())
+                            if len(hints) >= 2:
+                                break
+                    if hints:
+                        lines.append("- 数据质量提示（自动摘取）:")
+                        for h in hints:
+                            if h:
+                                lines.append(f"  - {h}")
+            except Exception:
+                pass
+            lines.append("")
         else:
             lines += [
                 "建议阅读顺序：",
@@ -373,6 +427,7 @@ def _write_start_here(
                 "",
             ]
         if render_dashboard_md:
+            lines.append("文件导航（Dashboard 常用）：")
             lines.append(f"- {L('reports/dashboard.html')}：聚焦版（HTML，更好读）")
             lines.append(f"- {L('reports/asin_drilldown.html')}：ASIN Drilldown（HTML）")
             lines.append(f"- {L('reports/category_drilldown.html')}：Category Drilldown（HTML）")
@@ -385,12 +440,17 @@ def _write_start_here(
         lines.append(f"- {L('dashboard/phase_cockpit.csv')}：生命周期总览（按 current_phase 汇总 focus/变化/动作量）")
         lines.append(f"- {L('dashboard/asin_focus.csv')}：ASIN Focus List（按 focus_score 排序，可筛选/分派）")
         lines.append(f"- {L('dashboard/asin_cockpit.csv')}：ASIN 总览（focus + drivers + 动作量汇总，一行一个 ASIN）")
+        lines.append(f"- {L('dashboard/compare_summary.csv')}：店铺环比摘要（7/14/30，销售/利润/花费/自然/转化）")
+        lines.append(f"- {L('dashboard/lifecycle_timeline.csv')}：生命周期时间轴摘要（每 ASIN 一行，供复盘/筛选）")
+        lines.append(f"- {L('dashboard/task_summary.csv')}：任务汇总（本周行动/Shop Alerts/Action Board 汇聚，可筛选复盘）")
         lines.append(f"- {L('dashboard/profit_reduce_watchlist.csv')}：利润控量 Watchlist（profit_direction=reduce 且仍在烧钱：优先止血/收口）")
         lines.append(f"- {L('dashboard/oos_with_ad_spend_watchlist.csv')}：断货仍烧钱 Watchlist（oos_with_ad_spend_days>0 且仍在投放：优先止损）")
         lines.append(f"- {L('dashboard/spend_up_no_sales_watchlist.csv')}：加花费但销量不增 Watchlist（delta_spend>0 且 delta_sales<=0：优先排查）")
         lines.append(f"- {L('dashboard/phase_down_recent_watchlist.csv')}：阶段走弱 Watchlist（近14天阶段走弱 down 且仍在花费：优先排查根因）")
         lines.append(f"- {L('dashboard/scale_opportunity_watchlist.csv')}：机会 Watchlist（可放量窗口/低花费高潜；用于预算迁移/加码）")
         lines.append(f"- {L('dashboard/opportunity_action_board.csv')}：机会→可执行动作（只保留 BID_UP/BUDGET_UP 且未阻断）")
+        lines.append(f"- {L('dashboard/inventory_sigmoid_watchlist.csv')}：库存调速建议（Sigmoid，仅建议，不影响排序）")
+        lines.append(f"- {L('dashboard/profit_guard_watchlist.csv')}：利润护栏 Watchlist（Break-even：安全ACOS/CPC 超线提示）")
         lines.append(f"- {L('dashboard/budget_transfer_plan.csv')}：预算迁移净表（估算金额；执行时以实际预算/花费节奏校准）")
         lines.append(f"- {L('dashboard/unlock_scale_tasks.csv')}：放量解锁任务表（可分工：广告/供应链/运营/美工）")
         lines.append(f"- {L('dashboard/unlock_scale_tasks_full.csv')}：放量解锁任务表全量（含更多任务/优先级，便于追溯）")
@@ -400,8 +460,10 @@ def _write_start_here(
         lines.append(f"- {L('dashboard/keyword_topics_action_hints.csv')}：关键词主题建议清单（Top 浪费→否词/降价；Top 贡献→加精确/提价；含 top_campaigns/top_ad_groups；scale 方向会标注/阻断库存风险）")
         lines.append(f"- {L('dashboard/keyword_topics_asin_context.csv')}：关键词主题→产品语境（只用高置信 term→asin；可看到类目/ASIN/生命周期/库存覆盖）")
         lines.append(f"- {L('dashboard/keyword_topics_category_phase_summary.csv')}：关键词主题→类目/生命周期汇总（先按类目/阶段看主题，再下钻到 ASIN）")
+        lines.append(f"- {L('dashboard/campaign_action_view.csv')}：Campaign 行动聚合（从 Action Board 归并，方便先按 campaign 排查）")
         lines.append(f"- {L('dashboard/action_board.csv')}：动作看板（去重后的运营视图；P0/P1 优先；可按类目/生命周期筛选）")
         lines.append(f"- {L('dashboard/action_board_full.csv')}：动作看板全量（含重复，便于追溯）")
+        lines.append(f"- {L('dashboard/shop_scorecard.json')}：店铺 KPI/诊断（结构化）")
         lines.append(f"- {L('ops/execution_log_template.xlsx')}：L0+ 执行回填模板（手工执行后回填，用于下次复盘）")
         if (shop_dir / "ops" / "action_review.csv").exists():
             lines.append(f"- {L('ops/action_review.csv')}：L0+ 动作复盘（已生成：基于历史 execution_log 复盘 7/14 天效果）")
@@ -649,7 +711,13 @@ def _write_ops_policy_snapshot(
         return
 
 
-def _write_run_start_here(out_dir: Path, shops: List[str], render_dashboard_md: bool, ai_report: bool) -> None:
+def _write_run_start_here(
+    out_dir: Path,
+    shops: List[str],
+    render_dashboard_md: bool,
+    ai_report: bool,
+    ai_report_multiagent: bool,
+) -> None:
     """
     run 级入口：方便你在 output/<run>/ 下快速找到每个店铺的 dashboard 与 AI 输出。
     """
@@ -1558,7 +1626,10 @@ def run(
     ops_log_root: Optional[Path] = None,
     action_review_windows: Optional[List[int]] = None,
     ai_report: bool = False,
+    ai_report_multiagent: bool = False,
     ai_prompt_only: bool = False,
+    ai_dashboard: bool = False,
+    ai_dashboard_multiagent: bool = False,
     ai_prefix: str = "LLM",
     ai_max_asins: int = 40,
     ai_max_actions: int = 200,
@@ -1684,6 +1755,7 @@ def run(
             output_profile=output_profile,
             render_dashboard_md=bool(render_dashboard_md),
             render_full_report=bool(render_report),
+            policy=policy,
         )
 
         def pick(df: pd.DataFrame) -> pd.DataFrame:
@@ -2149,6 +2221,85 @@ def run(
         except Exception:
             action_review_df = pd.DataFrame()
 
+        # ========= AI 输入包 / 数据质量 / AI 建议（可选） =========
+        # 说明：这些文件在 dashboard 渲染前生成，确保 HTML 能读取 AI 结果。
+        try:
+            ai_dir = shop_dir / "ai"
+            ai_dir.mkdir(parents=True, exist_ok=True)
+            ai_bundle = build_ai_input_bundle(
+                shop=shop,
+                stage=stage,
+                date_start=str(shop_ds) if shop_ds else "",
+                date_end=str(shop_de) if shop_de else "",
+                summary_total=bundle.get("summary_total", {}) if isinstance(bundle, dict) else {},
+                product_analysis_summary=bundle.get("product_analysis_summary", {}) if isinstance(bundle, dict) else {},
+                shop_scorecard=(diagnostics.get("shop_scorecard") if isinstance(diagnostics, dict) else {}) or {},
+                lifecycle_board=lifecycle_board_df,
+                lifecycle_windows=lifecycle_windows_df,
+                asin_top_campaigns=asin_top_campaigns_df,
+                asin_top_search_terms=asin_top_search_terms_df,
+                asin_top_targetings=asin_top_targetings_df,
+                asin_top_placements=asin_top_placements_df,
+                asin_limit=120,
+            )
+            (shop_dir / "ai_input_bundle.json").write_text(json_dumps(ai_bundle), encoding="utf-8")
+            (ai_dir / "ai_input_bundle.json").write_text(json_dumps(ai_bundle), encoding="utf-8")
+        except Exception:
+            pass
+
+        # 数据质量/维度覆盖文件（AI 与 dashboard 口径提示）
+        try:
+            ai_dir = shop_dir / "ai"
+            ai_dir.mkdir(parents=True, exist_ok=True)
+            dq = dq_report or build_data_quality_report(
+                shop=shop,
+                st=st,
+                tgt=tgt,
+                camp=camp,
+                plc=pl,
+                ap=ap,
+                pp=pp,
+                product_analysis_shop=pa_shop,
+                product_listing_shop=pl_shop,
+                lifecycle_board=lifecycle_board_df,
+            )
+            write_data_quality_files(ai_dir=ai_dir, report=dq)
+            try:
+                write_report_html_from_md(md_path=ai_dir / "data_quality.md", out_path=ai_dir / "data_quality.html")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # AI Dashboard（双Agent / 多‑agent）
+        try:
+            if bool(ai_dashboard_multiagent):
+                from src.analysis.ai_report import write_ai_dashboard_multiagent_for_shop
+
+                write_ai_dashboard_multiagent_for_shop(
+                    shop_dir=shop_dir,
+                    stage=str(stage or "").strip(),
+                    prefix=str(ai_prefix or "LLM").strip() or "LLM",
+                    max_asins=int(ai_max_asins or 0),
+                    max_actions=int(ai_max_actions or 0),
+                    timeout=int(ai_timeout or 180),
+                    prompt_only=bool(ai_prompt_only),
+                )
+            elif bool(ai_dashboard):
+                from src.analysis.ai_report import write_ai_dashboard_suggestions_for_shop
+
+                write_ai_dashboard_suggestions_for_shop(
+                    shop_dir=shop_dir,
+                    stage=str(stage or "").strip(),
+                    prefix=str(ai_prefix or "LLM").strip() or "LLM",
+                    max_asins=int(ai_max_asins or 0),
+                    max_actions=int(ai_max_actions or 0),
+                    timeout=int(ai_timeout or 180),
+                    prompt_only=bool(ai_prompt_only),
+                )
+        except Exception:
+            pass
+
         # ========= dashboard 聚焦层输出（总是生成，解决“report.md 太长抓不到重点”） =========
         try:
             write_dashboard_outputs(
@@ -2176,79 +2327,34 @@ def run(
         except Exception:
             pass
 
-        # ========= 输出（按档位控制，避免目录过乱） =========
-        # AI 输入包：无论 minimal/full 都生成（这是主文件）
+        # AI 建议报告 / 提示词留档（可选，不影响主流程）
+        # 放在 dashboard 之后：确保 action_board/asin_focus/keyword_topics 等证据表可用
         try:
-            ai_dir = shop_dir / "ai"
-            ai_dir.mkdir(parents=True, exist_ok=True)
-            ai_bundle = build_ai_input_bundle(
-                shop=shop,
-                stage=stage,
-                date_start=str(shop_ds) if shop_ds else "",
-                date_end=str(shop_de) if shop_de else "",
-                summary_total=bundle.get("summary_total", {}) if isinstance(bundle, dict) else {},
-                product_analysis_summary=bundle.get("product_analysis_summary", {}) if isinstance(bundle, dict) else {},
-                shop_scorecard=(diagnostics.get("shop_scorecard") if isinstance(diagnostics, dict) else {}) or {},
-                lifecycle_board=lifecycle_board_df,
-                lifecycle_windows=lifecycle_windows_df,
-                asin_top_campaigns=asin_top_campaigns_df,
-                asin_top_search_terms=asin_top_search_terms_df,
-                asin_top_targetings=asin_top_targetings_df,
-                asin_top_placements=asin_top_placements_df,
-                asin_limit=120,
-            )
-            # 兼容旧路径：根目录也保留一份（便于脚本/工具直接读取）
-            (shop_dir / "ai_input_bundle.json").write_text(json_dumps(ai_bundle), encoding="utf-8")
-            (ai_dir / "ai_input_bundle.json").write_text(json_dumps(ai_bundle), encoding="utf-8")
-        except Exception:
-            pass
+            if bool(ai_report) or bool(ai_report_multiagent) or bool(ai_prompt_only):
+                if bool(ai_report_multiagent):
+                    from src.analysis.ai_report import write_ai_suggestions_multiagent_for_shop
 
-        # 数据质量/维度覆盖：给 AI/分析用（总是生成，不依赖 report.md）
-        try:
-            ai_dir = shop_dir / "ai"
-            ai_dir.mkdir(parents=True, exist_ok=True)
-            dq = dq_report or build_data_quality_report(
-                shop=shop,
-                st=st,
-                tgt=tgt,
-                camp=camp,
-                plc=pl,
-                ap=ap,
-                pp=pp,
-                product_analysis_shop=pa_shop,
-                product_listing_shop=pl_shop,
-                lifecycle_board=lifecycle_board_df,
-            )
-            write_data_quality_files(ai_dir=ai_dir, report=dq)
-            # 展示层：生成 HTML（更好读，不改变口径）
-            try:
-                write_report_html_from_md(md_path=ai_dir / "data_quality.md", out_path=ai_dir / "data_quality.html")
-            except Exception:
-                pass
-        except Exception:
-            pass
+                    write_ai_suggestions_multiagent_for_shop(
+                        shop_dir=shop_dir,
+                        stage=str(stage or "").strip(),
+                        prefix=str(ai_prefix or "LLM").strip() or "LLM",
+                        max_asins=int(ai_max_asins or 0),
+                        max_actions=int(ai_max_actions or 0),
+                        timeout=int(ai_timeout or 180),
+                        prompt_only=bool(ai_prompt_only),
+                    )
+                else:
+                    from src.analysis.ai_report import write_ai_suggestions_for_shop
 
-        # ========= AI 建议报告 / 提示词留档（可选，不影响主流程） =========
-        # 说明：
-        # - 这里默认不开启，避免误耗 token；
-        # - 你启用后，需要配置环境变量（默认前缀 LLM_），例如：
-        #   LLM_PROVIDER=oai_http
-        #   LLM_API_KEY=...
-        #   LLM_MODEL=...
-        try:
-            if bool(ai_report) or bool(ai_prompt_only):
-                from analysis.ai_report import write_ai_suggestions_for_shop
-
-                write_ai_suggestions_for_shop(
-                    shop_dir=shop_dir,
-                    stage=str(stage or "").strip(),
-                    prefix=str(ai_prefix or "LLM").strip() or "LLM",
-                    max_asins=int(ai_max_asins or 0),
-                    max_actions=int(ai_max_actions or 0),
-                    timeout=int(ai_timeout or 180),
-                    prompt_only=bool(ai_prompt_only),
-                )
-                # 展示层：生成 HTML（更好读，不改变口径）
+                    write_ai_suggestions_for_shop(
+                        shop_dir=shop_dir,
+                        stage=str(stage or "").strip(),
+                        prefix=str(ai_prefix or "LLM").strip() or "LLM",
+                        max_asins=int(ai_max_asins or 0),
+                        max_actions=int(ai_max_actions or 0),
+                        timeout=int(ai_timeout or 180),
+                        prompt_only=bool(ai_prompt_only),
+                    )
                 try:
                     ai_dir = shop_dir / "ai"
                     if (ai_dir / "ai_suggestions.md").exists():
@@ -2612,6 +2718,7 @@ def run(
             output_profile=output_profile,
             render_dashboard_md=bool(render_dashboard_md),
             render_full_report=bool(render_report),
+            policy=policy,
         )
 
     # run 级入口（方便你一次性查看所有店铺）
@@ -2621,6 +2728,7 @@ def run(
             shops=shops,
             render_dashboard_md=bool(render_dashboard_md),
             ai_report=bool(ai_report),
+            ai_report_multiagent=bool(ai_report_multiagent),
         )
     except Exception:
         pass

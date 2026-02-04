@@ -17,10 +17,10 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from core.config import StageConfig
-from core.metrics import summarize, to_summary_dict
-from core.schema import CAN
-from core.utils import safe_div
+from src.core.config import StageConfig
+from src.core.metrics import summarize, to_summary_dict
+from src.core.schema import CAN
+from src.core.utils import safe_div
 
 
 def _shop_roll_compare_from_pa(product_analysis_shop: pd.DataFrame, window_days: int) -> Dict[str, object]:

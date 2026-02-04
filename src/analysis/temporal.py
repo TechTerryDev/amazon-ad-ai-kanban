@@ -20,10 +20,10 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from core.metrics import summarize
-from core.risk_scoring import signal_confidence, trend_signal_label
-from core.schema import CAN
-from core.utils import safe_div
+from src.core.metrics import summarize
+from src.core.risk_scoring import signal_confidence, trend_signal_label
+from src.core.schema import CAN
+from src.core.utils import safe_div
 
 
 @dataclass(frozen=True)

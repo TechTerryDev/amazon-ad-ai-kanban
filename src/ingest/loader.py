@@ -19,8 +19,8 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
-from core.schema import BASE_COLUMN_ALIASES, CAN, REPORT_KEYWORDS
-from core.utils import parse_date, to_float, normalize_status
+from src.core.schema import BASE_COLUMN_ALIASES, CAN, REPORT_KEYWORDS
+from src.core.utils import parse_date, to_float, normalize_status
 
 # 赛狐导出的 xlsx 经常触发这个 openpyxl 警告，属于“文件样式缺省”，不影响读取。
 warnings.filterwarnings("ignore", message="Workbook contains no default style, apply openpyxl's default")

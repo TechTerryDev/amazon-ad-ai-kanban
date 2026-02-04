@@ -14,6 +14,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import json
 
+try:
+    from pydantic import ValidationError
+    from src.core.policy_schema import OpsPolicySchema, PYDANTIC_AVAILABLE
+except Exception:  # pragma: no cover - 兼容未安装 pydantic
+    ValidationError = None  # type: ignore[assignment]
+    OpsPolicySchema = None  # type: ignore[assignment]
+    PYDANTIC_AVAILABLE = False  # type: ignore[assignment]
+
 
 @dataclass(frozen=True)
 class ScaleWindowPolicy:
@@ -43,6 +51,10 @@ class ScaleWindowPolicy:
     require_no_oos: bool = True
     require_no_low_inventory: bool = True
     require_oos_with_ad_spend_days_zero: bool = True
+
+    # 品类差异化（可选）
+    category_default: Dict[str, object] = field(default_factory=dict)
+    category_overrides: List[Dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -417,6 +429,9 @@ class OpsPolicy:
     block_scale_when_low_inventory: bool = True
     # 库存覆盖天数阻断：用于“库存不低但速度太快”的场景（0 表示关闭）
     block_scale_when_cover_days_below: float = 7.0
+    # 品类差异化库存阈值（可选）
+    inventory_category_default: Dict[str, object] = field(default_factory=dict)
+    inventory_category_overrides: List[Dict[str, object]] = field(default_factory=list)
 
     # 关键词漏斗
     keyword_funnel_top_n: int = 12
@@ -517,6 +532,12 @@ def load_ops_policy(path: Path) -> OpsPolicy:
             0.0,
             _to_float(inv.get("block_scale_when_cover_days_below"), base.block_scale_when_cover_days_below),
         )
+        inv_cat_default = inv.get("category_default") if isinstance(inv.get("category_default"), dict) else {}
+        inv_cat_overrides_raw = inv.get("category_overrides") if isinstance(inv.get("category_overrides"), list) else []
+        inv_cat_overrides = [x for x in inv_cat_overrides_raw if isinstance(x, dict)]
+        inv_cat_default = inv.get("category_default") if isinstance(inv.get("category_default"), dict) else {}
+        inv_cat_overrides_raw = inv.get("category_overrides") if isinstance(inv.get("category_overrides"), list) else []
+        inv_cat_overrides = [x for x in inv_cat_overrides_raw if isinstance(x, dict)]
 
         top_n = max(1, _to_int(kw.get("top_n"), base.keyword_funnel_top_n))
 
@@ -551,6 +572,9 @@ def load_ops_policy(path: Path) -> OpsPolicy:
         # “可放量窗口”阈值（可配置；没有则用默认）
         sw_base = base.dashboard_scale_window
         sw_data = dash.get("scale_window") if isinstance(dash.get("scale_window"), dict) else {}
+        sw_cat_default = sw_data.get("category_default") if isinstance(sw_data.get("category_default"), dict) else {}
+        sw_cat_overrides_raw = sw_data.get("category_overrides") if isinstance(sw_data.get("category_overrides"), list) else []
+        sw_cat_overrides = [x for x in sw_cat_overrides_raw if isinstance(x, dict)]
         exclude_phases = list(sw_base.exclude_phases)
         if isinstance(sw_data.get("exclude_phases"), list):
             tmp: List[str] = []
@@ -585,6 +609,8 @@ def load_ops_policy(path: Path) -> OpsPolicy:
                 sw_data.get("require_oos_with_ad_spend_days_zero"),
                 sw_base.require_oos_with_ad_spend_days_zero,
             ),
+            category_default=sw_cat_default,
+            category_overrides=sw_cat_overrides,
         )
 
         # ASIN Focus 评分（可配置；没有则用默认）
@@ -1052,6 +1078,8 @@ def load_ops_policy(path: Path) -> OpsPolicy:
             low_inventory_threshold=low_thr,
             block_scale_when_low_inventory=block_scale,
             block_scale_when_cover_days_below=cover_below,
+            inventory_category_default=inv_cat_default,
+            inventory_category_overrides=inv_cat_overrides,
             keyword_funnel_top_n=top_n,
             campaign_windows_days=windows2,
             campaign_min_spend=min_spend,
@@ -1082,7 +1110,7 @@ def validate_ops_policy_path(path: Path) -> List[str]:
 
     目标：
     - 降低调参误配的成本：字段名写错/类型写错/明显越界时给出提示；
-    - 不引入新依赖（先不使用 Pydantic）。
+    - 叠加 Pydantic 类型校验（仅提示，不阻断跑数）。
     """
     try:
         if path is None or (not Path(path).exists()):
@@ -1107,6 +1135,20 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
     """
     warnings: List[str] = []
     base = OpsPolicy()
+
+    # Pydantic 类型校验（补充维度：结构/类型更严格，但不阻断）
+    try:
+        if PYDANTIC_AVAILABLE and OpsPolicySchema is not None:
+            OpsPolicySchema.model_validate(data)
+    except Exception as e:
+        if ValidationError is not None and isinstance(e, ValidationError):
+            for err in e.errors():
+                loc = ".".join([str(x) for x in (err.get("loc") or []) if x is not None])
+                msg = str(err.get("msg") or "类型不匹配")
+                target = loc if loc else "root"
+                warnings.append(f"类型不匹配：`{target}` {msg}")
+        else:
+            warnings.append(f"Pydantic 校验失败：{type(e).__name__}")
 
     def join(prefix: str, key: str) -> str:
         return f"{prefix}.{key}" if prefix else key
@@ -1196,10 +1238,18 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
         warnings.append("类型不匹配：`inventory` 期望为 object/dict；将使用默认策略。")
         inv = {}
     inv = inv if isinstance(inv, dict) else {}
-    warn_unknown_keys(inv, {"low_inventory_threshold", "block_scale_when_low_inventory", "block_scale_when_cover_days_below"}, "inventory")
+    warn_unknown_keys(
+        inv,
+        {"low_inventory_threshold", "block_scale_when_low_inventory", "block_scale_when_cover_days_below", "category_default", "category_overrides"},
+        "inventory",
+    )
     check_int(inv, "low_inventory_threshold", base.low_inventory_threshold, "inventory", min_v=0)
     check_bool(inv, "block_scale_when_low_inventory", base.block_scale_when_low_inventory, "inventory")
     check_float(inv, "block_scale_when_cover_days_below", base.block_scale_when_cover_days_below, "inventory", min_v=0.0)
+    if "category_default" in inv and not isinstance(inv.get("category_default"), dict):
+        warnings.append("类型不匹配：`inventory.category_default` 期望为 object/dict；将忽略该配置。")
+    if "category_overrides" in inv and not isinstance(inv.get("category_overrides"), list):
+        warnings.append("类型不匹配：`inventory.category_overrides` 期望为数组；将忽略该配置。")
 
     # ===== keyword_funnel =====
     kw = data.get("keyword_funnel")
@@ -1272,6 +1322,10 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
     )
     check_float(sw, "max_tacos_roll", base.dashboard_scale_window.max_tacos_roll, "dashboard.scale_window", min_v=0.0)
     check_float(sw, "max_marginal_tacos", base.dashboard_scale_window.max_marginal_tacos, "dashboard.scale_window", min_v=0.0)
+    if "category_default" in sw and not isinstance(sw.get("category_default"), dict):
+        warnings.append("类型不匹配：`dashboard.scale_window.category_default` 期望为 object/dict；将忽略该配置。")
+    if "category_overrides" in sw and not isinstance(sw.get("category_overrides"), list):
+        warnings.append("类型不匹配：`dashboard.scale_window.category_overrides` 期望为数组；将忽略该配置。")
 
     # ===== dashboard.focus_scoring =====
     fs = dash.get("focus_scoring")
@@ -1527,6 +1581,8 @@ def ops_policy_effective_to_dict(policy: OpsPolicy) -> Dict[str, object]:
                 "low_inventory_threshold": int(policy.low_inventory_threshold),
                 "block_scale_when_low_inventory": bool(policy.block_scale_when_low_inventory),
                 "block_scale_when_cover_days_below": float(policy.block_scale_when_cover_days_below),
+                "category_default": dict(policy.inventory_category_default or {}),
+                "category_overrides": list(policy.inventory_category_overrides or []),
             },
             "keyword_funnel": {
                 "top_n": int(policy.keyword_funnel_top_n),
@@ -1810,6 +1866,9 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
         # “可放量窗口”阈值（可配置；没有则用默认）
         sw_base = base.dashboard_scale_window
         sw_data = dash.get("scale_window") if isinstance(dash.get("scale_window"), dict) else {}
+        sw_cat_default = sw_data.get("category_default") if isinstance(sw_data.get("category_default"), dict) else {}
+        sw_cat_overrides_raw = sw_data.get("category_overrides") if isinstance(sw_data.get("category_overrides"), list) else []
+        sw_cat_overrides = [x for x in sw_cat_overrides_raw if isinstance(x, dict)]
         exclude_phases = list(sw_base.exclude_phases)
         if isinstance(sw_data.get("exclude_phases"), list):
             tmp: List[str] = []
@@ -1844,6 +1903,8 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
                 sw_data.get("require_oos_with_ad_spend_days_zero"),
                 sw_base.require_oos_with_ad_spend_days_zero,
             ),
+            category_default=sw_cat_default,
+            category_overrides=sw_cat_overrides,
         )
 
         # ASIN Focus 评分（可配置；没有则用默认）
@@ -2288,6 +2349,8 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
             low_inventory_threshold=low_thr,
             block_scale_when_low_inventory=block_scale,
             block_scale_when_cover_days_below=cover_below,
+            inventory_category_default=inv_cat_default,
+            inventory_category_overrides=inv_cat_overrides,
             keyword_funnel_top_n=top_n,
             campaign_windows_days=windows2,
             campaign_min_spend=min_spend,
