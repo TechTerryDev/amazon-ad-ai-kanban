@@ -713,13 +713,11 @@ a:hover{text-decoration:underline;}
 .btn:active{transform:translateY(1px);}
   .layout{
     display:grid;
-    grid-template-columns:300px 1fr;
+    grid-template-columns:1fr;
     gap:14px;
     align-items:start;
   }
   .layout.single{grid-template-columns:1fr;}
-  .layout.toc-collapsed{grid-template-columns:1fr;}
-  .layout.toc-collapsed .toc{display:none;}
 @media (max-width: 980px){
   .layout{grid-template-columns:1fr;}
 }
@@ -727,7 +725,7 @@ a:hover{text-decoration:underline;}
   background:var(--card);
   border:1px solid var(--border);
   border-radius:var(--radius);
-  padding:18px 16px;
+  padding:16px 14px;
   box-shadow:var(--shadow);
 }
 .page-title-bar{
@@ -758,14 +756,46 @@ a:hover{text-decoration:underline;}
 }
 .shop-filter-hint{color:var(--muted);font-size:12px;}
 .anchor-spacer{height:1px;}
-.toc{
-  position:sticky;
+.toc-rail{
+  position:fixed;
+  right:0;
   top:68px;
+  height:calc(100vh - 84px);
+  width:12px;
+  z-index:39;
+  cursor:pointer;
+  background:linear-gradient(to left, rgba(37,99,235,.10), rgba(37,99,235,0));
+}
+.toc{
+  position:fixed;
+  right:0;
+  top:68px;
+  width:220px;
   max-height:calc(100vh - 84px);
   overflow:auto;
+  transform:translateX(210px);
+  transition:transform .2s ease;
+  z-index:40;
 }
+.toc:hover,
+.toc:focus-within,
+.toc-rail:hover + .toc,
+.toc-rail:focus + .toc,
+body.toc-pinned .toc{
+  transform:translateX(0);
+}
+body.toc-pinned .toc-rail{display:none;}
+.toc .toc-body{font-size:12px;}
+.toc .toc-title{font-size:13px;}
 @media (max-width: 980px){
-  .toc{position:relative;top:auto;max-height:none;}
+  .toc-rail{display:none;}
+  .toc{
+    position:relative;
+    top:auto;
+    width:auto;
+    max-height:none;
+    transform:none;
+  }
 }
 .toc-title{font-weight:700;margin-bottom:8px;}
 .toc-body{display:flex;flex-direction:column;gap:6px;}
@@ -2144,8 +2174,11 @@ function _normalizeAnchorsAndBuildToc(){
     }
   });
 
-  // 2) 生成目录（优先 h2/h3；h1 通常是标题，不放进目录）
-  const hs=Array.from(content.querySelectorAll('h2,h3'));
+  // 2) 生成目录（仅展示大标题：默认取 h2；无 h2 时退回 h3）
+  let hs=Array.from(content.querySelectorAll('h2'));
+  if(hs.length===0){
+    hs=Array.from(content.querySelectorAll('h3'));
+  }
   if(hs.length===0){
     tocCard.style.display='none';
     return;
@@ -2155,7 +2188,7 @@ function _normalizeAnchorsAndBuildToc(){
     const a=document.createElement('a');
     a.href='#'+(h.id||'');
     a.textContent=(h.textContent||'').trim();
-    a.className='toc-item ' + (h.tagName==='H3' ? 'toc-lvl3' : 'toc-lvl2');
+    a.className='toc-item toc-lvl2';
     frag.appendChild(a);
   });
   toc.innerHTML='';
@@ -3454,21 +3487,20 @@ function _safe(fn){
 }
 function _initTocToggle(){
   const btn=_qs('#btnToggleToc');
-  const layout=_qs('.layout');
-  if(!btn || !layout) return;
-  const key='dash_toc_collapsed';
+  if(!btn) return;
+  const key='dash_toc_pinned';
   const apply=(v)=>{
-    if(v){ layout.classList.add('toc-collapsed'); }
-    else{ layout.classList.remove('toc-collapsed'); }
+    if(v){ document.body.classList.add('toc-pinned'); }
+    else{ document.body.classList.remove('toc-pinned'); }
   };
-  try{
-    const saved=localStorage.getItem(key);
-    apply(saved==='1');
-  }catch(e){}
+  const setPinned=(v)=>{
+    apply(v);
+    try{ localStorage.setItem(key, v ? '1' : '0'); }catch(e){}
+  };
+  apply(true);
   btn.addEventListener('click', ()=>{
-    const next=!layout.classList.contains('toc-collapsed');
-    apply(next);
-    try{ localStorage.setItem(key, next ? '1' : '0'); }catch(e){}
+    const next=!document.body.classList.contains('toc-pinned');
+    setPinned(next);
   });
 }
 
@@ -3542,6 +3574,7 @@ window.addEventListener('load', ()=>{
   </div>
   <div class="wrap">
     <div class="layout">
+      <div class="toc-rail" id="tocRail" tabindex="0" title="悬浮显示目录"></div>
       <aside class="card toc" id="tocCard">
         <div class="toc-title">目录</div>
         <div class="toc-body" id="toc"></div>
@@ -12859,20 +12892,6 @@ def write_dashboard_md(
         except Exception:
             lines.append("- （阶段化指标生成失败）")
 
-        # AMC 执行建议（模板对照，不改变现有口径）
-        lines.append("")
-        lines.append('<a id="amc-plan"></a>')
-        lines.append("### AMC 执行建议（模板，对照用）")
-        lines.append("")
-        lines.append("- 说明：不改变现有阶段口径，仅作为执行对照；阶段切换指标见信息图底部快查。")
-        lines.append("- 认知期：优先 SBV + SP_Expand（先铺量）｜人群：搜索未购 / 类目浏览未购 / 相似受众")
-        lines.append("- 考虑期：优先 SP_Core + SD（稳排名与拦截）｜人群：点击未购 / 浏览未购 / 加购未购（中窗）")
-        lines.append("- 转化期：优先 SP_Core + SB（收割）｜人群：加购未购（短窗）/ 高意向")
-        lines.append("- 复购期：优先 SD + SB 防御（利润）｜人群：品牌购买者 / 高价值复购")
-        if amc_info_link:
-            lines.append(f"- 参考信息图：[{amc_info_doc.name}]({amc_info_link})")
-        if amc_plan_link:
-            lines.append(f"- 参考模板：[{amc_plan_doc.name}]({amc_plan_link})")
 
         # 产品侧变化摘要（自然/流量）
         lines.append("")
