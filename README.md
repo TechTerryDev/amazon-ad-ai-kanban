@@ -41,6 +41,9 @@ python main.py
 ### 4) 查看结果
 - 入口文件：`data/output/<时间戳>/START_HERE.html`
 - 每店铺聚焦版：`data/output/<时间戳>/<shop>/reports/dashboard.html`
+- 多店铺 Owner 轻量总览：`data/output/<时间戳>/OWNER_OVERVIEW.csv`
+- 店铺环比（含促销/季节性校正列）：`data/output/<时间戳>/<shop>/dashboard/compare_summary.csv`
+- 已回填执行日志时，会额外输出：`data/output/<时间戳>/<shop>/ops/action_review_summary.csv`
 
 ---
 
@@ -114,6 +117,7 @@ python main.py --input-dir data/input --out-dir data/output --ai-prompt-only
 ## 配置说明
 - 运营策略：`config/ops_policy.json`
 - 总选项档位：`config/ops_profile.json`（建议日常只改这里）
+- 生命周期参数：`src/lifecycle/lifecycle_config.json`（支持 `category_default/category_overrides` 做类目阈值覆盖）
 
 ---
 

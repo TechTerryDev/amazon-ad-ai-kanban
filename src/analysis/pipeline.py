@@ -467,6 +467,8 @@ def _write_start_here(
         lines.append(f"- {L('ops/execution_log_template.xlsx')}：L0+ 执行回填模板（手工执行后回填，用于下次复盘）")
         if (shop_dir / "ops" / "action_review.csv").exists():
             lines.append(f"- {L('ops/action_review.csv')}：L0+ 动作复盘（已生成：基于历史 execution_log 复盘 7/14 天效果）")
+            if (shop_dir / "ops" / "action_review_summary.csv").exists():
+                lines.append(f"- {L('ops/action_review_summary.csv')}：L0+ 动作闭环评分汇总（按窗口/动作类型统计 positive_rate 与平均分）")
         else:
             lines.append("- （可选）`ops/action_review.csv`：L0+ 动作复盘（需要你提供已回填的 execution_log，并运行时指定 `--ops-log-root <目录>`）")
         if render_full_report:
@@ -750,6 +752,7 @@ def _write_run_start_here(
             "- [配置校验](#policy)",
             "- [轻量汇总](#summary)",
             "- [Owner 汇总](OWNER_OVERVIEW.html)",
+            "- [Owner 轻量表](OWNER_OVERVIEW.csv)",
             "",
             '<a id="shops"></a>',
             "## 店铺列表（快速入口）",
@@ -1235,9 +1238,14 @@ def _write_run_start_here(
                     "ad_spend_recent_7d": c7.get("ad_spend_recent") if isinstance(c7, dict) else "",
                     "tacos_recent_7d": c7.get("tacos_recent") if isinstance(c7, dict) else "",
                     "delta_sales_7d": c7.get("delta_sales") if isinstance(c7, dict) else "",
+                    "delta_sales_7d_corrected": c7.get("delta_sales_corrected") if isinstance(c7, dict) else "",
                     "delta_ad_spend_7d": c7.get("delta_ad_spend") if isinstance(c7, dict) else "",
+                    "delta_ad_spend_7d_corrected": c7.get("delta_ad_spend_corrected") if isinstance(c7, dict) else "",
                     "delta_profit_7d": c7.get("delta_profit") if isinstance(c7, dict) else "",
+                    "delta_profit_7d_corrected": c7.get("delta_profit_corrected") if isinstance(c7, dict) else "",
                     "marginal_tacos_7d": c7.get("marginal_tacos") if isinstance(c7, dict) else "",
+                    "marginal_tacos_7d_corrected": c7.get("marginal_tacos_corrected") if isinstance(c7, dict) else "",
+                    "promo_adjusted_7d": c7.get("promo_or_seasonality_adjusted") if isinstance(c7, dict) else "",
                 }
             )
 
@@ -1324,9 +1332,14 @@ def _write_run_start_here(
                 "ad_spend_recent_7d",
                 "tacos_recent_7d",
                 "delta_sales_7d",
+                "delta_sales_7d_corrected",
                 "delta_ad_spend_7d",
+                "delta_ad_spend_7d_corrected",
                 "delta_profit_7d",
+                "delta_profit_7d_corrected",
                 "marginal_tacos_7d",
+                "marginal_tacos_7d_corrected",
+                "promo_adjusted_7d",
             ]
             lines.append("| " + " | ".join(headers) + " |")
             lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
@@ -1421,6 +1434,49 @@ def _write_owner_overview(out_dir: Path, shops: List[str]) -> None:
             "说明：只做“入口级聚合”，便于负责人快速定位重点；口径来源保持与各店铺 Dashboard 一致。",
             "",
         ]
+
+        # 轻量 CSV：便于 owner 在 Excel/BI 里快速筛选多店铺优先级
+        try:
+            overview_rows: List[Dict[str, object]] = []
+            for s in shops:
+                shop = str(s or "").strip()
+                if not shop:
+                    continue
+                sc = _read_json(out_dir / shop / "dashboard" / "shop_scorecard.json")
+                scorecard = sc.get("scorecard") if isinstance(sc.get("scorecard"), dict) else {}
+                biz = scorecard.get("biz_kpi") if isinstance(scorecard.get("biz_kpi"), dict) else {}
+                actions = scorecard.get("actions") if isinstance(scorecard.get("actions"), dict) else {}
+                watchlists = scorecard.get("watchlists") if isinstance(scorecard.get("watchlists"), dict) else {}
+                compares = scorecard.get("compares") if isinstance(scorecard.get("compares"), list) else []
+                c7 = {}
+                for c in compares:
+                    if isinstance(c, dict) and int(c.get("window_days") or 0) == 7:
+                        c7 = c
+                        break
+                overview_rows.append(
+                    {
+                        "shop": shop,
+                        "sales_total": biz.get("sales_total", 0),
+                        "profit_total": biz.get("profit_total", 0),
+                        "ad_spend_total": biz.get("ad_spend_total", 0),
+                        "tacos_total": biz.get("tacos_total", 0),
+                        "actions_total": actions.get("total", 0),
+                        "actions_p0": actions.get("p0_count", 0),
+                        "actions_blocked": actions.get("blocked_count", 0),
+                        "watch_profit_reduce": watchlists.get("profit_reduce_count", 0),
+                        "watch_oos_spend": watchlists.get("oos_with_ad_spend_count", 0),
+                        "watch_spend_up_no_sales": watchlists.get("spend_up_no_sales_count", 0),
+                        "watch_phase_down_recent": watchlists.get("phase_down_recent_count", 0),
+                        "watch_scale_opportunity": watchlists.get("scale_opportunity_count", 0),
+                        "delta_sales_7d": c7.get("delta_sales", 0),
+                        "delta_ad_spend_7d": c7.get("delta_ad_spend", 0),
+                        "delta_profit_7d": c7.get("delta_profit", 0),
+                        "promo_adjusted_7d": c7.get("promo_or_seasonality_adjusted", False),
+                    }
+                )
+            pd.DataFrame(overview_rows).to_csv(out_dir / "OWNER_OVERVIEW.csv", index=False, encoding="utf-8-sig")
+        except Exception:
+            pass
 
         # ===== 1) Top 风险 =====
         risk_sources = [

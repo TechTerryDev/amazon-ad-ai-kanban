@@ -17,7 +17,7 @@ ASIN 生命周期识别（面向运营的“动态周期”方法，不是硬阈
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -47,6 +47,9 @@ class LifecycleConfig:
     decline_ratio: float = 0.65
     # 库存阈值（用于 flag）
     low_inventory: int = 20
+    # 品类差异化阈值（可选）：支持按 category/match 覆盖上述生命周期参数
+    category_default: Dict[str, object] = field(default_factory=dict)
+    category_overrides: List[Dict[str, object]] = field(default_factory=list)
 
 
 _PHASE_TREND_RANK: Dict[str, int] = {
@@ -101,6 +104,86 @@ def _to_date(x: object) -> Optional[dt.date]:
         return dt.date.fromisoformat(s) if s else None
     except Exception:
         return None
+
+
+def _norm_category(v: object) -> str:
+    try:
+        s = str(v or "").strip()
+        if not s or s.lower() == "nan":
+            return ""
+        return s
+    except Exception:
+        return ""
+
+
+def _pick_category_override(category: str, cfg: LifecycleConfig) -> Dict[str, object]:
+    base = dict(getattr(cfg, "category_default", {}) or {})
+    cat = _norm_category(category).lower()
+    overrides = getattr(cfg, "category_overrides", []) or []
+    if not isinstance(overrides, list):
+        return base
+    for rule in overrides:
+        if not isinstance(rule, dict):
+            continue
+        exact = _norm_category(rule.get("category")).lower()
+        if exact and cat and exact == cat:
+            out = dict(base)
+            out.update(rule)
+            return out
+        match = rule.get("match") if isinstance(rule.get("match"), list) else []
+        if cat and isinstance(match, list):
+            for kw in match:
+                k = _norm_category(kw).lower()
+                if k and k in cat:
+                    out = dict(base)
+                    out.update(rule)
+                    return out
+    return base
+
+
+def _resolve_lifecycle_cfg_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> LifecycleConfig:
+    """
+    基于商品分类为当前 ASIN 解析生命周期阈值覆盖。
+    """
+    if ts is None or ts.empty:
+        return cfg
+    cat_col = None
+    for c in ("商品分类", "product_category"):
+        if c in ts.columns:
+            cat_col = c
+            break
+    if not cat_col:
+        return cfg
+
+    try:
+        vals = ts[cat_col].dropna().astype(str).tolist()
+    except Exception:
+        vals = []
+    vals = [_norm_category(x) for x in vals]
+    vals = [x for x in vals if x]
+    if not vals:
+        return cfg
+
+    category = pd.Series(vals).value_counts(dropna=False).index[0] if vals else ""
+    override = _pick_category_override(str(category), cfg)
+    if not override:
+        return cfg
+
+    base = asdict(cfg)
+    allowed = set(base.keys())
+    changed = False
+    for k, v in override.items():
+        if k in {"name", "category", "match", "keywords"}:
+            continue
+        if k in allowed:
+            base[k] = v
+            changed = True
+    if not changed:
+        return cfg
+    try:
+        return LifecycleConfig(**base)  # type: ignore[arg-type]
+    except Exception:
+        return cfg
 
 
 def _first_date_where(df: pd.DataFrame, mask: pd.Series) -> Optional[dt.date]:
@@ -492,6 +575,7 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
     if ts is None or ts.empty or CAN.date not in ts.columns:
         return pd.DataFrame()
 
+    cfg_eff = _resolve_lifecycle_cfg_for_asin(ts, cfg)
     ts = _coerce_cols(ts)
     ts = ts.sort_values(CAN.date).copy()
     dmin = ts[CAN.date].min()
@@ -512,17 +596,17 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
     active = _active_flag(ts)
     ts["active"] = active.astype(int)
     # 周期切分优先按库存（断货->到货），缺库存列时再回退到 active（历史兼容）
-    inv_cycle = _assign_cycle_id_by_inventory(ts, cfg)
+    inv_cycle = _assign_cycle_id_by_inventory(ts, cfg_eff)
     if inv_cycle is not None:
         ts["cycle_id"] = inv_cycle.astype(int)
     else:
-        ts["cycle_id"] = _assign_cycle_id(active, cfg).astype(int)
+        ts["cycle_id"] = _assign_cycle_id(active, cfg_eff).astype(int)
 
     # rolling 指标（用于动态阶段判断）
-    ts["sales_roll"] = _rolling(ts["销售额"], cfg.roll_days)
-    ts["sessions_roll"] = _rolling(ts["Sessions"], cfg.roll_days)
-    ts["ad_spend_roll"] = _rolling(ts["广告花费"], cfg.roll_days)
-    ts["profit_roll"] = _rolling(ts["毛利润"], cfg.roll_days)
+    ts["sales_roll"] = _rolling(ts["销售额"], cfg_eff.roll_days)
+    ts["sessions_roll"] = _rolling(ts["Sessions"], cfg_eff.roll_days)
+    ts["ad_spend_roll"] = _rolling(ts["广告花费"], cfg_eff.roll_days)
+    ts["profit_roll"] = _rolling(ts["毛利润"], cfg_eff.roll_days)
 
     ts["tacos_roll"] = ts.apply(lambda r: safe_div(r["广告花费"], r["销售额"]) if r["销售额"] > 0 else 0.0, axis=1)
     ts["cvr_roll"] = ts.apply(lambda r: safe_div(r["订单量"], r["Sessions"]) if r["Sessions"] > 0 else 0.0, axis=1)
@@ -586,32 +670,32 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
 
                     # 成熟期门槛（避免新品/低体量误判）
                     mature_gate = True
-                    min_days = int(cfg.min_mature_days or 0)
+                    min_days = int(cfg_eff.min_mature_days or 0)
                     if min_days > 0 and days_since_first_sale < min_days:
                         mature_gate = False
                     if min_days > 0 and isinstance(first_stock_date, dt.date) and days_since_first_stock < min_days:
                         mature_gate = False
-                    min_orders = float(cfg.min_mature_orders or 0.0)
+                    min_orders = float(cfg_eff.min_mature_orders or 0.0)
                     if min_orders > 0 and cum_orders < min_orders:
                         mature_gate = False
-                    min_sales = float(cfg.min_mature_sales or 0.0)
+                    min_sales = float(cfg_eff.min_mature_sales or 0.0)
                     if min_sales > 0 and cum_sales < min_sales:
                         mature_gate = False
-                    min_peak = float(cfg.min_peak_sales_roll or 0.0)
+                    min_peak = float(cfg_eff.min_peak_sales_roll or 0.0)
                     if min_peak > 0 and peak < min_peak:
                         mature_gate = False
 
                     # launch：刚开始出单的一段时间（默认 14 天，可配置）
-                    if days_since_first_sale <= int(cfg.launch_days or 14) and ratio < cfg.mature_ratio:
+                    if days_since_first_sale <= int(cfg_eff.launch_days or 14) and ratio < cfg_eff.mature_ratio:
                         phase = "launch"
                     # growth：销售在爬坡（斜率为正），且未到成熟段
-                    elif ratio < cfg.mature_ratio and slope >= 0:
+                    elif ratio < cfg_eff.mature_ratio and slope >= 0:
                         phase = "growth"
                     # mature：接近峰值且变化不大
-                    elif ratio >= cfg.mature_ratio and abs(slope) < max(1e-6, peak * 0.02) and mature_gate:
+                    elif ratio >= cfg_eff.mature_ratio and abs(slope) < max(1e-6, peak * 0.02) and mature_gate:
                         phase = "mature"
                     # decline：明显低于峰值且斜率为负
-                    elif ratio <= cfg.decline_ratio and slope < 0:
+                    elif ratio <= cfg_eff.decline_ratio and slope < 0:
                         phase = "decline"
                     else:
                         phase = "stable"
@@ -621,7 +705,7 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
     ts["lifecycle_phase"] = phases
 
     # flags：库存/断货风险（不改 phase，只做标记）
-    ts["flag_low_inventory"] = ((ts["FBA可售"] > 0) & (ts["FBA可售"] <= cfg.low_inventory)).astype(int)
+    ts["flag_low_inventory"] = ((ts["FBA可售"] > 0) & (ts["FBA可售"] <= cfg_eff.low_inventory)).astype(int)
     # 断货判定标准：只看库存（FBA可售==0）
     ts["flag_oos"] = (ts["FBA可售"] == 0).astype(int)
     # 断货异常：断货但仍有 Sessions/仍有广告花费（用于排查变体/配送设置/广告异常等）

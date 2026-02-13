@@ -25,6 +25,88 @@ from src.core.schema import CAN
 from src.core.utils import parse_date, safe_div
 
 
+def _clip(v: float, low: float, high: float) -> float:
+    try:
+        return max(float(low), min(float(high), float(v)))
+    except Exception:
+        return float(low)
+
+
+def _safe_ratio(numerator: object, denominator: object, default: float = 0.0) -> float:
+    try:
+        den = float(denominator)
+        if abs(den) <= 1e-9:
+            return float(default)
+        return float(numerator) / den
+    except Exception:
+        return float(default)
+
+
+def _action_goal(action_type: object) -> str:
+    act = _safe_str(action_type).upper()
+    if act in {"NEGATE", "BID_DOWN", "BUDGET_DOWN"}:
+        return "efficiency"
+    if act in {"BID_UP", "BUDGET_UP"}:
+        return "scale"
+    return "review"
+
+
+def _score_action_loop(row: Dict[str, object]) -> Tuple[float, str, str]:
+    """
+    为单条复盘记录生成动作闭环评分（0~100）。
+
+    评分目标：
+    - efficiency：控花费/降ACOS，同时尽量不伤销量
+    - scale：销量/订单增长优先，同时关注效率
+    - review：中性动作，综合观察销量与效率
+    """
+    status = _safe_str(row.get("status")).lower()
+    if status != "ok":
+        return (0.0, "unknown", _action_goal(row.get("action_type")))
+
+    goal = _action_goal(row.get("action_type"))
+    before_spend = float(pd.to_numeric(row.get("before_spend"), errors="coerce") or 0.0)
+    before_sales = float(pd.to_numeric(row.get("before_sales"), errors="coerce") or 0.0)
+    before_orders = float(pd.to_numeric(row.get("before_orders"), errors="coerce") or 0.0)
+    before_acos = float(pd.to_numeric(row.get("before_acos"), errors="coerce") or 0.0)
+    delta_spend = float(pd.to_numeric(row.get("delta_spend"), errors="coerce") or 0.0)
+    delta_sales = float(pd.to_numeric(row.get("delta_sales"), errors="coerce") or 0.0)
+    delta_orders = float(pd.to_numeric(row.get("delta_orders"), errors="coerce") or 0.0)
+    delta_acos = float(pd.to_numeric(row.get("delta_acos"), errors="coerce") or 0.0)
+
+    spend_ratio = _clip(_safe_ratio(delta_spend, max(abs(before_spend), 1.0), 0.0), -1.0, 1.0)
+    sales_ratio = _clip(_safe_ratio(delta_sales, max(abs(before_sales), 1.0), 0.0), -1.0, 1.0)
+    orders_ratio = _clip(_safe_ratio(delta_orders, max(abs(before_orders), 1.0), 0.0), -1.0, 1.0)
+    # ACOS 下降是正向：delta_acos<0 -> positive
+    acos_improve = _clip(-_safe_ratio(delta_acos, max(abs(before_acos), 0.05), 0.0), -1.0, 1.0)
+
+    score = 50.0
+    if goal == "efficiency":
+        score += (-spend_ratio) * 25.0
+        score += acos_improve * 25.0
+        score += sales_ratio * 10.0
+        score += orders_ratio * 10.0
+    elif goal == "scale":
+        score += sales_ratio * 30.0
+        score += orders_ratio * 20.0
+        score += acos_improve * 15.0
+        score += (-spend_ratio) * 5.0
+    else:
+        score += sales_ratio * 20.0
+        score += orders_ratio * 15.0
+        score += acos_improve * 20.0
+        score += (-spend_ratio) * 5.0
+
+    score = round(_clip(score, 0.0, 100.0), 2)
+    if score >= 70.0:
+        label = "positive"
+    elif score <= 40.0:
+        label = "negative"
+    else:
+        label = "neutral"
+    return (score, label, goal)
+
+
 def _safe_str(x: object) -> str:
     try:
         if x is None:
@@ -431,7 +513,98 @@ def build_action_review(
 
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    try:
+        scores = out.apply(lambda r: _score_action_loop(r.to_dict()), axis=1)
+        out["action_loop_score"] = scores.map(lambda x: float(x[0]) if isinstance(x, tuple) else 0.0)
+        out["action_loop_label"] = scores.map(lambda x: str(x[1]) if isinstance(x, tuple) else "unknown")
+        out["action_goal"] = scores.map(lambda x: str(x[2]) if isinstance(x, tuple) else "")
+    except Exception:
+        out["action_loop_score"] = 0.0
+        out["action_loop_label"] = "unknown"
+        out["action_goal"] = out.get("action_type", "").map(_action_goal) if "action_type" in out.columns else ""
+    return out
+
+
+def build_action_review_summary(action_review: pd.DataFrame) -> pd.DataFrame:
+    """
+    动作闭环汇总：按 window_days + action_type 聚合表现。
+    """
+    columns = [
+        "window_days",
+        "action_type",
+        "action_goal",
+        "actions_count",
+        "ok_count",
+        "positive_count",
+        "neutral_count",
+        "negative_count",
+        "positive_rate",
+        "avg_action_loop_score",
+        "median_delta_sales",
+        "median_delta_spend",
+        "median_delta_acos",
+    ]
+    if action_review is None or action_review.empty:
+        return pd.DataFrame(columns=columns)
+
+    try:
+        df = action_review.copy()
+        if "window_days" not in df.columns:
+            return pd.DataFrame(columns=columns)
+        if "action_type" not in df.columns:
+            return pd.DataFrame(columns=columns)
+        if "status" not in df.columns:
+            df["status"] = ""
+        if "action_goal" not in df.columns:
+            df["action_goal"] = df["action_type"].map(_action_goal)
+        if "action_loop_score" not in df.columns:
+            df["action_loop_score"] = 0.0
+        if "action_loop_label" not in df.columns:
+            df["action_loop_label"] = "unknown"
+        for c in ("delta_sales", "delta_spend", "delta_acos", "action_loop_score"):
+            df[c] = pd.to_numeric(df.get(c, 0.0), errors="coerce").fillna(0.0)
+        df["window_days"] = pd.to_numeric(df["window_days"], errors="coerce").fillna(0).astype(int)
+        df["action_type"] = df["action_type"].astype(str).fillna("").str.strip()
+        df["action_goal"] = df["action_goal"].astype(str).fillna("").str.strip()
+        df["status"] = df["status"].astype(str).fillna("").str.strip().str.lower()
+        df["action_loop_label"] = df["action_loop_label"].astype(str).fillna("").str.strip().str.lower()
+        df = df[(df["window_days"] > 0) & (df["action_type"] != "")]
+        if df.empty:
+            return pd.DataFrame(columns=columns)
+
+        grouped_rows: List[Dict[str, object]] = []
+        for (wd, act, goal), g in df.groupby(["window_days", "action_type", "action_goal"], dropna=False):
+            actions_count = int(len(g))
+            ok = g[g["status"] == "ok"].copy()
+            ok_count = int(len(ok))
+            pos_count = int((ok["action_loop_label"] == "positive").sum()) if ok_count > 0 else 0
+            neu_count = int((ok["action_loop_label"] == "neutral").sum()) if ok_count > 0 else 0
+            neg_count = int((ok["action_loop_label"] == "negative").sum()) if ok_count > 0 else 0
+            grouped_rows.append(
+                {
+                    "window_days": int(wd),
+                    "action_type": str(act),
+                    "action_goal": str(goal),
+                    "actions_count": actions_count,
+                    "ok_count": ok_count,
+                    "positive_count": pos_count,
+                    "neutral_count": neu_count,
+                    "negative_count": neg_count,
+                    "positive_rate": round(safe_div(pos_count, ok_count) if ok_count > 0 else 0.0, 4),
+                    "avg_action_loop_score": round(float(ok["action_loop_score"].mean()) if ok_count > 0 else 0.0, 2),
+                    "median_delta_sales": round(float(ok["delta_sales"].median()) if ok_count > 0 else 0.0, 2),
+                    "median_delta_spend": round(float(ok["delta_spend"].median()) if ok_count > 0 else 0.0, 2),
+                    "median_delta_acos": round(float(ok["delta_acos"].median()) if ok_count > 0 else 0.0, 4),
+                }
+            )
+        out = pd.DataFrame(grouped_rows)
+        if out.empty:
+            return pd.DataFrame(columns=columns)
+        out = out.sort_values(["window_days", "positive_rate", "avg_action_loop_score"], ascending=[True, False, False])
+        return out.reindex(columns=columns)
+    except Exception:
+        return pd.DataFrame(columns=columns)
 
 
 def write_action_review(
@@ -451,10 +624,13 @@ def write_action_review(
         ops_dir.mkdir(parents=True, exist_ok=True)
         review = build_action_review(execution_log, st=st, tgt=tgt, camp=camp, pl=pl, windows_days=windows_days)
         out_path = ops_dir / "action_review.csv"
+        summary_path = ops_dir / "action_review_summary.csv"
         if review is None or review.empty:
             pd.DataFrame(columns=["action_key", "status"]).to_csv(out_path, index=False, encoding="utf-8-sig")
+            build_action_review_summary(pd.DataFrame()).to_csv(summary_path, index=False, encoding="utf-8-sig")
         else:
             review.to_csv(out_path, index=False, encoding="utf-8-sig")
+            build_action_review_summary(review).to_csv(summary_path, index=False, encoding="utf-8-sig")
         return out_path
     except Exception:
         return None

@@ -3871,6 +3871,14 @@ def build_compare_summary_table(scorecard: Dict[str, object]) -> pd.DataFrame:
         "ad_acos_prev",
         "delta_ad_acos",
         "marginal_tacos",
+        "delta_sales_corrected",
+        "delta_ad_spend_corrected",
+        "delta_profit_corrected",
+        "marginal_tacos_corrected",
+        "promo_days_prev",
+        "promo_days_recent",
+        "promo_or_seasonality_adjusted",
+        "promo_or_seasonality_note",
     ]
 
     def _num(x: object, nd: int = 2) -> float:
@@ -3953,6 +3961,14 @@ def build_compare_summary_table(scorecard: Dict[str, object]) -> pd.DataFrame:
                 if "delta_ad_acos" in c
                 else _num_ratio(c.get("ad_acos_recent", 0.0)) - _num_ratio(c.get("ad_acos_prev", 0.0)),
                 "marginal_tacos": _num_ratio(c.get("marginal_tacos", 0.0)),
+                "delta_sales_corrected": _num(c.get("delta_sales_corrected", 0.0)),
+                "delta_ad_spend_corrected": _num(c.get("delta_ad_spend_corrected", 0.0)),
+                "delta_profit_corrected": _num(c.get("delta_profit_corrected", 0.0)),
+                "marginal_tacos_corrected": _num_ratio(c.get("marginal_tacos_corrected", 0.0)),
+                "promo_days_prev": _num(c.get("promo_days_prev", 0.0), nd=0),
+                "promo_days_recent": _num(c.get("promo_days_recent", 0.0), nd=0),
+                "promo_or_seasonality_adjusted": bool(c.get("promo_or_seasonality_adjusted", False)),
+                "promo_or_seasonality_note": str(c.get("promo_or_seasonality_note", "") or ""),
             }
             out_rows.append(row)
         if not out_rows:
@@ -13225,7 +13241,13 @@ def write_dashboard_md(
 
                 lines.append("")
                 lines.append('<a id="review"></a>')
-                lines.append("### L0+ 执行复盘（按类目 Top3 + 异常） - [打开复盘表](../ops/action_review.csv)")
+                review_links = ["[打开复盘表](../ops/action_review.csv)"]
+                try:
+                    if out_path is not None and (Path(out_path).parent.parent / "ops" / "action_review_summary.csv").exists():
+                        review_links.append("[闭环评分汇总](../ops/action_review_summary.csv)")
+                except Exception:
+                    pass
+                lines.append(f"### L0+ 执行复盘（按类目 Top3 + 异常） - {' | '.join(review_links)}")
                 lines.append("")
                 lines.append("- 说明：按商品分类聚合；每类展示 Top3 复盘动作 + 1 条异常。")
 
@@ -13290,22 +13312,33 @@ def write_dashboard_md(
                         continue
                     ok = sub[sub["status"] == "ok"].copy()
                     if not ok.empty:
-                        try:
-                            ok["score"] = ok.apply(
-                                lambda r: float(r.get("delta_sales", 0.0))
-                                - max(float(r.get("delta_spend", 0.0)), 0.0) * 0.5
-                                + (0.0 if float(r.get("delta_acos", 0.0)) >= 0 else abs(float(r.get("delta_acos", 0.0))) * 100.0),
-                                axis=1,
-                            )
-                            ok = ok.sort_values(["score"], ascending=[False])
-                        except Exception:
-                            ok = ok.sort_values(["delta_sales"], ascending=[False])
+                        if "action_loop_score" in ok.columns:
+                            try:
+                                ok["action_loop_score"] = pd.to_numeric(ok.get("action_loop_score"), errors="coerce").fillna(0.0)
+                                ok = ok.sort_values(["action_loop_score", "delta_sales"], ascending=[False, False])
+                            except Exception:
+                                ok = ok.sort_values(["delta_sales"], ascending=[False])
+                        else:
+                            try:
+                                ok["score"] = ok.apply(
+                                    lambda r: float(r.get("delta_sales", 0.0))
+                                    - max(float(r.get("delta_spend", 0.0)), 0.0) * 0.5
+                                    + (0.0 if float(r.get("delta_acos", 0.0)) >= 0 else abs(float(r.get("delta_acos", 0.0))) * 100.0),
+                                    axis=1,
+                                )
+                                ok = ok.sort_values(["score"], ascending=[False])
+                            except Exception:
+                                ok = ok.sort_values(["delta_sales"], ascending=[False])
                         top = ok.head(3).copy()
                         top["delta_sales"] = top["delta_sales"].map(lambda x: _fmt_signed_usd(x))
                         top["delta_spend"] = top["delta_spend"].map(lambda x: _fmt_signed_usd(x))
                         top["delta_acos"] = top["delta_acos"].map(
                             lambda x: (f"{float(x):+.4f}".rstrip("0").rstrip(".") if x != 0 else "0")
                         )
+                        if "action_loop_score" in top.columns:
+                            top["action_loop_score"] = pd.to_numeric(top.get("action_loop_score"), errors="coerce").fillna(0.0).round(1)
+                        if "action_loop_label" in top.columns:
+                            top["action_loop_label"] = top["action_loop_label"].astype(str).fillna("").str.strip()
                     else:
                         top = pd.DataFrame()
 
@@ -13317,7 +13350,7 @@ def write_dashboard_md(
                         lines.append(
                             _df_to_md_table(
                                 top,
-                                [c for c in ["action_brief", "delta_sales", "delta_spend", "delta_acos"] if c in top.columns],
+                                [c for c in ["action_brief", "action_loop_score", "action_loop_label", "delta_sales", "delta_spend", "delta_acos"] if c in top.columns],
                             )
                         )
 
