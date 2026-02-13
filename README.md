@@ -44,6 +44,7 @@ python main.py
 - 多店铺 Owner 轻量总览：`data/output/<时间戳>/OWNER_OVERVIEW.csv`
 - 多店铺 Owner 排序总览（含统一优先级分）：`data/output/<时间戳>/OWNER_OVERVIEW.md` / `.html`
 - 店铺环比（含促销/季节性校正列）：`data/output/<时间戳>/<shop>/dashboard/compare_summary.csv`
+- 广告位预算平移建议：`data/output/<时间戳>/<shop>/dashboard/placement_rebalance_plan.csv`
 - 已回填执行日志时，会额外输出：`data/output/<时间戳>/<shop>/ops/action_review_summary.csv`
 
 ---
@@ -149,6 +150,10 @@ python main.py --input-dir data/input --out-dir data/output --ai-prompt-only
 - `dashboard.action_scoring.weight_action_loop_score`：闭环分权重（越高越偏向历史高分动作）
 - `dashboard.action_scoring.action_loop_min_support`：动作闭环最低样本数
 - `dashboard.action_scoring.action_loop_recent_window_days`：闭环统计回看天数
+
+### 广告执行优先级（本次增强）
+- `dashboard/keyword_topics_action_hints.csv` 新增 `hint_priority_score / owner / risk_level`，便于你按“收益-风险”排序处理主题动作。
+- `dashboard/placement_rebalance_plan.csv` 提供广告位预算 from→to 建议（优先同 Campaign 平移；无承接位时回收到 `RESERVE`）。
 
 ---
 

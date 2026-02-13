@@ -452,6 +452,7 @@ def _write_start_here(
         lines.append(f"- {L('dashboard/inventory_sigmoid_watchlist.csv')}：库存调速建议（Sigmoid，仅建议，不影响排序）")
         lines.append(f"- {L('dashboard/profit_guard_watchlist.csv')}：利润护栏 Watchlist（Break-even：安全ACOS/CPC 超线提示）")
         lines.append(f"- {L('dashboard/budget_transfer_plan.csv')}：预算迁移净表（估算金额；执行时以实际预算/花费节奏校准）")
+        lines.append(f"- {L('dashboard/placement_rebalance_plan.csv')}：广告位预算平移建议（同 Campaign 内 from→to；无承接时回收到 RESERVE）")
         lines.append(f"- {L('dashboard/unlock_scale_tasks.csv')}：放量解锁任务表（可分工：广告/供应链/运营/美工）")
         lines.append(f"- {L('dashboard/unlock_scale_tasks_full.csv')}：放量解锁任务表全量（含更多任务/优先级，便于追溯）")
         lines.append(f"- {L('dashboard/drivers_top_asins.csv')}：变化来源（近7天 vs 前7天 Top ASIN）")

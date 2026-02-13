@@ -47,7 +47,7 @@ from src.core.risk_scoring import (
     risk_level,
 )
 from src.core.schema import CAN
-from src.core.utils import json_dumps
+from src.core.utils import json_dumps, safe_div
 from src.dashboard.keyword_topics import (
     annotate_keyword_topic_action_hints,
     build_keyword_topic_action_hints,
@@ -7240,6 +7240,175 @@ def build_profit_guard_watchlist(
         return pd.DataFrame()
 
 
+def build_placement_rebalance_plan(
+    action_board_dedup_all: Optional[pd.DataFrame],
+    stage: str,
+    max_rows: int = 200,
+) -> pd.DataFrame:
+    """
+    基于 placement 层动作生成预算重分配建议（同 campaign 内优先平移）。
+    """
+    cols = [
+        "priority",
+        "transfer_type",
+        "ad_type",
+        "campaign",
+        "from_placement",
+        "to_placement",
+        "amount_usd_estimated",
+        "shift_ratio",
+        "from_spend",
+        "from_acos",
+        "to_spend",
+        "to_acos",
+        "from_action_priority_score",
+        "to_action_priority_score",
+        "reason",
+        "playbook_scene",
+        "playbook_url",
+    ]
+    ab = action_board_dedup_all.copy() if isinstance(action_board_dedup_all, pd.DataFrame) else pd.DataFrame()
+    if ab is None or ab.empty:
+        return pd.DataFrame(columns=cols)
+
+    need_cols = {"level", "action_type", "ad_type", "campaign", "object_name"}
+    if not need_cols.issubset(set(ab.columns)):
+        return pd.DataFrame(columns=cols)
+
+    out = ab.copy()
+    out["level"] = out["level"].astype(str).str.strip().str.lower()
+    out["action_type"] = out["action_type"].astype(str).str.strip().str.upper()
+    out["ad_type"] = out["ad_type"].astype(str).str.strip().str.upper()
+    out["campaign"] = out["campaign"].astype(str).str.strip()
+    out["object_name"] = out["object_name"].astype(str).str.strip()
+    out = out[(out["level"] == "placement") & (out["action_type"].isin({"BID_UP", "BID_DOWN"}))].copy()
+    out = out[(out["ad_type"] != "") & (out["campaign"] != "") & (out["object_name"] != "")].copy()
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+
+    try:
+        out["blocked"] = pd.to_numeric(out.get("blocked", 0), errors="coerce").fillna(0).astype(int)
+        out = out[out["blocked"] <= 0].copy()
+    except Exception:
+        pass
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+
+    out["e_spend"] = pd.to_numeric(out.get("e_spend", 0.0), errors="coerce").fillna(0.0)
+    out["action_priority_score"] = pd.to_numeric(out.get("action_priority_score", 0.0), errors="coerce").fillna(0.0)
+
+    def _extract_acos(r: pd.Series) -> float:
+        try:
+            v = float(r.get("e_acos", 0.0) or 0.0)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+        try:
+            ev = r.get("evidence_json", "")
+            data = json.loads(ev) if isinstance(ev, str) and ev.strip() else {}
+            v = float(data.get("acos", 0.0) or 0.0)
+            return v if v > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    try:
+        out["e_acos"] = out.apply(_extract_acos, axis=1)
+    except Exception:
+        out["e_acos"] = 0.0
+
+    cfg = get_stage_config(stage)
+    target_acos = max(float(getattr(cfg, "target_acos", 0.0) or 0.0), 1e-6)
+    min_shift = max(5.0, float(getattr(cfg, "waste_spend", 0.0) or 0.0) * 0.1)
+
+    rows: List[Dict[str, object]] = []
+    for (ad_type, campaign), gg in out.groupby(["ad_type", "campaign"], dropna=False):
+        ups = gg[gg["action_type"] == "BID_UP"].copy()
+        downs = gg[gg["action_type"] == "BID_DOWN"].copy()
+        if downs.empty:
+            continue
+        ups = ups.sort_values(["action_priority_score", "e_spend"], ascending=[False, False]).copy()
+        downs = downs.sort_values(["action_priority_score", "e_spend"], ascending=[False, False]).copy()
+
+        for _, d in downs.head(12).iterrows():
+            from_placement = str(d.get("object_name", "") or "").strip()
+            if not from_placement:
+                continue
+            to_row = pd.Series(dtype=object)
+            if not ups.empty:
+                cand = ups[ups["object_name"].astype(str).str.strip() != from_placement].copy()
+                if not cand.empty:
+                    to_row = cand.iloc[0]
+
+            from_spend = max(float(d.get("e_spend", 0.0) or 0.0), 0.0)
+            from_acos = max(float(d.get("e_acos", 0.0) or 0.0), 0.0)
+            severity = max(0.0, safe_div(from_acos - target_acos, target_acos)) if from_acos > 0 else 0.6
+            shift_ratio = max(0.10, min(0.35, 0.12 + severity * 0.10))
+            amount = round(max(min_shift, from_spend * shift_ratio), 2)
+
+            if to_row.empty:
+                transfer_type = "reserve"
+                to_placement = "RESERVE"
+                to_spend = 0.0
+                to_acos = 0.0
+                to_score = 0.0
+                reason = "同 Campaign 暂无明显优质广告位承接，先回收预算到 RESERVE。"
+            else:
+                transfer_type = "transfer"
+                to_placement = str(to_row.get("object_name", "") or "").strip() or "RESERVE"
+                to_spend = max(float(to_row.get("e_spend", 0.0) or 0.0), 0.0)
+                to_acos = max(float(to_row.get("e_acos", 0.0) or 0.0), 0.0)
+                to_score = max(float(to_row.get("action_priority_score", 0.0) or 0.0), 0.0)
+                reason = "同 Campaign 广告位预算平移：从高损耗位置回收，向高效率位置倾斜。"
+
+            priority = str(d.get("priority", "") or "").strip().upper()
+            if priority not in {"P0", "P1", "P2"}:
+                priority = "P1"
+
+            scene = "scene-placement-rebalance"
+            rows.append(
+                {
+                    "priority": priority,
+                    "transfer_type": transfer_type,
+                    "ad_type": str(ad_type or ""),
+                    "campaign": str(campaign or ""),
+                    "from_placement": from_placement,
+                    "to_placement": to_placement,
+                    "amount_usd_estimated": amount,
+                    "shift_ratio": round(float(shift_ratio), 4),
+                    "from_spend": round(float(from_spend), 2),
+                    "from_acos": round(float(from_acos), 4),
+                    "to_spend": round(float(to_spend), 2),
+                    "to_acos": round(float(to_acos), 4),
+                    "from_action_priority_score": round(float(d.get("action_priority_score", 0.0) or 0.0), 2),
+                    "to_action_priority_score": round(float(to_score), 2),
+                    "reason": reason,
+                    "playbook_scene": scene,
+                    "playbook_url": f"{PB_DOC_REL}#{scene}",
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    res = pd.DataFrame(rows)
+    try:
+        rank = {"P0": 0, "P1": 1, "P2": 2}
+        res["_pr"] = res["priority"].map(lambda x: rank.get(str(x).upper(), 9))
+        res = res.sort_values(
+            ["_pr", "amount_usd_estimated", "from_action_priority_score"],
+            ascending=[True, False, False],
+        ).copy()
+        res = res.drop(columns=["_pr"], errors="ignore")
+    except Exception:
+        pass
+
+    n = max(1, int(max_rows or 1))
+    res = res.head(n).copy()
+    keep = [c for c in cols if c in res.columns]
+    return res[keep].reset_index(drop=True)
+
+
 def build_budget_transfer_plan_with_opportunities(
     budget_transfer_plan: Optional[Dict[str, object]],
     scale_opportunity_watchlist: Optional[pd.DataFrame],
@@ -11336,6 +11505,7 @@ def write_dashboard_md(
     lifecycle_timeline: Optional[pd.DataFrame] = None,
     policy: Optional[OpsPolicy] = None,
     budget_transfer_plan: Optional[Dict[str, object]] = None,
+    placement_rebalance_plan: Optional[pd.DataFrame] = None,
     unlock_scale_tasks: Optional[pd.DataFrame] = None,
     data_quality_hints: Optional[List[str]] = None,
     action_review: Optional[pd.DataFrame] = None,
@@ -11719,6 +11889,7 @@ def write_dashboard_md(
         quick_links.append("[Campaign排查](#campaign)")
         quick_links.append("[Action Board](../dashboard/action_board.csv)")
         quick_links.append("[解锁任务表](../dashboard/unlock_scale_tasks.csv)")
+        quick_links.append("[广告位预算平移](../dashboard/placement_rebalance_plan.csv)")
         quick_links.append("[任务汇总](../dashboard/task_summary.csv)")
         quick_links.append("[环比摘要](../dashboard/compare_summary.csv)")
         quick_links.append("[生命周期时间轴表](../dashboard/lifecycle_timeline.csv)")
@@ -12163,19 +12334,22 @@ def write_dashboard_md(
             transfer_cnt = len(transfers) if isinstance(transfers, list) else 0
             savings_cnt = len(savings) if isinstance(savings, list) else 0
             task_cnt = int(len(unlock_scale_tasks)) if isinstance(unlock_scale_tasks, pd.DataFrame) else 0
+            placement_cnt = int(len(placement_rebalance_plan)) if isinstance(placement_rebalance_plan, pd.DataFrame) else 0
 
-            if transfer_cnt > 0 or savings_cnt > 0 or task_cnt > 0:
+            if transfer_cnt > 0 or savings_cnt > 0 or task_cnt > 0 or placement_cnt > 0:
                 has_ops_plans = True
                 parts = []
                 if transfer_cnt > 0:
                     parts.append(f"净迁移 `{transfer_cnt}`")
                 if savings_cnt > 0:
                     parts.append(f"回收 `{savings_cnt}`")
+                if placement_cnt > 0:
+                    parts.append(f"广告位平移 `{placement_cnt}`")
                 if task_cnt > 0:
                     parts.append(f"解锁任务(P0/P1 Top) `{task_cnt}`")
                 joined = " | ".join(parts) if parts else "（无）"
                 lines.append(
-                    f"- 预算迁移/放量解锁：{joined}（[迁移表](../dashboard/budget_transfer_plan.csv) | [任务表](../dashboard/unlock_scale_tasks.csv)）"
+                    f"- 预算迁移/放量解锁：{joined}（[迁移表](../dashboard/budget_transfer_plan.csv) | [广告位平移](../dashboard/placement_rebalance_plan.csv) | [任务表](../dashboard/unlock_scale_tasks.csv)）"
                 )
         except Exception:
             has_ops_plans = False
@@ -17564,6 +17738,7 @@ def write_dashboard_outputs(
     - dashboard/keyword_topics_action_hints.csv（主题建议：把主题落到 top_campaigns/top_ad_groups，形成可分派清单；scale 方向会标注/阻断库存风险）
     - dashboard/keyword_topics_asin_context.csv（主题→产品语境：只用高置信 term→asin，把主题落到类目/ASIN/生命周期/库存覆盖）
     - dashboard/keyword_topics_category_phase_summary.csv（主题→类目/生命周期汇总：先按类目/阶段看主题的 spend/sales/waste_spend，再下钻到 ASIN）
+    - dashboard/placement_rebalance_plan.csv（广告位预算平移建议：同 campaign 内 from->to）
 
     返回（主要路径）：
     - dashboard/shop_scorecard.json
@@ -17583,6 +17758,7 @@ def write_dashboard_outputs(
     dash_md_path = None
     keyword_topics_path = None
     keyword_topics_hints_path = None
+    placement_rebalance_plan: pd.DataFrame = pd.DataFrame()
 
     # 供 shop_scorecard “抓重点汇总”使用（即便中途异常也避免 UnboundLocalError）
     action_board: pd.DataFrame = pd.DataFrame()
@@ -17952,6 +18128,39 @@ def write_dashboard_outputs(
                 ]
             ).to_csv(budget_transfer_plan_path, index=False, encoding="utf-8-sig")
 
+        # 3.605) placement_rebalance_plan.csv（广告位预算重分配：同 Campaign 优先平移）
+        placement_rebalance_plan_path = dashboard_dir / "placement_rebalance_plan.csv"
+        try:
+            placement_rebalance_plan = build_placement_rebalance_plan(
+                action_board_dedup_all=action_board_all if isinstance(action_board_all, pd.DataFrame) else None,
+                stage=stage,
+                max_rows=300,
+            )
+        except Exception:
+            placement_rebalance_plan = pd.DataFrame()
+        if placement_rebalance_plan is not None and not placement_rebalance_plan.empty:
+            placement_rebalance_plan.to_csv(placement_rebalance_plan_path, index=False, encoding="utf-8-sig")
+        else:
+            pd.DataFrame(
+                columns=[
+                    "priority",
+                    "transfer_type",
+                    "ad_type",
+                    "campaign",
+                    "from_placement",
+                    "to_placement",
+                    "amount_usd_estimated",
+                    "shift_ratio",
+                    "from_spend",
+                    "from_acos",
+                    "to_spend",
+                    "to_acos",
+                    "from_action_priority_score",
+                    "to_action_priority_score",
+                    "reason",
+                ]
+            ).to_csv(placement_rebalance_plan_path, index=False, encoding="utf-8-sig")
+
         # 3.61) unlock_scale_tasks.csv（放量解锁任务：可分工）
         unlock_scale_tasks_full_table = None
         try:
@@ -18271,6 +18480,9 @@ def write_dashboard_outputs(
         # 4.8) keyword_topics_action_hints.csv（主题建议：可分派清单）
         keyword_hints_cols = [
             "priority",
+            "hint_priority_score",
+            "owner",
+            "risk_level",
             "direction",
             "hint_action",
             "ad_type",
@@ -18582,6 +18794,7 @@ def write_dashboard_outputs(
                     lifecycle_timeline=build_lifecycle_timeline_view(lifecycle_timeline_table if isinstance(lifecycle_timeline_table, pd.DataFrame) else None),
                     policy=policy,
                     budget_transfer_plan=budget_transfer_plan_effective,
+                    placement_rebalance_plan=placement_rebalance_plan if isinstance(placement_rebalance_plan, pd.DataFrame) else None,
                     unlock_scale_tasks=unlock_scale_tasks_table if isinstance(unlock_scale_tasks_table, pd.DataFrame) else None,
                     data_quality_hints=data_quality_hints,
                     action_review=action_review if isinstance(action_review, pd.DataFrame) else None,
@@ -18650,6 +18863,7 @@ def write_dashboard_outputs(
                 keyword_topics = _read_csv(dashboard_dir / "keyword_topics.csv") if "dashboard_dir" in locals() else pd.DataFrame()
                 asin_cockpit = _read_csv(dashboard_dir / "asin_cockpit.csv") if "dashboard_dir" in locals() else pd.DataFrame()
                 unlock_scale_tasks = _read_csv(dashboard_dir / "unlock_scale_tasks.csv") if "dashboard_dir" in locals() else pd.DataFrame()
+                placement_rebalance_plan = _read_csv(dashboard_dir / "placement_rebalance_plan.csv") if "dashboard_dir" in locals() else pd.DataFrame()
                 compare_summary = _read_csv(dashboard_dir / "compare_summary.csv") if "dashboard_dir" in locals() else pd.DataFrame()
                 lifecycle_timeline = build_lifecycle_timeline_view(_read_csv(dashboard_dir / "lifecycle_timeline.csv") if "dashboard_dir" in locals() else pd.DataFrame())
 
@@ -18673,6 +18887,7 @@ def write_dashboard_outputs(
                     lifecycle_timeline=build_lifecycle_timeline_view(lifecycle_timeline if isinstance(lifecycle_timeline, pd.DataFrame) and not lifecycle_timeline.empty else None),
                     policy=policy,
                     budget_transfer_plan={},
+                    placement_rebalance_plan=placement_rebalance_plan if not placement_rebalance_plan.empty else None,
                     unlock_scale_tasks=unlock_scale_tasks if not unlock_scale_tasks.empty else None,
                     data_quality_hints=None,
                     action_review=None,
