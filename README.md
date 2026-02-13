@@ -42,6 +42,7 @@ python main.py
 - 入口文件：`data/output/<时间戳>/START_HERE.html`
 - 每店铺聚焦版：`data/output/<时间戳>/<shop>/reports/dashboard.html`
 - 多店铺 Owner 轻量总览：`data/output/<时间戳>/OWNER_OVERVIEW.csv`
+- 多店铺 Owner 排序总览（含统一优先级分）：`data/output/<时间戳>/OWNER_OVERVIEW.md` / `.html`
 - 店铺环比（含促销/季节性校正列）：`data/output/<时间戳>/<shop>/dashboard/compare_summary.csv`
 - 已回填执行日志时，会额外输出：`data/output/<时间戳>/<shop>/ops/action_review_summary.csv`
 
@@ -118,6 +119,36 @@ python main.py --input-dir data/input --out-dir data/output --ai-prompt-only
 - 运营策略：`config/ops_policy.json`
 - 总选项档位：`config/ops_profile.json`（建议日常只改这里）
 - 生命周期参数：`src/lifecycle/lifecycle_config.json`（支持 `category_default/category_overrides` 做类目阈值覆盖）
+
+### 生命周期类目阈值覆盖示例（`src/lifecycle/lifecycle_config.json`）
+```json
+{
+  "category_default": {
+    "min_mature_orders": 20,
+    "low_inventory": 20
+  },
+  "category_overrides": [
+    {
+      "name": "fast_moving",
+      "match": ["beauty", "grocery"],
+      "min_mature_orders": 35,
+      "low_inventory": 35
+    },
+    {
+      "name": "slow_moving",
+      "match": ["furniture", "home decor"],
+      "min_mature_orders": 10,
+      "min_peak_sales_roll": 6
+    }
+  ]
+}
+```
+
+### 动作闭环与促销校正参数（`config/ops_policy.json`）
+- `dashboard.promo_adjustment.*`：控制 compare 的促销/季节性校正（只影响 `*_corrected` 字段）
+- `dashboard.action_scoring.weight_action_loop_score`：闭环分权重（越高越偏向历史高分动作）
+- `dashboard.action_scoring.action_loop_min_support`：动作闭环最低样本数
+- `dashboard.action_scoring.action_loop_recent_window_days`：闭环统计回看天数
 
 ---
 

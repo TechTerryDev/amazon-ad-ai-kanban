@@ -8980,6 +8980,7 @@ def score_action_board(
     action_board: pd.DataFrame,
     asin_focus_all: Optional[pd.DataFrame],
     policy: OpsPolicy,
+    action_review: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     给 Action Board 增加“运营化优先级”字段，并调整默认排序。
@@ -9376,6 +9377,62 @@ def score_action_board(
     df["blocked"] = blocked_list
     df["blocked_reason"] = blocked_reason_list
 
+    # 2.5) 动作闭环表现（按 action_type 聚合），用于把“历史有效动作”提到前面
+    loop_stats: Dict[str, Dict[str, float]] = {}
+    try:
+        ar = action_review.copy() if isinstance(action_review, pd.DataFrame) else pd.DataFrame()
+        if ar is not None and (not ar.empty) and ("action_type" in ar.columns):
+            ar["action_type"] = ar["action_type"].astype(str).fillna("").str.strip().str.upper()
+            ar = ar[ar["action_type"] != ""].copy()
+            if "window_days" in ar.columns:
+                ar["window_days"] = pd.to_numeric(ar.get("window_days"), errors="coerce").fillna(0).astype(int)
+                candidate = [int(x) for x in ar["window_days"].unique().tolist() if int(x) > 0]
+            else:
+                ar["window_days"] = 0
+                candidate = []
+            target_window = 7 if 7 in candidate else (min(candidate) if candidate else 0)
+            if target_window > 0:
+                ar = ar[ar["window_days"] == int(target_window)].copy()
+            recent_days = int(
+                getattr(
+                    getattr(policy, "dashboard_action_scoring", None) or ActionScoringPolicy(),
+                    "action_loop_recent_window_days",
+                    7,
+                )
+                or 7
+            )
+            if recent_days > 0:
+                date_col = next((c for c in ("executed_at", "action_date", "date") if c in ar.columns), "")
+                if date_col:
+                    dt = pd.to_datetime(ar.get(date_col), errors="coerce")
+                    max_dt = dt.max()
+                    if pd.notna(max_dt):
+                        cutoff = max_dt - pd.Timedelta(days=max(1, recent_days) - 1)
+                        ar = ar[dt >= cutoff].copy()
+            if "status" in ar.columns:
+                ar["status"] = ar["status"].astype(str).fillna("").str.strip().str.lower()
+                ar = ar[ar["status"] == "ok"].copy()
+            if "action_loop_score" not in ar.columns:
+                ar["action_loop_score"] = 50.0
+            ar["action_loop_score"] = pd.to_numeric(ar.get("action_loop_score"), errors="coerce").fillna(50.0)
+            if "action_loop_label" not in ar.columns:
+                ar["action_loop_label"] = ""
+            ar["action_loop_label"] = ar["action_loop_label"].astype(str).fillna("").str.strip().str.lower()
+            for act, g in ar.groupby("action_type", dropna=False):
+                if not act:
+                    continue
+                cnt = int(len(g))
+                if cnt <= 0:
+                    continue
+                pos = int((g["action_loop_label"] == "positive").sum()) if "action_loop_label" in g.columns else 0
+                loop_stats[str(act)] = {
+                    "avg_score": float(pd.to_numeric(g.get("action_loop_score"), errors="coerce").fillna(50.0).mean()),
+                    "positive_rate": (float(pos) / float(cnt)) if cnt > 0 else 0.0,
+                    "count": float(cnt),
+                }
+    except Exception:
+        loop_stats = {}
+
     # 3) 计算 action_priority_score（排序分）
     ap = getattr(policy, "dashboard_action_scoring", None) or ActionScoringPolicy()
     pr_rank = {"P0": 0, "P1": 1, "P2": 2}
@@ -9413,6 +9470,9 @@ def score_action_board(
 
     scores: List[float] = []
     reasons: List[str] = []
+    loop_avg_scores: List[float] = []
+    loop_positive_rates: List[float] = []
+    loop_samples: List[int] = []
     for _, r in df.iterrows():
         priority = str(r.get("priority", "") or "")
         act = str(r.get("action_type", "") or "").strip().upper()
@@ -9451,7 +9511,21 @@ def score_action_board(
             elif pdir == "scale":
                 score += float(ap.profit_scale_scale_boost)
 
+        # 动作闭环加权：同类动作历史有效时轻微加分，反之轻微降权
+        stats = loop_stats.get(act, {})
+        avg_loop = float(stats.get("avg_score", 50.0) or 50.0)
+        pos_rate = float(stats.get("positive_rate", 0.0) or 0.0)
+        sample_cnt = int(float(stats.get("count", 0.0) or 0.0))
+        min_support = max(1, int(getattr(ap, "action_loop_min_support", 2) or 2))
+        weight_loop = float(getattr(ap, "weight_action_loop_score", 0.0) or 0.0)
+        if sample_cnt >= min_support and weight_loop != 0.0:
+            loop_delta = max(-1.0, min(1.0, (avg_loop - 50.0) / 50.0))
+            score += loop_delta * weight_loop
+
         scores.append(round(float(score), 2))
+        loop_avg_scores.append(round(float(avg_loop), 2))
+        loop_positive_rates.append(round(float(pos_rate), 4))
+        loop_samples.append(int(sample_cnt))
 
         # priority_reason：短标签（便于运营扫读）
         tags: List[str] = []
@@ -9476,6 +9550,12 @@ def score_action_board(
         elif focus_score >= 50:
             tags.append("ASIN关注")
 
+        if sample_cnt >= min_support:
+            if avg_loop >= 70:
+                tags.append("闭环优")
+            elif avg_loop <= 40:
+                tags.append("闭环弱")
+
         if phase in {"decline", "inactive"} and blocked <= 0:
             tags.append("衰退期" if phase == "decline" else "不活跃")
 
@@ -9487,6 +9567,9 @@ def score_action_board(
         reasons.append(";".join(uniq))
 
     df["action_priority_score"] = scores
+    df["action_loop_avg_score"] = loop_avg_scores
+    df["action_loop_positive_rate"] = loop_positive_rates
+    df["action_loop_samples"] = loop_samples
     df["priority_reason"] = reasons
 
     # 3.1) needs_manual_confirm：弱关联动作的“人工确认”标记（便于运营一键筛选）
@@ -9555,8 +9638,8 @@ def score_action_board(
     df["_e_spend"] = pd.to_numeric(df.get("e_spend", 0.0), errors="coerce").fillna(0.0)
     df["blocked"] = pd.to_numeric(df.get("blocked", 0), errors="coerce").fillna(0).astype(int)
     df = df.sort_values(
-        ["blocked", "_priority_rank", "action_priority_score", "_e_spend"],
-        ascending=[True, True, False, False],
+        ["blocked", "_priority_rank", "action_priority_score", "action_loop_avg_score", "_e_spend"],
+        ascending=[True, True, False, False, False],
     ).copy()
     df = df.drop(columns=["_priority_rank", "_e_spend"], errors="ignore")
 
@@ -17575,7 +17658,12 @@ def write_dashboard_outputs(
             asin_top_targetings=asin_top_targetings,
             asin_top_placements=asin_top_placements,
         )
-        action_board_full = score_action_board(action_board=action_board_full, asin_focus_all=asin_focus_all, policy=policy)
+        action_board_full = score_action_board(
+            action_board=action_board_full,
+            asin_focus_all=asin_focus_all,
+            policy=policy,
+            action_review=action_review if isinstance(action_review, pd.DataFrame) else None,
+        )
         # 操作手册联动：把动作表一键接回“怎么查/怎么做”的固定流程（不影响口径/算数逻辑）
         action_board_full = enrich_action_board_with_playbook_scene(action_board_full)
         # 全量文件（含重复）
