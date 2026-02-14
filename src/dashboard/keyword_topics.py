@@ -781,6 +781,63 @@ def build_keyword_topic_action_hints(
     # P0 阈值（随 stage 调整，避免太激进）
     p0_waste_spend = float(cfg.waste_spend or 0.0) * 3.0
 
+    def _build_human_step(
+        direction: str,
+        risk_level: str,
+        top_match_types: str,
+        waste_ratio: float,
+        acos: float,
+        target_acos_val: float,
+    ) -> Tuple[str, str, str, str]:
+        """
+        生成更“可执行/有人味”的建议四件套：
+        - execution_style: 执行风格
+        - expected_signal: 观察成功信号
+        - rollback_guard: 回滚护栏
+        - next_step: 具体下一步
+        """
+        mt = str(top_match_types or "")
+        has_broad = "广泛匹配" in mt
+        target = max(float(target_acos_val or 0.0), 1e-6)
+        if direction == "reduce":
+            if str(risk_level) == "high":
+                style = "先止损后保量"
+                step = (
+                    "先从高浪费词和广泛匹配词开始处理：先否词3-5个并小步降价，"
+                    "当天只做一轮，避免把还在出单的词一次性误杀。"
+                )
+            elif str(risk_level) == "medium":
+                style = "稳健降噪"
+                step = "先按 top_campaigns 定位主题词，优先清理低意图词；降价优先于大范围否词。"
+            else:
+                style = "精修长尾"
+                step = "把该主题当作低优先级清理项：先处理长尾词，再观察是否需要继续收口。"
+            if has_broad:
+                step += " 先处理广泛匹配，再看词组/精确，通常更稳。"
+            expected = "24-48h 内 waste_spend 下降且订单基本稳定，即可继续下一批。"
+            rollback = "若订单下滑>15%或广告销售下滑>20%，回滚最近一轮否词/降价。"
+            return style, expected, rollback, step
+
+        # scale
+        acos_ratio = safe_div(float(acos), target)
+        if str(risk_level) == "high" or acos_ratio > 1.0:
+            style = "谨慎试投"
+            step = (
+                "先做小预算测试：只扩1-2个精确词并小步提价，"
+                "确认转化稳定后再加预算，避免直接放大造成成本失控。"
+            )
+        elif str(risk_level) == "medium":
+            style = "小步放量"
+            step = "优先把高转化词加精确并提价 5%~10%，连续两天稳定后再加预算。"
+        else:
+            style = "顺势放量"
+            step = "该主题可作为优先放量池：先加精确词，再按转化表现逐步加预算。"
+        if waste_ratio > 0.4:
+            step += " 同时保留否词检查，避免放量时把低意图词一并放大。"
+        expected = "48h 内订单/销售提升且 ACoS 不劣化，再进入第二轮加码。"
+        rollback = "若 ACoS 连续两天高于目标且订单无提升，撤回最近一次提价/加预算。"
+        return style, expected, rollback, step
+
     def _append_rows(df: pd.DataFrame, direction: str) -> None:
         for _, r in df.iterrows():
             ad_type = str(r.get("ad_type", "") or "").strip()
@@ -797,18 +854,68 @@ def build_keyword_topic_action_hints(
             waste_term_count = int(float(r.get("waste_term_count", 0) or 0))
             top_terms = _norm_text_cell(r.get("top_terms", ""))
 
+            target_base = max(float(target_acos or 0.0), 1e-6)
+            # 统一优先级分：用于跨主题快速排序，不替代原始口径
+            if direction == "reduce":
+                waste_pressure = safe_div(waste_spend, max(float(cfg.waste_spend or 0.0), 1.0))
+                over_target = max(0.0, acos - float(target_acos or 0.0))
+                hint_priority_score = (
+                    60.0
+                    + waste_pressure * 10.0
+                    + waste_ratio * 80.0
+                    + min(40.0, over_target * 80.0)
+                    + min(20.0, float(waste_term_count))
+                )
+            else:
+                efficiency_gain = max(0.0, safe_div(float(target_acos or 0.0) - acos, target_base))
+                hint_priority_score = (
+                    40.0
+                    + min(60.0, sales * 0.12)
+                    + min(40.0, float(orders) * 5.0)
+                    + efficiency_gain * 60.0
+                )
+            hint_priority_score = round(float(hint_priority_score), 2)
+
             if direction == "reduce":
                 priority = "P0" if waste_spend >= p0_waste_spend else "P1"
                 hint_action = "否词/降价/收预算"
-                next_step = "优先在 top_campaigns 中筛该主题相关 search terms，先核对 top_terms，再做否词/降价；避免误杀带量词。"
+                owner = "广告运营"
+                if waste_spend >= p0_waste_spend * 1.5 or waste_ratio >= 0.85:
+                    risk_level = "high"
+                elif waste_spend >= p0_waste_spend or waste_ratio >= 0.7:
+                    risk_level = "medium"
+                else:
+                    risk_level = "low"
             else:
                 priority = "P1"
                 hint_action = "加精确词/提价/加预算"
-                next_step = "优先在 top_campaigns 中把该主题的高转化词加精确/提价；放量前结合 ASIN 的库存覆盖/利润方向确认。"
+                owner = "广告运营"
+                # 放量主题按 ACoS 接近目标线给风险分层，避免“好词误加码”
+                if acos > float(target_acos or 0.0):
+                    risk_level = "high"
+                elif acos > float(target_acos or 0.0) * 0.85:
+                    risk_level = "medium"
+                else:
+                    risk_level = "low"
+
+            top_campaigns = _fmt_campaigns(tkey, direction=direction)
+            top_ad_groups = _fmt_ad_groups(tkey, direction=direction)
+            top_match_types = _fmt_match_types(tkey, direction=direction)
+            execution_style, expected_signal, rollback_guard, next_step = _build_human_step(
+                direction=direction,
+                risk_level=risk_level,
+                top_match_types=top_match_types,
+                waste_ratio=waste_ratio,
+                acos=acos,
+                target_acos_val=float(target_acos or 0.0),
+            )
 
             rows.append(
                 {
                     "priority": priority,
+                    "hint_priority_score": hint_priority_score,
+                    "owner": owner,
+                    "risk_level": risk_level,
                     "direction": direction,
                     "hint_action": hint_action,
                     "ad_type": ad_type,
@@ -823,9 +930,12 @@ def build_keyword_topic_action_hints(
                     "term_count": term_count,
                     "waste_term_count": waste_term_count,
                     "top_terms": top_terms,
-                    "top_campaigns": _fmt_campaigns(tkey, direction=direction),
-                    "top_ad_groups": _fmt_ad_groups(tkey, direction=direction),
-                    "top_match_types": _fmt_match_types(tkey, direction=direction),
+                    "top_campaigns": top_campaigns,
+                    "top_ad_groups": top_ad_groups,
+                    "top_match_types": top_match_types,
+                    "execution_style": execution_style,
+                    "expected_signal": expected_signal,
+                    "rollback_guard": rollback_guard,
                     "filter_contains": ng,
                     "next_step": next_step,
                 }
@@ -844,17 +954,21 @@ def build_keyword_topic_action_hints(
     try:
         out["_p"] = out["priority"].map(lambda x: 0 if str(x).upper() == "P0" else 1)
         out["_dir"] = out["direction"].map(lambda x: 0 if str(x) == "reduce" else 1)
+        out["_score"] = pd.to_numeric(out.get("hint_priority_score", 0.0), errors="coerce").fillna(0.0)
         out["_impact"] = out.apply(
             lambda rr: float(rr.get("waste_spend", 0.0) or 0.0) if str(rr.get("direction", "")) == "reduce" else float(rr.get("sales", 0.0) or 0.0),
             axis=1,
         )
-        out = out.sort_values(["_p", "_dir", "_impact"], ascending=[True, True, False]).copy()
-        out = out.drop(columns=["_p", "_dir", "_impact"], errors="ignore")
+        out = out.sort_values(["_p", "_dir", "_score", "_impact"], ascending=[True, True, False, False]).copy()
+        out = out.drop(columns=["_p", "_dir", "_score", "_impact"], errors="ignore")
     except Exception:
         pass
 
     cols = [
         "priority",
+        "hint_priority_score",
+        "owner",
+        "risk_level",
         "direction",
         "hint_action",
         "ad_type",
@@ -872,6 +986,9 @@ def build_keyword_topic_action_hints(
         "top_campaigns",
         "top_ad_groups",
         "top_match_types",
+        "execution_style",
+        "expected_signal",
+        "rollback_guard",
         "filter_contains",
         "next_step",
     ]

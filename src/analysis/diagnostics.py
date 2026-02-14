@@ -18,12 +18,124 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from src.core.config import StageConfig
+from src.core.policy import OpsPolicy
 from src.core.metrics import summarize, to_summary_dict
 from src.core.schema import CAN
 from src.core.utils import safe_div
 
 
-def _shop_roll_compare_from_pa(product_analysis_shop: pd.DataFrame, window_days: int) -> Dict[str, object]:
+def _build_shop_daily_metrics_with_promo_adjustment(
+    product_analysis_shop: pd.DataFrame,
+    policy: Optional[OpsPolicy] = None,
+) -> pd.DataFrame:
+    """
+    按日聚合店铺经营指标，并做“促销尖峰”轻量校正（不覆盖原始值）。
+
+    说明：
+    - 只用于 compare 的补充字段，原始 delta 仍保留；
+    - 促销识别采用“相对历史中位数”的规则化方法，避免引入外部依赖。
+    """
+    if product_analysis_shop is None or product_analysis_shop.empty or CAN.date not in product_analysis_shop.columns:
+        return pd.DataFrame()
+
+    pa = product_analysis_shop.copy()
+    pa = pa[pa[CAN.date].notna()].copy()
+    if pa.empty:
+        return pd.DataFrame()
+
+    num_cols = ["销售额", "订单量", "Sessions", "广告花费", "广告销售额", "毛利润"]
+    keep_cols: List[str] = []
+    for c in num_cols:
+        if c in pa.columns:
+            pa[c] = pd.to_numeric(pa[c], errors="coerce").fillna(0.0)
+            keep_cols.append(c)
+    if not keep_cols:
+        return pd.DataFrame()
+
+    daily = pa.groupby(CAN.date, dropna=False, as_index=False)[keep_cols].sum().sort_values(CAN.date).copy()
+    if daily.empty:
+        return pd.DataFrame()
+
+    for c in ("销售额", "广告花费", "毛利润"):
+        if c not in daily.columns:
+            daily[c] = 0.0
+
+    pa_cfg = getattr(policy, "dashboard_promo_adjustment", None) if isinstance(policy, OpsPolicy) else None
+    enabled = bool(getattr(pa_cfg, "enabled", True) if pa_cfg is not None else True)
+    if not enabled:
+        daily["promo_spike"] = 0
+        daily["sales_spike_ratio"] = 1.0
+        daily["spend_spike_ratio"] = 1.0
+        daily["sales_corrected"] = daily["销售额"]
+        daily["ad_spend_corrected"] = daily["广告花费"]
+        daily["profit_corrected"] = daily["毛利润"]
+        return daily
+
+    lookback_days = int(getattr(pa_cfg, "baseline_lookback_days", 28) if pa_cfg is not None else 28)
+    min_periods = int(getattr(pa_cfg, "baseline_min_periods", 7) if pa_cfg is not None else 7)
+    lookback_days = max(7, lookback_days)
+    min_periods = max(1, min(min_periods, lookback_days))
+    sales_spike_thr = float(getattr(pa_cfg, "sales_spike_threshold", 2.0) if pa_cfg is not None else 2.0)
+    spend_spike_thr = float(getattr(pa_cfg, "spend_spike_threshold", 1.5) if pa_cfg is not None else 1.5)
+    sales_spike_thr_alt = float(getattr(pa_cfg, "sales_spike_threshold_alt", 1.6) if pa_cfg is not None else 1.6)
+    spend_spike_thr_alt = float(getattr(pa_cfg, "spend_spike_threshold_alt", 2.0) if pa_cfg is not None else 2.0)
+    damp = float(getattr(pa_cfg, "damp_ratio", 0.35) if pa_cfg is not None else 0.35)
+    damp = max(0.0, min(1.0, damp))
+
+    def _baseline_col(s: pd.Series, lookback_days: int = 28, min_periods: int = 7) -> pd.Series:
+        x = pd.to_numeric(s, errors="coerce").fillna(0.0)
+        # 只用“过去”数据做基线，避免未来信息泄漏
+        hist = x.shift(1).rolling(window=int(lookback_days), min_periods=int(min_periods)).median()
+        hist2 = x.shift(1).expanding(min_periods=1).median()
+        base = hist.fillna(hist2)
+        if base.isna().all():
+            med = float(x.median()) if len(x) > 0 else 0.0
+            base = pd.Series([med] * len(x), index=x.index)
+        base = base.fillna(float(base.median()) if not base.empty else 0.0)
+        return base.clip(lower=0.0)
+
+    daily["baseline_sales"] = _baseline_col(daily["销售额"], lookback_days=lookback_days, min_periods=min_periods)
+    daily["baseline_ad_spend"] = _baseline_col(daily["广告花费"], lookback_days=lookback_days, min_periods=min_periods)
+    daily["baseline_profit"] = _baseline_col(daily["毛利润"], lookback_days=lookback_days, min_periods=min_periods)
+
+    sales_intensity = daily.apply(
+        lambda r: safe_div(float(r.get("销售额", 0.0) or 0.0), max(float(r.get("baseline_sales", 0.0) or 0.0), 1.0)),
+        axis=1,
+    )
+    spend_intensity = daily.apply(
+        lambda r: safe_div(float(r.get("广告花费", 0.0) or 0.0), max(float(r.get("baseline_ad_spend", 0.0) or 0.0), 1.0)),
+        axis=1,
+    )
+
+    # 促销/大促候选：销量与广告花费同步显著抬升
+    daily["promo_spike"] = (
+        ((sales_intensity >= sales_spike_thr) & (spend_intensity >= spend_spike_thr))
+        | ((sales_intensity >= sales_spike_thr_alt) & (spend_intensity >= spend_spike_thr_alt))
+    ).astype(int)
+    daily["sales_spike_ratio"] = sales_intensity.round(4)
+    daily["spend_spike_ratio"] = spend_intensity.round(4)
+
+    # 轻量校正：对促销尖峰只保留部分增量，避免环比被单次活动“拉爆”
+    sales_delta = (daily["销售额"] - daily["baseline_sales"]).clip(lower=0.0)
+    spend_delta = (daily["广告花费"] - daily["baseline_ad_spend"]).clip(lower=0.0)
+    profit_delta = (daily["毛利润"] - daily["baseline_profit"]).clip(lower=0.0)
+    daily["sales_corrected"] = daily["销售额"]
+    daily["ad_spend_corrected"] = daily["广告花费"]
+    daily["profit_corrected"] = daily["毛利润"]
+    mask = daily["promo_spike"] > 0
+    daily.loc[mask, "sales_corrected"] = daily.loc[mask, "baseline_sales"] + (sales_delta[mask] * damp)
+    daily.loc[mask, "ad_spend_corrected"] = daily.loc[mask, "baseline_ad_spend"] + (spend_delta[mask] * damp)
+    daily.loc[mask, "profit_corrected"] = daily.loc[mask, "baseline_profit"] + (profit_delta[mask] * damp)
+    daily["sales_corrected"] = daily["sales_corrected"].clip(lower=0.0)
+    daily["ad_spend_corrected"] = daily["ad_spend_corrected"].clip(lower=0.0)
+    return daily
+
+
+def _shop_roll_compare_from_pa(
+    product_analysis_shop: pd.DataFrame,
+    window_days: int,
+    policy: Optional[OpsPolicy] = None,
+) -> Dict[str, object]:
     """
     店铺层滚动环比（优先用产品分析的“经营底座”，因为它包含自然流量+广告合计）。
     recent N 天 vs 前 N 天：
@@ -72,6 +184,29 @@ def _shop_roll_compare_from_pa(product_analysis_shop: pd.DataFrame, window_days:
     prev = _sum_range(prev_start, prev_end)
     rec = _sum_range(recent_start, recent_end)
 
+    daily = _build_shop_daily_metrics_with_promo_adjustment(pa, policy=policy)
+    promo_days_prev = 0
+    promo_days_recent = 0
+    sales_prev_corr = 0.0
+    sales_recent_corr = 0.0
+    ad_spend_prev_corr = 0.0
+    ad_spend_recent_corr = 0.0
+    profit_prev_corr = 0.0
+    profit_recent_corr = 0.0
+    if daily is not None and not daily.empty:
+        d_prev = daily[(daily[CAN.date] >= prev_start) & (daily[CAN.date] <= prev_end)].copy()
+        d_rec = daily[(daily[CAN.date] >= recent_start) & (daily[CAN.date] <= recent_end)].copy()
+        if not d_prev.empty:
+            promo_days_prev = int(pd.to_numeric(d_prev.get("promo_spike", 0), errors="coerce").fillna(0).sum())
+            sales_prev_corr = float(pd.to_numeric(d_prev.get("sales_corrected", 0.0), errors="coerce").fillna(0.0).sum())
+            ad_spend_prev_corr = float(pd.to_numeric(d_prev.get("ad_spend_corrected", 0.0), errors="coerce").fillna(0.0).sum())
+            profit_prev_corr = float(pd.to_numeric(d_prev.get("profit_corrected", 0.0), errors="coerce").fillna(0.0).sum())
+        if not d_rec.empty:
+            promo_days_recent = int(pd.to_numeric(d_rec.get("promo_spike", 0), errors="coerce").fillna(0).sum())
+            sales_recent_corr = float(pd.to_numeric(d_rec.get("sales_corrected", 0.0), errors="coerce").fillna(0.0).sum())
+            ad_spend_recent_corr = float(pd.to_numeric(d_rec.get("ad_spend_corrected", 0.0), errors="coerce").fillna(0.0).sum())
+            profit_recent_corr = float(pd.to_numeric(d_rec.get("profit_corrected", 0.0), errors="coerce").fillna(0.0).sum())
+
     sales_prev = float(prev.get("sales", 0.0))
     sales_recent = float(rec.get("sales", 0.0))
     ad_spend_prev = float(prev.get("ad_spend", 0.0))
@@ -90,6 +225,10 @@ def _shop_roll_compare_from_pa(product_analysis_shop: pd.DataFrame, window_days:
     delta_orders = float(orders_recent - orders_prev)
     delta_sessions = float(sessions_recent - sessions_prev)
     delta_profit = float(profit_recent - profit_prev)
+    delta_sales_corr = float(sales_recent_corr - sales_prev_corr)
+    delta_ad_spend_corr = float(ad_spend_recent_corr - ad_spend_prev_corr)
+    delta_profit_corr = float(profit_recent_corr - profit_prev_corr)
+    correction_applied = bool((promo_days_prev + promo_days_recent) > 0)
 
     out = {
         "window_days": n,
@@ -114,6 +253,24 @@ def _shop_roll_compare_from_pa(product_analysis_shop: pd.DataFrame, window_days:
         "delta_orders": round(delta_orders, 2),
         "delta_sessions": round(delta_sessions, 2),
         "delta_profit": round(delta_profit, 2),
+        "sales_prev_corrected": round(sales_prev_corr, 2),
+        "sales_recent_corrected": round(sales_recent_corr, 2),
+        "ad_spend_prev_corrected": round(ad_spend_prev_corr, 2),
+        "ad_spend_recent_corrected": round(ad_spend_recent_corr, 2),
+        "profit_prev_corrected": round(profit_prev_corr, 2),
+        "profit_recent_corrected": round(profit_recent_corr, 2),
+        "delta_sales_corrected": round(delta_sales_corr, 2),
+        "delta_ad_spend_corrected": round(delta_ad_spend_corr, 2),
+        "delta_profit_corrected": round(delta_profit_corr, 2),
+        "marginal_tacos_corrected": round(safe_div(delta_ad_spend_corr, delta_sales_corr) if delta_sales_corr > 0 else 0.0, 4),
+        "promo_days_prev": int(promo_days_prev),
+        "promo_days_recent": int(promo_days_recent),
+        "promo_or_seasonality_adjusted": bool(correction_applied),
+        "promo_or_seasonality_note": (
+            f"promo_spike_detected(prev={int(promo_days_prev)},recent={int(promo_days_recent)})"
+            if correction_applied
+            else ""
+        ),
         "tacos_prev": round(safe_div(ad_spend_prev, sales_prev) if sales_prev > 0 else 0.0, 4),
         "tacos_recent": round(safe_div(ad_spend_recent, sales_recent) if sales_recent > 0 else 0.0, 4),
         "ad_sales_share_prev": round(safe_div(ad_sales_prev, sales_prev) if sales_prev > 0 else 0.0, 4),
@@ -277,6 +434,7 @@ def diagnose_shop_scorecard(
     product_analysis_shop: pd.DataFrame,
     lifecycle_board: pd.DataFrame,
     windows_days: Optional[List[int]] = None,
+    policy: Optional[OpsPolicy] = None,
 ) -> Dict[str, object]:
     """
     店铺诊断（scorecard）：把“店铺到底哪里出问题/哪里能放量”变成固定口径的结构化输出。
@@ -403,7 +561,7 @@ def diagnose_shop_scorecard(
     compares: List[Dict[str, object]] = []
     for w in windows_days:
         try:
-            c = _shop_roll_compare_from_pa(product_analysis_shop, int(w))
+            c = _shop_roll_compare_from_pa(product_analysis_shop, int(w), policy=policy)
             if c:
                 compares.append(c)
         except Exception:

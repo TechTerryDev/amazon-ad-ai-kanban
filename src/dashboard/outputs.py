@@ -47,7 +47,7 @@ from src.core.risk_scoring import (
     risk_level,
 )
 from src.core.schema import CAN
-from src.core.utils import json_dumps
+from src.core.utils import json_dumps, safe_div
 from src.dashboard.keyword_topics import (
     annotate_keyword_topic_action_hints,
     build_keyword_topic_action_hints,
@@ -1844,6 +1844,60 @@ tbody tr:hover td{background:rgba(37,99,235,.06);}
     color:var(--text);
     margin-bottom:6px;
   }
+  .phase-line-controls{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    margin:10px 0 12px;
+    font-size:12px;
+    color:var(--muted);
+  }
+  .phase-line-controls .ctl{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    padding:6px 10px;
+    border-radius:10px;
+    border:1px solid var(--border);
+    background:rgba(255,255,255,.7);
+  }
+  @media (prefers-color-scheme: dark){
+    .phase-line-controls .ctl{background:rgba(2,6,23,.4);}
+  }
+  .phase-line-controls input,
+  .phase-line-controls select{
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:4px 8px;
+    font:inherit;
+    color:var(--text);
+    background:transparent;
+  }
+  .phase-line-chart{
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    background:var(--card);
+    overflow:auto;
+  }
+  .phase-line-canvas{
+    min-width:760px;
+    width:100%;
+    height:280px;
+    display:block;
+  }
+  .phase-line-panel{
+    margin-top:10px;
+    padding:10px 12px;
+    border-radius:12px;
+    border:1px dashed var(--border);
+    color:var(--muted);
+    font-size:12px;
+  }
+  .phase-line-panel .label{
+    font-weight:700;
+    color:var(--text);
+    margin-bottom:6px;
+  }
   .vis-item.phase-launch{border-color:#22c55e;background:#dcfce7;}
   .vis-item.phase-growth{border-color:#16a34a;background:#bbf7d0;}
   .vis-item.phase-stable{border-color:#3b82f6;background:#dbeafe;}
@@ -2093,6 +2147,381 @@ function _initVisTimeline(){
 
   _applyFilters();
 }
+
+function _initPhaseLineChart(){
+  const host=_qs('#phaseLineChart');
+  if(!host){ return; }
+  const controls=_qs('#phaseLineControls');
+  const panel=_qs('#phaseLinePanel');
+  const b64 = host.getAttribute('data-vis') || (_qs('#visTimeline') ? (_qs('#visTimeline').getAttribute('data-vis') || '') : '');
+  if(!b64){
+    if(panel){ panel.innerHTML='<div class="label">提示</div><div>暂无可用数据</div>'; }
+    return;
+  }
+  let payload=null;
+  try{ payload = JSON.parse(_visDecode(b64) || '{}'); }catch(e){ payload=null; }
+  if(!payload || !Array.isArray(payload.items) || payload.items.length===0){
+    if(panel){ panel.innerHTML='<div class="label">提示</div><div>暂无可用数据</div>'; }
+    return;
+  }
+
+  function _esc(s){
+    return String(s||'')
+      .replace(/&/g,'&amp;')
+      .replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;')
+      .replace(/'/g,'&#39;');
+  }
+  function _toDate(s){
+    const d = new Date(String(s||''));
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  function _isoDay(d){
+    if(!(d instanceof Date) || Number.isNaN(d.getTime())) return '';
+    const y=d.getFullYear();
+    const m=String(d.getMonth()+1).padStart(2,'0');
+    const day=String(d.getDate()).padStart(2,'0');
+    return y+'-'+m+'-'+day;
+  }
+  function _addDays(d, n){
+    return new Date(d.getTime() + Number(n||0)*24*60*60*1000);
+  }
+  function _phaseLabel(p){
+    const map={
+      'pre_launch':'pre',
+      'launch':'launch',
+      'growth':'growth',
+      'stable':'stable',
+      'mature':'mature',
+      'decline':'decline',
+      'inactive':'inactive',
+      'unknown':'unknown'
+    };
+    return map[String(p||'').trim()] || String(p||'unknown');
+  }
+  function _phaseColor(p){
+    const map={
+      'pre_launch':'#a1a1aa',
+      'launch':'#22c55e',
+      'growth':'#16a34a',
+      'stable':'#3b82f6',
+      'mature':'#6366f1',
+      'decline':'#f97316',
+      'inactive':'#ef4444',
+      'unknown':'#94a3b8'
+    };
+    return map[String(p||'').trim()] || '#94a3b8';
+  }
+  function _transitionReason(prevPhase, nextPhase, nextDays){
+    const prev = String(prevPhase||'').trim();
+    const next = String(nextPhase||'').trim();
+    const d = Number(nextDays||0);
+    const dd = d > 0 ? ('（'+String(d)+'d）') : '';
+    if(prev==='pre_launch' && next==='launch') return '首单/启动信号出现，进入 launch'+dd;
+    if(prev==='launch' && next==='growth') return '冷启动通过验证，进入 growth 放量观察'+dd;
+    if(prev==='launch' && next==='decline') return '启动转化偏弱，进入 decline 需先控量'+dd;
+    if(prev==='growth' && next==='stable') return '增速放缓，进入 stable 稳态运营'+dd;
+    if(prev==='growth' && next==='decline') return '增长走弱，转入 decline 修复'+dd;
+    if(prev==='stable' && next==='growth') return '效率/销量改善，重回 growth'+dd;
+    if(prev==='stable' && next==='decline') return '稳态转弱，进入 decline'+dd;
+    if(prev==='mature' && next==='decline') return '成熟段需求回落，进入 decline'+dd;
+    if(prev==='decline' && (next==='growth' || next==='stable' || next==='mature')) return '修复生效，阶段回升到 '+_phaseLabel(next)+dd;
+    if(next==='inactive') return '活动或供给中断，进入 inactive'+dd;
+    if(prev==='inactive' && next!=='inactive') return '恢复投放/供给后重启，进入 '+_phaseLabel(next)+dd;
+    return _phaseLabel(prev)+' → '+_phaseLabel(next)+' 阶段切换'+dd;
+  }
+
+  const allItems = payload.items
+    .map((it, idx)=>{
+      const asin = String(it.asin||'').trim().toUpperCase();
+      const fallbackId = String(it.id||'').trim();
+      const key = asin || fallbackId || ('ITEM_'+String(idx+1));
+      return Object.assign({}, it, {
+        _key: key,
+        _asin_display: asin || fallbackId || '-'
+      });
+    })
+    .sort((a,b)=>Number(b.score||0)-Number(a.score||0));
+
+  if(allItems.length===0){
+    if(panel){ panel.innerHTML='<div class="label">提示</div><div>暂无可用商品数据</div>'; }
+    return;
+  }
+
+  const asinMap = new Map();
+  allItems.forEach(it=>{
+    const key=String(it._key||'').trim();
+    if(!key) return;
+    if(!asinMap.has(key)){ asinMap.set(key, it); }
+  });
+  const asinItems = Array.from(asinMap.values());
+
+  if(controls){
+    controls.innerHTML = [
+      '<div class="ctl"><label>类目</label><select id="phaseLineCategory"></select></div>',
+      '<div class="ctl"><label>阶段</label><select id="phaseLinePhase"></select></div>',
+      '<div class="ctl"><label>ASIN</label><select id="phaseLineAsin"></select></div>',
+      '<div class="ctl"><label>搜索</label><input id="phaseLineQuery" placeholder="产品名/ASIN" /></div>',
+      '<div class="ctl"><button class="btn" id="phaseLinePrev" type="button">上一条</button></div>',
+      '<div class="ctl"><button class="btn" id="phaseLineNext" type="button">下一条</button></div>',
+      '<div class="ctl"><button class="btn" id="phaseLineReset" type="button">重置</button></div>'
+    ].join('');
+  }
+
+  const selCategory = document.getElementById('phaseLineCategory');
+  const selPhase = document.getElementById('phaseLinePhase');
+  const sel = document.getElementById('phaseLineAsin');
+  const query = document.getElementById('phaseLineQuery');
+  const btnPrev = document.getElementById('phaseLinePrev');
+  const btnNext = document.getElementById('phaseLineNext');
+  const btnReset = document.getElementById('phaseLineReset');
+
+  function _itemName(it){
+    return String(it.display_name || it.name || '').trim();
+  }
+  function _categoryName(it){
+    return String(it.category || '（未分类）').trim() || '（未分类）';
+  }
+  function _phaseValue(it){
+    return String(it.current_phase || it.phase || 'unknown').trim().toLowerCase() || 'unknown';
+  }
+  function _renderFacetOptions(){
+    if(selCategory){
+      const categorySet = new Set();
+      asinItems.forEach(it=>{ categorySet.add(_categoryName(it)); });
+      const categories = Array.from(categorySet.values()).sort((a,b)=>a.localeCompare(b,'zh'));
+      const current = String(selCategory.value || '').trim();
+      selCategory.innerHTML = ['<option value="">全部类目</option>'].concat(
+        categories.map(cat=>'<option value="'+_esc(cat)+'">'+_esc(cat)+'</option>')
+      ).join('');
+      selCategory.value = categories.some(cat=>cat===current) ? current : '';
+    }
+    if(selPhase){
+      const phaseSet = new Set();
+      asinItems.forEach(it=>{ phaseSet.add(_phaseValue(it)); });
+      const phaseRank = ['pre_launch','launch','growth','stable','mature','decline','inactive','unknown'];
+      const phases = Array.from(phaseSet.values()).sort((a,b)=>{
+        const ia = phaseRank.indexOf(a);
+        const ib = phaseRank.indexOf(b);
+        const va = ia >= 0 ? ia : 999;
+        const vb = ib >= 0 ? ib : 999;
+        if(va !== vb){ return va - vb; }
+        return String(a).localeCompare(String(b));
+      });
+      const current = String(selPhase.value || '').trim().toLowerCase();
+      selPhase.innerHTML = ['<option value="">全部阶段</option>'].concat(
+        phases.map(ph=>'<option value="'+_esc(ph)+'">'+_esc(_phaseLabel(ph))+'</option>')
+      ).join('');
+      selPhase.value = phases.some(ph=>ph===current) ? current : '';
+    }
+  }
+
+  function _buildOptions(filterText){
+    if(!sel) return;
+    const categoryFilter = selCategory ? String(selCategory.value||'').trim() : '';
+    const phaseFilter = selPhase ? String(selPhase.value||'').trim().toLowerCase() : '';
+    const q = String(filterText||'').trim().toLowerCase();
+    const options = asinItems.filter(it=>{
+      if(categoryFilter && _categoryName(it) !== categoryFilter){ return false; }
+      if(phaseFilter && _phaseValue(it) !== phaseFilter){ return false; }
+      if(!q) return true;
+      const hay=(
+        _itemName(it)+' '+String(it._asin_display||'')+' '+String(it._key||'')+' '+_categoryName(it)
+      ).toLowerCase();
+      return hay.indexOf(q) >= 0;
+    });
+    const current=sel.value;
+    sel.innerHTML = options.map(it=>{
+      const key=String(it._key||'').trim();
+      const asinShow=String(it._asin_display||'-').trim();
+      const nm=_itemName(it) || asinShow || key;
+      const ph=_phaseLabel(_phaseValue(it));
+      const cat=_categoryName(it);
+      return '<option value="'+_esc(key)+'">'+_esc(nm)+' ('+_esc(asinShow)+') · '+_esc(cat)+' · '+_esc(ph)+'</option>';
+    }).join('');
+    if(options.length===0){
+      sel.innerHTML='<option value="">（无匹配）</option>';
+      return;
+    }
+    const hasCurrent = options.some(it=>String(it._key||'').trim()===String(current||'').trim());
+    sel.value = hasCurrent ? current : String(options[0]._key||'').trim();
+  }
+
+  function _currentItem(){
+    const key = sel ? String(sel.value||'').trim() : '';
+    if(!key) return null;
+    return asinMap.get(key) || null;
+  }
+
+  function _segmentRows(item){
+    const raw = Array.isArray(item.segments) ? item.segments : [];
+    const segs = raw
+      .map(s=>({
+        phase: String((s && s.phase) || '').trim() || 'unknown',
+        start: _toDate((s && s.start) || ''),
+        end: _toDate((s && s.end) || ''),
+        days: Number((s && s.days) || 0)
+      }))
+      .filter(s=>s.start && s.end && s.end >= s.start && s.days > 0);
+    if(segs.length>0) return segs;
+    const st = _toDate(item.cycle_start || item.start || '');
+    const ed = _toDate(item.cycle_end || item.end || '');
+    if(st && ed && ed>=st){
+      return [{phase: String(item.current_phase||item.phase||'unknown'), start: st, end: ed, days: Math.max(1, Math.round((ed-st)/(24*60*60*1000))+1)}];
+    }
+    return [];
+  }
+
+  function _render(){
+    const item = _currentItem();
+    if(!item){
+      host.innerHTML='';
+      if(panel){ panel.innerHTML='<div class="label">提示</div><div>请选择产品</div>'; }
+      return;
+    }
+    const segs = _segmentRows(item);
+    if(segs.length===0){
+      host.innerHTML='<div class="hint" style="padding:12px;">该 ASIN 无可用阶段数据</div>';
+      if(panel){ panel.innerHTML='<div class="label">'+_esc(_itemName(item)||item.asin||item._key||'')+'</div><div>暂无可绘制的阶段序列。</div>'; }
+      return;
+    }
+
+    const phaseOrder=['inactive','pre_launch','launch','growth','stable','mature','decline'];
+    const yMap={};
+    phaseOrder.forEach((p,i)=>{ yMap[p]=i; });
+    const left=120, right=26, top=20, bottom=30;
+    const start=segs[0].start;
+    const end=segs[segs.length-1].end;
+    const totalDays=Math.max(1, Math.round((end-start)/(24*60*60*1000))+1);
+    const width=Math.max(900, totalDays*4);
+    const height=280;
+    const plotW=width-left-right;
+    const rowH=(height-top-bottom)/(phaseOrder.length-1);
+    function xOf(d){
+      const days=(d-start)/(24*60*60*1000);
+      return left + (days/Math.max(1,totalDays-1))*plotW;
+    }
+    function yOf(phase){
+      const idx = yMap.hasOwnProperty(phase) ? yMap[phase] : yMap['inactive'];
+      return top + idx*rowH;
+    }
+
+    const parts=[];
+    parts.push('<svg class="phase-line-canvas" viewBox="0 0 '+width+' '+height+'" preserveAspectRatio="none">');
+    parts.push('<rect x="0" y="0" width="'+width+'" height="'+height+'" fill="transparent" />');
+    for(let i=0;i<phaseOrder.length;i++){
+      const ph=phaseOrder[i];
+      const y=yOf(ph);
+      parts.push('<line x1="'+left+'" y1="'+y+'" x2="'+(width-right)+'" y2="'+y+'" stroke="rgba(148,163,184,.22)" stroke-width="1" />');
+      parts.push('<text x="'+(left-8)+'" y="'+(y+4)+'" text-anchor="end" font-size="11" fill="var(--muted)">'+_esc(_phaseLabel(ph))+'</text>');
+    }
+    parts.push('<line x1="'+left+'" y1="'+(height-bottom)+'" x2="'+(width-right)+'" y2="'+(height-bottom)+'" stroke="rgba(148,163,184,.35)" stroke-width="1.2" />');
+    const tickN = Math.min(8, Math.max(3, Math.floor(totalDays/30)+2));
+    for(let i=0;i<tickN;i++){
+      const ratio = tickN===1 ? 0 : i/(tickN-1);
+      const d = _addDays(start, Math.round((totalDays-1)*ratio));
+      const x = left + ratio*plotW;
+      parts.push('<line x1="'+x+'" y1="'+(height-bottom)+'" x2="'+x+'" y2="'+(height-bottom+5)+'" stroke="rgba(148,163,184,.4)" stroke-width="1" />');
+      parts.push('<text x="'+x+'" y="'+(height-8)+'" text-anchor="middle" font-size="10" fill="var(--muted)">'+_esc(_isoDay(d).slice(5))+'</text>');
+    }
+
+    for(let i=0;i<segs.length;i++){
+      const seg=segs[i];
+      const y=yOf(seg.phase);
+      const segStart = seg.start;
+      const segEndExclusive = _addDays(seg.end, 1);
+      const x0=xOf(segStart);
+      const x1=xOf(segEndExclusive);
+      const color=_phaseColor(seg.phase);
+      parts.push('<line x1="'+x0+'" y1="'+y+'" x2="'+x1+'" y2="'+y+'" stroke="'+color+'" stroke-width="4" stroke-linecap="round" />');
+      parts.push('<circle cx="'+x0+'" cy="'+y+'" r="2.8" fill="'+color+'" />');
+      if(i===segs.length-1){ parts.push('<circle cx="'+x1+'" cy="'+y+'" r="2.8" fill="'+color+'" />'); }
+      if((x1-x0) > 56){
+        const xm=(x0+x1)/2;
+        const txt=_phaseLabel(seg.phase)+' '+String(seg.days||0)+'d';
+        parts.push('<text x="'+xm+'" y="'+(y-7)+'" text-anchor="middle" font-size="10" fill="'+color+'">'+_esc(txt)+'</text>');
+      }
+      if(i < segs.length-1){
+        const next=segs[i+1];
+        const y2=yOf(next.phase);
+        const xJump=x1;
+        parts.push('<line x1="'+xJump+'" y1="'+y+'" x2="'+xJump+'" y2="'+y2+'" stroke="'+_phaseColor(next.phase)+'" stroke-width="2" stroke-dasharray="4 3" />');
+      }
+    }
+    parts.push('</svg>');
+    host.innerHTML=parts.join('');
+
+    if(panel){
+      const detail = segs.map(s=>_phaseLabel(s.phase)+' '+String(s.days||0)+'d').join(' → ');
+      const transitions = [];
+      for(let i=1;i<segs.length;i++){
+        const prev = segs[i-1];
+        const cur = segs[i];
+        transitions.push(_transitionReason(prev.phase, cur.phase, cur.days));
+      }
+      const transitionText = transitions.length > 0 ? transitions.slice(-4).join('；') : '当前周期内无阶段切换';
+      panel.innerHTML = [
+        '<div class="label">'+_esc(_itemName(item) || item.asin || item._key || '')+'</div>',
+        '<div>ASIN：'+_esc(item.asin || item._asin_display || item._key || '-')+'</div>',
+        '<div>类目：'+_esc(_categoryName(item))+'</div>',
+        '<div>当前阶段：'+_esc(_phaseLabel(_phaseValue(item)))+'</div>',
+        '<div>周期：'+_esc(_isoDay(start))+' ~ '+_esc(_isoDay(end))+'（'+String(totalDays)+'天）</div>',
+        '<div>阶段序列：'+_esc(detail || '-')+'</div>',
+        '<div>切换解读：'+_esc(transitionText)+'</div>',
+        '<div>说明：该图用于单 ASIN 的阶段演进解读；跨产品横向对比请继续看上方甘特图。</div>'
+      ].join('');
+    }
+  }
+
+  _renderFacetOptions();
+  _buildOptions('');
+  _render();
+  if(sel){ sel.addEventListener('change', _render); }
+  if(selCategory){
+    selCategory.addEventListener('change', ()=>{
+      _buildOptions(query ? (query.value || '') : '');
+      _render();
+    });
+  }
+  if(selPhase){
+    selPhase.addEventListener('change', ()=>{
+      _buildOptions(query ? (query.value || '') : '');
+      _render();
+    });
+  }
+  if(query){
+    query.addEventListener('input', ()=>{
+      _buildOptions(query.value || '');
+      _render();
+    });
+  }
+  if(btnPrev){
+    btnPrev.addEventListener('click', ()=>{
+      if(!sel || !sel.options || sel.options.length===0) return;
+      const idx=Math.max(0, sel.selectedIndex-1);
+      sel.selectedIndex=idx;
+      _render();
+    });
+  }
+  if(btnNext){
+    btnNext.addEventListener('click', ()=>{
+      if(!sel || !sel.options || sel.options.length===0) return;
+      const idx=Math.min(sel.options.length-1, sel.selectedIndex+1);
+      sel.selectedIndex=idx;
+      _render();
+    });
+  }
+  if(btnReset){
+    btnReset.addEventListener('click', ()=>{
+      if(query){ query.value=''; }
+      if(selCategory){ selCategory.value=''; }
+      if(selPhase){ selPhase.value=''; }
+      _buildOptions('');
+      _render();
+    });
+  }
+}
 """
         if extra_css:
             css = css + "\n" + extra_css
@@ -2104,6 +2533,9 @@ function _slugify(s){
   const cleaned=t.replace(/[^a-z0-9\u4e00-\u9fff_\-]+/g,'');
   return cleaned;
 }
+
+// 默认空实现：dashboard.html 会在 extra_js 中覆盖为真实交互逻辑
+function _initPhaseLineChart(){}
 
 // 轻量表格排序：点击表头即可按该列排序（数字/文本自动识别）
 function _parseNum(t){
@@ -3522,6 +3954,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   _safe(_decorateCardPriority);
   _safe(_renderTimelines);
   _safe(_initVisTimeline);
+  _safe(_initPhaseLineChart);
   _safe(_bindTimelineRerender);
   _safe(_autoStyleTables);
   _safe(_initToTop);
@@ -3537,6 +3970,7 @@ function _rehydrateCore(){
   _safe(_initTocActive);
   _safe(_renderTimelines);
   _safe(_bindTimelineRerender);
+  _safe(_initPhaseLineChart);
 }
 
 window.addEventListener('load', ()=>{
@@ -3871,6 +4305,14 @@ def build_compare_summary_table(scorecard: Dict[str, object]) -> pd.DataFrame:
         "ad_acos_prev",
         "delta_ad_acos",
         "marginal_tacos",
+        "delta_sales_corrected",
+        "delta_ad_spend_corrected",
+        "delta_profit_corrected",
+        "marginal_tacos_corrected",
+        "promo_days_prev",
+        "promo_days_recent",
+        "promo_or_seasonality_adjusted",
+        "promo_or_seasonality_note",
     ]
 
     def _num(x: object, nd: int = 2) -> float:
@@ -3953,6 +4395,14 @@ def build_compare_summary_table(scorecard: Dict[str, object]) -> pd.DataFrame:
                 if "delta_ad_acos" in c
                 else _num_ratio(c.get("ad_acos_recent", 0.0)) - _num_ratio(c.get("ad_acos_prev", 0.0)),
                 "marginal_tacos": _num_ratio(c.get("marginal_tacos", 0.0)),
+                "delta_sales_corrected": _num(c.get("delta_sales_corrected", 0.0)),
+                "delta_ad_spend_corrected": _num(c.get("delta_ad_spend_corrected", 0.0)),
+                "delta_profit_corrected": _num(c.get("delta_profit_corrected", 0.0)),
+                "marginal_tacos_corrected": _num_ratio(c.get("marginal_tacos_corrected", 0.0)),
+                "promo_days_prev": _num(c.get("promo_days_prev", 0.0), nd=0),
+                "promo_days_recent": _num(c.get("promo_days_recent", 0.0), nd=0),
+                "promo_or_seasonality_adjusted": bool(c.get("promo_or_seasonality_adjusted", False)),
+                "promo_or_seasonality_note": str(c.get("promo_or_seasonality_note", "") or ""),
             }
             out_rows.append(row)
         if not out_rows:
@@ -7224,6 +7674,210 @@ def build_profit_guard_watchlist(
         return pd.DataFrame()
 
 
+def build_placement_rebalance_plan(
+    action_board_dedup_all: Optional[pd.DataFrame],
+    stage: str,
+    policy: Optional[OpsPolicy] = None,
+    max_rows: int = 200,
+) -> pd.DataFrame:
+    """
+    基于 placement 层动作生成预算重分配建议（同 campaign 内优先平移）。
+    """
+    cols = [
+        "priority",
+        "transfer_type",
+        "ad_type",
+        "campaign",
+        "from_placement",
+        "to_placement",
+        "amount_usd_estimated",
+        "shift_ratio",
+        "from_spend",
+        "from_acos",
+        "to_spend",
+        "to_acos",
+        "from_action_priority_score",
+        "to_action_priority_score",
+        "owner",
+        "execution_style",
+        "reason",
+        "expected_signal",
+        "rollback_guard",
+        "next_step",
+        "playbook_scene",
+        "playbook_url",
+    ]
+    ab = action_board_dedup_all.copy() if isinstance(action_board_dedup_all, pd.DataFrame) else pd.DataFrame()
+    if ab is None or ab.empty:
+        return pd.DataFrame(columns=cols)
+
+    need_cols = {"level", "action_type", "ad_type", "campaign", "object_name"}
+    if not need_cols.issubset(set(ab.columns)):
+        return pd.DataFrame(columns=cols)
+
+    out = ab.copy()
+    out["level"] = out["level"].astype(str).str.strip().str.lower()
+    out["action_type"] = out["action_type"].astype(str).str.strip().str.upper()
+    out["ad_type"] = out["ad_type"].astype(str).str.strip().str.upper()
+    out["campaign"] = out["campaign"].astype(str).str.strip()
+    out["object_name"] = out["object_name"].astype(str).str.strip()
+    out = out[(out["level"] == "placement") & (out["action_type"].isin({"BID_UP", "BID_DOWN"}))].copy()
+    out = out[(out["ad_type"] != "") & (out["campaign"] != "") & (out["object_name"] != "")].copy()
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+
+    try:
+        out["blocked"] = pd.to_numeric(out.get("blocked", 0), errors="coerce").fillna(0).astype(int)
+        out = out[out["blocked"] <= 0].copy()
+    except Exception:
+        pass
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+
+    prb = getattr(policy, "dashboard_placement_rebalance", None) if isinstance(policy, OpsPolicy) else None
+    if prb is not None and (not bool(getattr(prb, "enabled", True))):
+        return pd.DataFrame(columns=cols)
+
+    out["e_spend"] = pd.to_numeric(out.get("e_spend", 0.0), errors="coerce").fillna(0.0)
+    out["action_priority_score"] = pd.to_numeric(out.get("action_priority_score", 0.0), errors="coerce").fillna(0.0)
+
+    def _extract_acos(r: pd.Series) -> float:
+        try:
+            v = float(r.get("e_acos", 0.0) or 0.0)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+        try:
+            ev = r.get("evidence_json", "")
+            data = json.loads(ev) if isinstance(ev, str) and ev.strip() else {}
+            v = float(data.get("acos", 0.0) or 0.0)
+            return v if v > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    try:
+        out["e_acos"] = out.apply(_extract_acos, axis=1)
+    except Exception:
+        out["e_acos"] = 0.0
+
+    cfg = get_stage_config(stage)
+    target_acos = max(float(getattr(cfg, "target_acos", 0.0) or 0.0), 1e-6)
+    min_shift_ratio = max(0.0, min(1.0, float(getattr(prb, "min_shift_ratio", 0.10) or 0.10)))
+    base_shift_ratio = max(min_shift_ratio, min(1.0, float(getattr(prb, "base_shift_ratio", 0.12) or 0.12)))
+    max_shift_ratio = max(base_shift_ratio, min(1.0, float(getattr(prb, "max_shift_ratio", 0.35) or 0.35)))
+    severity_weight = max(0.0, float(getattr(prb, "severity_weight", 0.10) or 0.10))
+    fallback_severity = max(0.0, float(getattr(prb, "fallback_severity", 0.60) or 0.60))
+    min_shift = max(
+        max(0.0, float(getattr(prb, "min_shift_usd", 5.0) or 5.0)),
+        float(getattr(cfg, "waste_spend", 0.0) or 0.0) * max(0.0, float(getattr(prb, "stage_waste_floor_ratio", 0.10) or 0.10)),
+    )
+    max_down_per_campaign = max(1, int(getattr(prb, "max_down_per_campaign", 12) or 12))
+
+    rows: List[Dict[str, object]] = []
+    for (ad_type, campaign), gg in out.groupby(["ad_type", "campaign"], dropna=False):
+        ups = gg[gg["action_type"] == "BID_UP"].copy()
+        downs = gg[gg["action_type"] == "BID_DOWN"].copy()
+        if downs.empty:
+            continue
+        ups = ups.sort_values(["action_priority_score", "e_spend"], ascending=[False, False]).copy()
+        downs = downs.sort_values(["action_priority_score", "e_spend"], ascending=[False, False]).copy()
+
+        for _, d in downs.head(max_down_per_campaign).iterrows():
+            from_placement = str(d.get("object_name", "") or "").strip()
+            if not from_placement:
+                continue
+            to_row = pd.Series(dtype=object)
+            if not ups.empty:
+                cand = ups[ups["object_name"].astype(str).str.strip() != from_placement].copy()
+                if not cand.empty:
+                    to_row = cand.iloc[0]
+
+            from_spend = max(float(d.get("e_spend", 0.0) or 0.0), 0.0)
+            from_acos = max(float(d.get("e_acos", 0.0) or 0.0), 0.0)
+            severity = max(0.0, safe_div(from_acos - target_acos, target_acos)) if from_acos > 0 else fallback_severity
+            shift_ratio = max(min_shift_ratio, min(max_shift_ratio, base_shift_ratio + severity * severity_weight))
+            amount = round(max(min_shift, from_spend * shift_ratio), 2)
+
+            if to_row.empty:
+                transfer_type = "reserve"
+                to_placement = "RESERVE"
+                to_spend = 0.0
+                to_acos = 0.0
+                to_score = 0.0
+                reason = "同 Campaign 暂无明显优质广告位承接，先回收预算到 RESERVE。"
+                execution_style = "风险控制（先回收后观察）"
+                expected_signal = "24h 内 from_placement 花费下降，订单/CTR 基本稳定。"
+                rollback_guard = "若订单下滑>15%或CTR下滑>20%，下轮先减半回收比例。"
+                next_step = f"先回收约 ${amount:.2f} 到 RESERVE，不急着二次分配；明天复盘该 Campaign 的订单与CTR再决定去向。"
+            else:
+                transfer_type = "transfer"
+                to_placement = str(to_row.get("object_name", "") or "").strip() or "RESERVE"
+                to_spend = max(float(to_row.get("e_spend", 0.0) or 0.0), 0.0)
+                to_acos = max(float(to_row.get("e_acos", 0.0) or 0.0), 0.0)
+                to_score = max(float(to_row.get("action_priority_score", 0.0) or 0.0), 0.0)
+                reason = "同 Campaign 广告位预算平移：从高损耗位置回收，向高效率位置倾斜。"
+                execution_style = "小步试投（先验证再放大）" if shift_ratio < 0.22 else "止损优先（强动作）"
+                expected_signal = "48h 内 to_placement 的转化率/订单占比提升，整体 ACoS 不劣化。"
+                rollback_guard = "若 to_placement 未改善且 from_placement 订单回撤明显，恢复最近一次平移金额。"
+                next_step = (
+                    f"先平移约 ${amount:.2f}（{from_placement} → {to_placement}），"
+                    "48h 复盘后再决定是否继续加码，避免一次性调太猛。"
+                )
+
+            priority = str(d.get("priority", "") or "").strip().upper()
+            if priority not in {"P0", "P1", "P2"}:
+                priority = "P1"
+
+            scene = "scene-placement-rebalance"
+            rows.append(
+                {
+                    "priority": priority,
+                    "transfer_type": transfer_type,
+                    "ad_type": str(ad_type or ""),
+                    "campaign": str(campaign or ""),
+                    "from_placement": from_placement,
+                    "to_placement": to_placement,
+                    "amount_usd_estimated": amount,
+                    "shift_ratio": round(float(shift_ratio), 4),
+                    "from_spend": round(float(from_spend), 2),
+                    "from_acos": round(float(from_acos), 4),
+                    "to_spend": round(float(to_spend), 2),
+                    "to_acos": round(float(to_acos), 4),
+                    "from_action_priority_score": round(float(d.get("action_priority_score", 0.0) or 0.0), 2),
+                    "to_action_priority_score": round(float(to_score), 2),
+                    "owner": "广告运营",
+                    "execution_style": execution_style,
+                    "reason": reason,
+                    "expected_signal": expected_signal,
+                    "rollback_guard": rollback_guard,
+                    "next_step": next_step,
+                    "playbook_scene": scene,
+                    "playbook_url": f"{PB_DOC_REL}#{scene}",
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    res = pd.DataFrame(rows)
+    try:
+        rank = {"P0": 0, "P1": 1, "P2": 2}
+        res["_pr"] = res["priority"].map(lambda x: rank.get(str(x).upper(), 9))
+        res = res.sort_values(
+            ["_pr", "amount_usd_estimated", "from_action_priority_score"],
+            ascending=[True, False, False],
+        ).copy()
+        res = res.drop(columns=["_pr"], errors="ignore")
+    except Exception:
+        pass
+
+    n = max(1, int(max_rows or 1))
+    res = res.head(n).copy()
+    keep = [c for c in cols if c in res.columns]
+    return res[keep].reset_index(drop=True)
+
+
 def build_budget_transfer_plan_with_opportunities(
     budget_transfer_plan: Optional[Dict[str, object]],
     scale_opportunity_watchlist: Optional[pd.DataFrame],
@@ -8964,6 +9618,7 @@ def score_action_board(
     action_board: pd.DataFrame,
     asin_focus_all: Optional[pd.DataFrame],
     policy: OpsPolicy,
+    action_review: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     给 Action Board 增加“运营化优先级”字段，并调整默认排序。
@@ -9360,6 +10015,62 @@ def score_action_board(
     df["blocked"] = blocked_list
     df["blocked_reason"] = blocked_reason_list
 
+    # 2.5) 动作闭环表现（按 action_type 聚合），用于把“历史有效动作”提到前面
+    loop_stats: Dict[str, Dict[str, float]] = {}
+    try:
+        ar = action_review.copy() if isinstance(action_review, pd.DataFrame) else pd.DataFrame()
+        if ar is not None and (not ar.empty) and ("action_type" in ar.columns):
+            ar["action_type"] = ar["action_type"].astype(str).fillna("").str.strip().str.upper()
+            ar = ar[ar["action_type"] != ""].copy()
+            if "window_days" in ar.columns:
+                ar["window_days"] = pd.to_numeric(ar.get("window_days"), errors="coerce").fillna(0).astype(int)
+                candidate = [int(x) for x in ar["window_days"].unique().tolist() if int(x) > 0]
+            else:
+                ar["window_days"] = 0
+                candidate = []
+            target_window = 7 if 7 in candidate else (min(candidate) if candidate else 0)
+            if target_window > 0:
+                ar = ar[ar["window_days"] == int(target_window)].copy()
+            recent_days = int(
+                getattr(
+                    getattr(policy, "dashboard_action_scoring", None) or ActionScoringPolicy(),
+                    "action_loop_recent_window_days",
+                    7,
+                )
+                or 7
+            )
+            if recent_days > 0:
+                date_col = next((c for c in ("executed_at", "action_date", "date") if c in ar.columns), "")
+                if date_col:
+                    dt = pd.to_datetime(ar.get(date_col), errors="coerce")
+                    max_dt = dt.max()
+                    if pd.notna(max_dt):
+                        cutoff = max_dt - pd.Timedelta(days=max(1, recent_days) - 1)
+                        ar = ar[dt >= cutoff].copy()
+            if "status" in ar.columns:
+                ar["status"] = ar["status"].astype(str).fillna("").str.strip().str.lower()
+                ar = ar[ar["status"] == "ok"].copy()
+            if "action_loop_score" not in ar.columns:
+                ar["action_loop_score"] = 50.0
+            ar["action_loop_score"] = pd.to_numeric(ar.get("action_loop_score"), errors="coerce").fillna(50.0)
+            if "action_loop_label" not in ar.columns:
+                ar["action_loop_label"] = ""
+            ar["action_loop_label"] = ar["action_loop_label"].astype(str).fillna("").str.strip().str.lower()
+            for act, g in ar.groupby("action_type", dropna=False):
+                if not act:
+                    continue
+                cnt = int(len(g))
+                if cnt <= 0:
+                    continue
+                pos = int((g["action_loop_label"] == "positive").sum()) if "action_loop_label" in g.columns else 0
+                loop_stats[str(act)] = {
+                    "avg_score": float(pd.to_numeric(g.get("action_loop_score"), errors="coerce").fillna(50.0).mean()),
+                    "positive_rate": (float(pos) / float(cnt)) if cnt > 0 else 0.0,
+                    "count": float(cnt),
+                }
+    except Exception:
+        loop_stats = {}
+
     # 3) 计算 action_priority_score（排序分）
     ap = getattr(policy, "dashboard_action_scoring", None) or ActionScoringPolicy()
     pr_rank = {"P0": 0, "P1": 1, "P2": 2}
@@ -9395,11 +10106,213 @@ def score_action_board(
             return "阻断:低库存"
         return "阻断"
 
+    def _phase_to_stage(phase: str) -> str:
+        p = str(phase or "").strip().lower()
+        if p in {"launch", "pre_launch"}:
+            return "launch"
+        if p in {"growth"}:
+            return "growth"
+        return "profit"
+
+    def _fmt_metric_usd(v: object) -> str:
+        x = _safe_float(v)
+        try:
+            if pd.isna(x):
+                x = 0.0
+        except Exception:
+            pass
+        return f"${x:.2f}"
+
+    def _fmt_metric_pct(v: object) -> str:
+        x = _safe_float(v)
+        try:
+            if pd.isna(x):
+                x = 0.0
+        except Exception:
+            pass
+        return f"{x * 100:.1f}%"
+
+    def _owner_for_action(act: str, blocked_reason: str, level: str) -> str:
+        br = str(blocked_reason or "")
+        lv = str(level or "").strip().lower()
+        if ("库存" in br) or ("断货" in br):
+            return "供应链/广告运营"
+        if act == "REVIEW" and lv == "asin":
+            return "运营/广告运营"
+        if act == "REVIEW":
+            return "广告运营/运营"
+        return "广告运营"
+
+    def _stage_label(stage_key: str) -> str:
+        s = str(stage_key or "").strip().lower()
+        if s == "launch":
+            return "新品期"
+        if s == "growth":
+            return "成长期"
+        return "利润期"
+
+    def _profit_label(pdir: str) -> str:
+        p = str(pdir or "").strip().lower()
+        if p == "reduce":
+            return "控量优先"
+        if p == "scale":
+            return "可放量"
+        return "稳态经营"
+
+    def _build_action_playbook_row(
+        act: str,
+        level: str,
+        phase: str,
+        blocked: int,
+        blocked_reason: str,
+        conf: float,
+        e_spend: float,
+        e_sales: float,
+        e_orders: float,
+        e_acos: float,
+        cover_days: float,
+        pdir: str,
+        low_conf_thr: float,
+    ) -> Tuple[str, str, str, str, str, str, str]:
+        """
+        基于动作与证据生成“更可执行”的运营建议五件套：
+        - decision_basis: 为什么触发
+        - execution_style: 执行风格
+        - operator_steps: 具体操作
+        - expected_signal: 观察信号
+        - rollback_guard: 回滚护栏
+        """
+        stage_key = _phase_to_stage(phase)
+        stage_label = _stage_label(stage_key)
+        profit_label = _profit_label(pdir)
+        target_acos = float(get_stage_config(stage_key).target_acos)
+        basis = (
+            f"spend={_fmt_metric_usd(e_spend)} | orders={int(round(max(0.0, e_orders)))} | "
+            f"sales={_fmt_metric_usd(e_sales)} | acos={_fmt_metric_pct(e_acos)} | "
+            f"target={_fmt_metric_pct(target_acos)} | stage={stage_label} | profit={profit_label} | hint_conf={conf:.2f}"
+        )
+        strategy_context = f"{stage_label}·{profit_label}"
+
+        if blocked > 0:
+            intensity = "L1谨慎"
+            style = f"{strategy_context}·{intensity}：先解锁再执行"
+            steps = "先处理阻断原因（库存/断货），阻断未解除前不执行放量动作。"
+            expected = "阻断解除后再执行加价/加预算，避免无货引流或低覆盖硬放量。"
+            rollback = "若阻断再次出现（库存跌破阈值/断货），立即暂停本轮放量动作。"
+            return basis, style, steps, expected, rollback, strategy_context, intensity
+
+        if act == "NEGATE":
+            if stage_key == "launch":
+                intensity = "L1谨慎"
+                style = f"{strategy_context}·{intensity}：轻量止损"
+                steps = "新品期先否定 1-3 个低意图词，并小幅降价 3%-5%，避免一次性大幅收口。"
+                expected = "无效点击下降，同时保留冷启动探索流量。"
+                rollback = "若曝光明显下降且转化未提升，回退最近一轮否词/降价。"
+            elif stage_key == "profit" or str(pdir or "").strip().lower() == "reduce":
+                intensity = "L3强动作"
+                style = f"{strategy_context}·{intensity}：强止损控量"
+                steps = "优先处理高花费无单词，单轮否定 5-8 个低意图词，并下调 8%-15% 出价。"
+                expected = "浪费花费快速下降，利润端压力缓解。"
+                rollback = "若订单下滑>12% 或销售下滑>18%，回滚最近一次强动作。"
+            else:
+                intensity = "L2标准"
+                style = f"{strategy_context}·{intensity}：先止损后保量"
+                steps = "先在该 campaign 中按花费排序处理高浪费词：先否定 3-5 个明显低意图词，再小步降价 5%-10%，48h 后复盘。"
+                expected = "waste_spend 下降，且订单/销售不出现明显下滑。"
+                rollback = "若订单下滑>15% 或销售下滑>20%，回滚最近一轮否词/降价。"
+            return basis, style, steps, expected, rollback, strategy_context, intensity
+
+        if act == "BID_DOWN":
+            if stage_key == "launch":
+                intensity = "L1谨慎"
+                style = f"{strategy_context}·{intensity}：温和效率修正"
+                steps = "优先下调高 ACoS 词 3%-5%，先保留探索流量，再逐步压缩低效流量。"
+                expected = "ACoS 回落，点击量不出现断崖式下滑。"
+                rollback = "若点击与订单同时明显下滑，回调到上一个出价档位。"
+            elif stage_key == "profit" or str(pdir or "").strip().lower() == "reduce":
+                intensity = "L3强动作"
+                style = f"{strategy_context}·{intensity}：利润导向降价"
+                steps = "对高 ACoS 且低转化投放位优先降价 10%-15%，把预算让给稳定出单词。"
+                expected = "48h 内 ACoS 明显改善，利润回收更快。"
+                rollback = "若核心订单显著下滑且 ACoS 未改善，回调一档并改小步降价。"
+            else:
+                intensity = "L2标准"
+                style = f"{strategy_context}·{intensity}：效率修正"
+                steps = "先对高 ACoS 投放位降价 5%-10%，保留已出单词；避免一次性大幅下调。"
+                expected = "48-72h 内 ACoS 回落并保持订单稳定。"
+                rollback = "若订单显著下滑且 ACoS 未改善，回调至上一个出价档位。"
+            return basis, style, steps, expected, rollback, strategy_context, intensity
+
+        if act in {"BID_UP", "BUDGET_UP"}:
+            if conf < float(low_conf_thr):
+                intensity = "L1谨慎"
+                style = f"{strategy_context}·{intensity}：先确认再放量"
+                steps = "先在 asin_hint_candidates 核对归因对象，确认后仅对高转化词/广告位小步加价或加预算。"
+            elif stage_key == "launch":
+                intensity = "L1谨慎"
+                style = f"{strategy_context}·{intensity}：冷启动试探放量"
+                steps = "新品期先对高点击且已转化对象小步加价 3%-5%，优先验证词包与 listing 匹配度。"
+            elif pdir == "reduce":
+                intensity = "L1谨慎"
+                style = f"{strategy_context}·{intensity}：利润保护型放量"
+                steps = "该 ASIN 利润方向偏控量，先优化结构再放量；如需加码，仅做小步测试。"
+            elif stage_key == "growth" and pdir == "scale":
+                intensity = "L3强动作"
+                style = f"{strategy_context}·{intensity}：成长期加速放量"
+                steps = "先加价 8%-12% 或加预算 10%-15%，集中投向高转化词与优质广告位。"
+            else:
+                intensity = "L2标准"
+                style = f"{strategy_context}·{intensity}：小步试投"
+                steps = "先加价 5%-10% 或小幅加预算，48h 看转化与 ACoS，再决定第二轮。"
+            if cover_days > 0:
+                steps += f" 当前 cover7d={cover_days:.1f}，放量时同步盯库存。"
+            expected = "订单/销售提升，且 ACoS 不劣化或可接受。"
+            rollback = "若连续两天 ACoS 高于目标且订单无提升，撤回最近一次加码。"
+            return basis, style, steps, expected, rollback, strategy_context, intensity
+
+        if act in {"BUDGET_DOWN", "PAUSE"}:
+            if stage_key == "profit" or str(pdir or "").strip().lower() == "reduce":
+                intensity = "L3强动作"
+                style = f"{strategy_context}·{intensity}：控损优先"
+                steps = "利润期优先收预算或暂停低效对象，再把预算让给高效率 campaign/placement。"
+            else:
+                intensity = "L2标准"
+                style = f"{strategy_context}·{intensity}：结构控损"
+                steps = "先收预算或暂停低效对象，再把预算让给高效率 campaign/placement。"
+            expected = "低效花费下降，整体转化效率提升。"
+            rollback = "若核心订单受影响明显，恢复部分预算并改为小步降价。"
+            return basis, style, steps, expected, rollback, strategy_context, intensity
+
+        # REVIEW/其他
+        intensity = "L1谨慎" if stage_key == "launch" else "L2标准"
+        style = f"{strategy_context}·{intensity}：诊断优先"
+        if str(level or "").strip().lower() in {"search_term", "targeting"}:
+            steps = "先查搜索词意图与匹配类型，再看出价和否词；必要时回看 Listing（主图/价格/评价）协同优化。"
+        elif str(level or "").strip().lower() == "placement":
+            steps = "先按广告位看 from->to 效率差，再做小步平移或系数调整。"
+        else:
+            steps = "先按 campaign 维度排查结构（词、投放位、预算分配），确认根因后再执行动作。"
+        expected = "定位出明确根因，并转化为可执行动作（否词/调价/预算平移）。"
+        rollback = "若首轮动作未见改善，回退并改用更保守策略。"
+        return basis, style, steps, expected, rollback, strategy_context, intensity
+
     scores: List[float] = []
     reasons: List[str] = []
+    loop_avg_scores: List[float] = []
+    loop_positive_rates: List[float] = []
+    loop_samples: List[int] = []
+    owner_suggested_list: List[str] = []
+    decision_basis_list: List[str] = []
+    execution_style_list: List[str] = []
+    operator_steps_list: List[str] = []
+    expected_signal_list: List[str] = []
+    rollback_guard_list: List[str] = []
+    strategy_context_list: List[str] = []
+    action_intensity_list: List[str] = []
     for _, r in df.iterrows():
         priority = str(r.get("priority", "") or "")
         act = str(r.get("action_type", "") or "").strip().upper()
+        level = str(r.get("level", "") or "").strip().lower()
         phase = str(r.get("current_phase", "") or "").strip().lower()
 
         conf = _safe_float(r.get("asin_hint_confidence", 0.0))
@@ -9435,7 +10348,21 @@ def score_action_board(
             elif pdir == "scale":
                 score += float(ap.profit_scale_scale_boost)
 
+        # 动作闭环加权：同类动作历史有效时轻微加分，反之轻微降权
+        stats = loop_stats.get(act, {})
+        avg_loop = float(stats.get("avg_score", 50.0) or 50.0)
+        pos_rate = float(stats.get("positive_rate", 0.0) or 0.0)
+        sample_cnt = int(float(stats.get("count", 0.0) or 0.0))
+        min_support = max(1, int(getattr(ap, "action_loop_min_support", 2) or 2))
+        weight_loop = float(getattr(ap, "weight_action_loop_score", 0.0) or 0.0)
+        if sample_cnt >= min_support and weight_loop != 0.0:
+            loop_delta = max(-1.0, min(1.0, (avg_loop - 50.0) / 50.0))
+            score += loop_delta * weight_loop
+
         scores.append(round(float(score), 2))
+        loop_avg_scores.append(round(float(avg_loop), 2))
+        loop_positive_rates.append(round(float(pos_rate), 4))
+        loop_samples.append(int(sample_cnt))
 
         # priority_reason：短标签（便于运营扫读）
         tags: List[str] = []
@@ -9460,6 +10387,12 @@ def score_action_board(
         elif focus_score >= 50:
             tags.append("ASIN关注")
 
+        if sample_cnt >= min_support:
+            if avg_loop >= 70:
+                tags.append("闭环优")
+            elif avg_loop <= 40:
+                tags.append("闭环弱")
+
         if phase in {"decline", "inactive"} and blocked <= 0:
             tags.append("衰退期" if phase == "decline" else "不活跃")
 
@@ -9470,8 +10403,47 @@ def score_action_board(
         uniq = uniq[:3]
         reasons.append(";".join(uniq))
 
+        e_sales = _safe_float(r.get("e_sales", 0.0))
+        e_orders = _safe_float(r.get("e_orders", 0.0))
+        e_acos = _safe_float(r.get("e_acos", 0.0))
+        cover_days = _safe_float(r.get("asin_inventory_cover_days_7d", 0.0))
+        basis, style, steps, expected, rollback, strategy_context, action_intensity = _build_action_playbook_row(
+            act=act,
+            level=level,
+            phase=phase,
+            blocked=blocked,
+            blocked_reason=blocked_reason,
+            conf=conf,
+            e_spend=e_spend,
+            e_sales=e_sales,
+            e_orders=e_orders,
+            e_acos=e_acos,
+            cover_days=cover_days,
+            pdir=pdir,
+            low_conf_thr=float(ap.low_hint_confidence_threshold),
+        )
+        owner_suggested_list.append(_owner_for_action(act=act, blocked_reason=blocked_reason, level=level))
+        decision_basis_list.append(basis)
+        execution_style_list.append(style)
+        operator_steps_list.append(steps)
+        expected_signal_list.append(expected)
+        rollback_guard_list.append(rollback)
+        strategy_context_list.append(strategy_context)
+        action_intensity_list.append(action_intensity)
+
     df["action_priority_score"] = scores
+    df["action_loop_avg_score"] = loop_avg_scores
+    df["action_loop_positive_rate"] = loop_positive_rates
+    df["action_loop_samples"] = loop_samples
     df["priority_reason"] = reasons
+    df["owner_suggested"] = owner_suggested_list
+    df["decision_basis"] = decision_basis_list
+    df["execution_style"] = execution_style_list
+    df["operator_steps"] = operator_steps_list
+    df["expected_signal"] = expected_signal_list
+    df["rollback_guard"] = rollback_guard_list
+    df["strategy_context"] = strategy_context_list
+    df["action_intensity"] = action_intensity_list
 
     # 3.1) needs_manual_confirm：弱关联动作的“人工确认”标记（便于运营一键筛选）
     # 说明：
@@ -9539,8 +10511,8 @@ def score_action_board(
     df["_e_spend"] = pd.to_numeric(df.get("e_spend", 0.0), errors="coerce").fillna(0.0)
     df["blocked"] = pd.to_numeric(df.get("blocked", 0), errors="coerce").fillna(0).astype(int)
     df = df.sort_values(
-        ["blocked", "_priority_rank", "action_priority_score", "_e_spend"],
-        ascending=[True, True, False, False],
+        ["blocked", "_priority_rank", "action_priority_score", "action_loop_avg_score", "_e_spend"],
+        ascending=[True, True, False, False, False],
     ).copy()
     df = df.drop(columns=["_priority_rank", "_e_spend"], errors="ignore")
 
@@ -9695,6 +10667,67 @@ def dedup_action_board(action_board: pd.DataFrame) -> pd.DataFrame:
 
     keep = keep.drop(columns=["_priority_rank", "_level_rank", "_dedup_bucket"], errors="ignore")
     return keep.reset_index(drop=True)
+
+
+def build_action_execution_guide(
+    action_board: Optional[pd.DataFrame],
+    max_rows: int = 300,
+) -> pd.DataFrame:
+    """
+    动作执行手册（action_execution_guide.csv）：
+    把 Action Board 的“规则结论”转换为运营可直接执行的步骤化清单。
+    """
+    cols = [
+        "priority",
+        "owner_suggested",
+        "ad_type",
+        "level",
+        "campaign",
+        "ad_group",
+        "match_type",
+        "object_name",
+        "action_type",
+        "action_value",
+        "blocked",
+        "blocked_reason",
+        "decision_basis",
+        "strategy_context",
+        "action_intensity",
+        "execution_style",
+        "operator_steps",
+        "expected_signal",
+        "rollback_guard",
+        "priority_reason",
+        "action_priority_score",
+        "playbook_scene",
+        "playbook_url",
+    ]
+    ab = action_board.copy() if isinstance(action_board, pd.DataFrame) else pd.DataFrame()
+    if ab is None or ab.empty:
+        return pd.DataFrame(columns=cols)
+
+    out = ab.copy()
+    if "action_priority_score" not in out.columns:
+        out["action_priority_score"] = 0.0
+    if "blocked" not in out.columns:
+        out["blocked"] = 0
+    out["action_priority_score"] = pd.to_numeric(out.get("action_priority_score", 0.0), errors="coerce").fillna(0.0)
+    out["blocked"] = pd.to_numeric(out.get("blocked", 0), errors="coerce").fillna(0).astype(int)
+    if "priority" not in out.columns:
+        out["priority"] = ""
+    rank = {"P0": 0, "P1": 1, "P2": 2}
+    out["_pr"] = out["priority"].astype(str).str.upper().map(lambda x: rank.get(x, 9))
+    try:
+        out = out.sort_values(
+            ["blocked", "_pr", "action_priority_score", "e_spend"],
+            ascending=[True, True, False, False],
+        ).copy()
+    except Exception:
+        out = out.sort_values(["blocked", "_pr", "action_priority_score"], ascending=[True, True, False]).copy()
+    out = out.drop(columns=["_pr"], errors="ignore")
+    out = out.head(max(1, int(max_rows or 1))).copy()
+    keep = [c for c in cols if c in out.columns]
+    return out[keep].reset_index(drop=True)
 
 
 def build_campaign_action_view(
@@ -11237,6 +12270,7 @@ def write_dashboard_md(
     lifecycle_timeline: Optional[pd.DataFrame] = None,
     policy: Optional[OpsPolicy] = None,
     budget_transfer_plan: Optional[Dict[str, object]] = None,
+    placement_rebalance_plan: Optional[pd.DataFrame] = None,
     unlock_scale_tasks: Optional[pd.DataFrame] = None,
     data_quality_hints: Optional[List[str]] = None,
     action_review: Optional[pd.DataFrame] = None,
@@ -11419,7 +12453,7 @@ def write_dashboard_md(
 
         def _strip_md_links(text: str) -> str:
             try:
-                return re.sub(r"\\[([^\\]]+)\\]\\([^\\)]+\\)", r"\\1", text)
+                return re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
             except Exception:
                 return text
 
@@ -11619,7 +12653,9 @@ def write_dashboard_md(
         quick_links.append("[本周行动](#weekly)")
         quick_links.append("[Campaign排查](#campaign)")
         quick_links.append("[Action Board](../dashboard/action_board.csv)")
+        quick_links.append("[动作执行手册](../dashboard/action_execution_guide.csv)")
         quick_links.append("[解锁任务表](../dashboard/unlock_scale_tasks.csv)")
+        quick_links.append("[广告位预算平移](../dashboard/placement_rebalance_plan.csv)")
         quick_links.append("[任务汇总](../dashboard/task_summary.csv)")
         quick_links.append("[环比摘要](../dashboard/compare_summary.csv)")
         quick_links.append("[生命周期时间轴表](../dashboard/lifecycle_timeline.csv)")
@@ -11765,6 +12801,32 @@ def write_dashboard_md(
                 for idx, r in lt_vis.iterrows():
                     asin_val = str(r.get("asin", "") or "").strip().upper()
                     name_val = str(r.get("product_name", "") or "").strip()
+                    product_display_val = str(r.get("product_display", "") or "").strip()
+                    if not asin_val:
+                        # 回退：部分历史/汇总表没有独立 asin 列，尝试从展示文本中抽取 ASIN。
+                        for source_text in (product_display_val, name_val):
+                            m = re.search(r"\b(B[0-9A-Z]{9})\b", str(source_text or "").upper())
+                            if m:
+                                asin_val = str(m.group(1)).strip().upper()
+                                break
+                    display_name = product_display_val
+                    try:
+                        display_name = re.sub(
+                            r"\s*[\(（]\s*ASIN\s*[:：]\s*B[0-9A-Z]{9}\s*[\)）]\s*$",
+                            "",
+                            str(product_display_val or ""),
+                            flags=re.IGNORECASE,
+                        ).strip()
+                    except Exception:
+                        display_name = str(product_display_val or "").strip()
+                    if not display_name:
+                        display_name = str(product_display_val or "").strip()
+                    name_clean = str(name_val or "").strip()
+                    if name_clean and asin_val and name_clean.upper() == asin_val:
+                        name_clean = ""
+                    label = name_clean or display_name or asin_val
+                    if not label:
+                        label = f"ASIN_{idx+1}"
                     cat_val = str(r.get("product_category", "") or "（未分类）").strip() or "（未分类）"
                     phase_val = str(r.get("phase_label", "") or "unknown").strip().lower() or "unknown"
                     cycle = str(r.get("cycle_range", "") or "").strip()
@@ -11780,13 +12842,11 @@ def write_dashboard_md(
                             continue
                     if not end_dt:
                         end_dt = start_dt
-                    label = name_val or asin_val or str(r.get("product_display", "") or "").strip()
-                    if not label:
-                        label = f"ASIN_{idx+1}"
                     label_short = label if len(label) <= 18 else (label[:16] + "…")
                     group_label = label
-                    if asin_val and name_val:
-                        group_label = f"{name_val} ({asin_val})"
+                    if asin_val and label:
+                        if asin_val not in str(label).upper():
+                            group_label = f"{label} ({asin_val})"
                     group_label_short = group_label if len(group_label) <= 26 else (group_label[:24] + "…")
                     prod_id = f"prod::{asin_val or idx}"
                     if cat_val not in category_groups:
@@ -11848,6 +12908,26 @@ def write_dashboard_md(
                     phase_short_seq = [phase_short_map.get(ph, ph) for ph in phase_unique]
                     phase_list_text = "/".join([p for p in phase_short_seq if p])
                     phase_detail = "; ".join([f"{phase_short_map.get(ph, ph)} {int(days)}d" for ph, days in segments])
+                    seg_ranges: List[Dict[str, object]] = []
+                    try:
+                        cur_day = start_dt
+                        for ph, days in segments:
+                            d = int(days or 0)
+                            if d <= 0:
+                                continue
+                            seg_start = cur_day
+                            seg_end = seg_start + dt.timedelta(days=max(d - 1, 0))
+                            seg_ranges.append(
+                                {
+                                    "phase": ph,
+                                    "days": d,
+                                    "start": seg_start.isoformat(),
+                                    "end": seg_end.isoformat(),
+                                }
+                            )
+                            cur_day = seg_end + dt.timedelta(days=1)
+                    except Exception:
+                        seg_ranges = []
                     title_parts = [
                         f"{label}",
                         f"ASIN: {asin_val}" if asin_val else "",
@@ -11877,8 +12957,12 @@ def write_dashboard_md(
                             "category": cat_val,
                             "asin": asin_val,
                             "name": label,
+                            "display_name": label,
                             "label_short": label_short,
                             "score": score,
+                            "cycle_start": start_dt.isoformat(),
+                            "cycle_end": end_dt.isoformat(),
+                            "segments": seg_ranges,
                             "className": "phase-multi",
                             "style": f"background: {gradient}; border-color: {phase_color_map.get(phase_val, '#94a3b8')};",
                         }
@@ -12064,19 +13148,22 @@ def write_dashboard_md(
             transfer_cnt = len(transfers) if isinstance(transfers, list) else 0
             savings_cnt = len(savings) if isinstance(savings, list) else 0
             task_cnt = int(len(unlock_scale_tasks)) if isinstance(unlock_scale_tasks, pd.DataFrame) else 0
+            placement_cnt = int(len(placement_rebalance_plan)) if isinstance(placement_rebalance_plan, pd.DataFrame) else 0
 
-            if transfer_cnt > 0 or savings_cnt > 0 or task_cnt > 0:
+            if transfer_cnt > 0 or savings_cnt > 0 or task_cnt > 0 or placement_cnt > 0:
                 has_ops_plans = True
                 parts = []
                 if transfer_cnt > 0:
                     parts.append(f"净迁移 `{transfer_cnt}`")
                 if savings_cnt > 0:
                     parts.append(f"回收 `{savings_cnt}`")
+                if placement_cnt > 0:
+                    parts.append(f"广告位平移 `{placement_cnt}`")
                 if task_cnt > 0:
                     parts.append(f"解锁任务(P0/P1 Top) `{task_cnt}`")
                 joined = " | ".join(parts) if parts else "（无）"
                 lines.append(
-                    f"- 预算迁移/放量解锁：{joined}（[迁移表](../dashboard/budget_transfer_plan.csv) | [任务表](../dashboard/unlock_scale_tasks.csv)）"
+                    f"- 预算迁移/放量解锁：{joined}（[迁移表](../dashboard/budget_transfer_plan.csv) | [广告位平移](../dashboard/placement_rebalance_plan.csv) | [任务表](../dashboard/unlock_scale_tasks.csv)）"
                 )
         except Exception:
             has_ops_plans = False
@@ -12117,8 +13204,8 @@ def write_dashboard_md(
                     return 0.0
 
             def _evidence_text(parts: List[str]) -> str:
-                ps = [p for p in parts if str(p or "").strip()]
-                return f"证据: {' | '.join(ps)}" if ps else "证据: 见明细表"
+                ps = [str(p or "").strip() for p in parts if str(p or "").strip()]
+                return " ｜ ".join(ps) if ps else "见明细表"
 
             def _priority_rank(p: str) -> int:
                 pr = str(p or "").strip().upper()
@@ -12137,6 +13224,53 @@ def write_dashboard_md(
                 if g == "scale":
                     return "放量"
                 return "排查"
+
+            def _action_label(action_type: str) -> str:
+                t = str(action_type or "").strip().upper()
+                mapping = {
+                    "NEGATE": "否定低意图词",
+                    "BID_DOWN": "下调高成本词出价",
+                    "BID_UP": "提升高转化词出价",
+                    "BUDGET_UP": "提高高效活动预算",
+                    "REVIEW": "排查异常投放对象",
+                    "PAUSE": "暂停低效对象",
+                    "BUDGET_DOWN": "下调低效预算",
+                }
+                return mapping.get(t, t or "执行广告动作")
+
+            def _compact_basis_text(text: object) -> str:
+                raw = str(text or "").strip()
+                if not raw:
+                    return ""
+                parts = [p.strip() for p in raw.split("|") if p.strip()]
+                if not parts:
+                    return raw
+                keep: List[str] = []
+                for p in parts:
+                    if len(keep) >= 3:
+                        break
+                    keep.append(p)
+                return "；".join(keep)
+
+            def _build_weekly_line(
+                priority: str,
+                group: str,
+                title: str,
+                description: str,
+                evidence: str,
+                owner: str,
+            ) -> str:
+                head = f"`{priority}` `{_group_tag(group)}` {title}".strip()
+                if description:
+                    head = f"{head}：{description}"
+                tail: List[str] = []
+                if evidence:
+                    tail.append(f"证据:{evidence}")
+                if owner:
+                    tail.append(f"责任:{owner}")
+                if tail:
+                    head = f"{head} | {' | '.join(tail)}"
+                return head
 
             def _goal_rank(goal: str) -> int:
                 g = str(goal or "").strip()
@@ -12304,21 +13438,29 @@ def write_dashboard_md(
                     bg = _fmt_usd(r.get("budget_gap_usd_est"))
                     pg = _fmt_usd(r.get("profit_gap_usd_est"))
                     if spd7:
-                        ev_parts.append(f"日销7d=`{spd7}`")
+                        ev_parts.append(f"日销7d={spd7}")
                         delta_val = abs(_as_float(r.get("sales_per_day_7d")))
                     if bg and bg != "$0":
-                        ev_parts.append(f"预算缺口≈`{bg}`")
+                        ev_parts.append(f"预算缺口≈{bg}")
                         spend_val += abs(_as_float(r.get("budget_gap_usd_est")))
                     if pg and pg != "$0":
-                        ev_parts.append(f"利润缺口≈`{pg}`")
+                        ev_parts.append(f"利润缺口≈{pg}")
                         spend_val += abs(_as_float(r.get("profit_gap_usd_est")))
                     ev_txt = _evidence_text(ev_parts)
 
                     prefix = f"{cat} " if cat else ""
                     product_label = _format_product_label(asin, r.get("product_name", ""))
-                    title = f"{prefix}{product_label} {task_type}".strip()
+                    title = _strip_md_links(f"{prefix}{product_label} {task_type}".strip()).replace("**", "").strip()
                     if not title:
                         continue
+                    desc = "先收口低效预算和高 ACOS 出价，再把预算向已出单词迁移。"
+                    if ("库存" in task_type) or ("补货" in task_type) or ("断货" in task_type):
+                        desc = "先补货/控量，避免无货引流；库存恢复后再执行放量。"
+                    elif ("否词" in task_type) or ("收口" in task_type):
+                        desc = "先清理低意图流量，再做小步调价，优先保证订单稳定。"
+                    operator_steps = "按任务表优先级逐条执行；每次只改一轮，48h 后复盘。"
+                    expected_signal = "低效花费下降，核心订单不下滑。"
+                    rollback_guard = "若订单连续两天下滑明显，回滚最近一轮调价/否词。"
                     candidates.append(
                         {
                             "priority": p,
@@ -12326,7 +13468,22 @@ def write_dashboard_md(
                             "asin": asin,
                             "spend": float(spend_val),
                             "delta": float(delta_val),
-                            "line": f"`{p}` `{_group_tag(group)}` {title} | {ev_txt} | 责任:{owner}",
+                            "title": title,
+                            "description": desc,
+                            "evidence": ev_txt,
+                            "owner": owner,
+                            "operator_steps": operator_steps,
+                            "expected_signal": expected_signal,
+                            "rollback_guard": rollback_guard,
+                            "goal": _infer_goal_tag(f"{task_type} {ev_txt}"),
+                            "line": _build_weekly_line(
+                                priority=p,
+                                group=group,
+                                title=title,
+                                description=desc,
+                                evidence=ev_txt,
+                                owner=owner,
+                            ),
                         }
                     )
 
@@ -12341,8 +13498,46 @@ def write_dashboard_md(
                     owner = _owner_from_alert(title)
                     group = _group_from_alert(title)
                     ev_txt = _evidence_text([detail] if detail else [])
-                    line = f"`{p}` `{_group_tag(group)}` {title} | {ev_txt} | 责任:{owner}"
-                    candidates.append({"priority": p, "group": group, "asin": "", "spend": 0.0, "delta": 0.0, "line": line})
+                    if group == "stop":
+                        desc = "先止损再放量，避免预算继续流向低效对象。"
+                        op = "先冻结高浪费对象，再检查词包和匹配方式，确认后逐步恢复。"
+                        exp = "浪费花费下降，整体转化效率改善。"
+                        rb = "若核心订单受影响，恢复上一个可控档位并改小步执行。"
+                    elif group == "scale":
+                        desc = "可做小步加码，优先放量高转化对象。"
+                        op = "先在高转化对象加价/加预算 5%-10%，48h 后看转化再决定第二轮。"
+                        exp = "订单增长且 ACoS 不明显恶化。"
+                        rb = "若两天内 ACoS 明显走高且订单未增，回撤最近一次加码。"
+                    else:
+                        desc = "先排查根因，再执行动作，避免误操作。"
+                        op = "先看 listing/价格/评价与词包匹配，再决定否词、调价或预算平移。"
+                        exp = "定位到可执行根因并形成下一步动作。"
+                        rb = "若首轮动作无改善，回退并切换更保守方案。"
+                    candidates.append(
+                        {
+                            "priority": p,
+                            "group": group,
+                            "asin": "",
+                            "spend": 0.0,
+                            "delta": 0.0,
+                            "title": title,
+                            "description": desc,
+                            "evidence": ev_txt,
+                            "owner": owner,
+                            "operator_steps": op,
+                            "expected_signal": exp,
+                            "rollback_guard": rb,
+                            "goal": _infer_goal_tag(f"{title} {detail}"),
+                            "line": _build_weekly_line(
+                                priority=p,
+                                group=group,
+                                title=title,
+                                description=desc,
+                                evidence=ev_txt,
+                                owner=owner,
+                            ),
+                        }
+                    )
 
             # C) Action Board：广告端可直接执行（补齐“止损/放量/排查”）
             if isinstance(action_board, pd.DataFrame) and (not action_board.empty):
@@ -12395,26 +13590,35 @@ def write_dashboard_md(
 
                     ev_parts = []
                     if e_spend:
-                        ev_parts.append(f"花费=`{e_spend}`")
+                        ev_parts.append(f"花费={e_spend}")
                     if delta_sales:
-                        ev_parts.append(f"ΔSales=`{delta_sales}`")
+                        ev_parts.append(f"ΔSales={delta_sales}")
                     if delta_spend:
-                        ev_parts.append(f"ΔSpend=`{delta_spend}`")
+                        ev_parts.append(f"ΔSpend={delta_spend}")
                     if e_orders:
-                        ev_parts.append(f"订单=`{e_orders}`")
+                        ev_parts.append(f"订单={e_orders}")
                     if e_acos:
-                        ev_parts.append(f"ACOS=`{e_acos}`")
+                        ev_parts.append(f"ACOS={e_acos}")
                     if blocked > 0 and blocked_reason:
-                        ev_parts.append(f"阻断=`{blocked_reason}`")
+                        ev_parts.append(f"阻断={blocked_reason}")
                     ev_txt = _evidence_text(ev_parts)
 
-                    core = f"{action_type} {obj}".strip() if action_type or obj else "广告动作"
+                    action_label = _action_label(action_type)
+                    core = f"{action_label} {obj}".strip() if action_type or obj else "广告动作"
                     if product_label:
                         core = f"{product_label} {core}".strip()
                     if camp:
                         core += f" @ {camp}"
                     if needs_confirm:
                         core += " [需确认]"
+                    core = _strip_md_links(core).replace("**", "").strip()
+                    owner = str(r.get("owner_suggested", "") or "").strip() or owner
+                    desc = str(r.get("execution_style", "") or "").strip() or "先小步执行，再基于数据复盘。"
+                    operator_steps = str(r.get("operator_steps", "") or "").strip() or "按动作逐条执行，避免同日多项大改。"
+                    expected_signal = str(r.get("expected_signal", "") or "").strip() or "核心指标向目标收敛。"
+                    rollback_guard = str(r.get("rollback_guard", "") or "").strip() or "若核心指标劣化，回滚最近一次动作。"
+                    basis = _compact_basis_text(r.get("decision_basis", ""))
+                    evidence_compact = ev_txt if ev_txt and ev_txt != "见明细表" else basis
 
                     candidates.append(
                         {
@@ -12423,7 +13627,22 @@ def write_dashboard_md(
                             "asin": asin,
                             "spend": float(_as_float(r.get("e_spend"))),
                             "delta": float(abs(delta_sales_val) if delta_sales_val != 0 else abs(delta_spend_val)),
-                            "line": f"`{p}` `{_group_tag(group)}` {core} | {ev_txt} | 责任:{owner}",
+                            "title": core,
+                            "description": desc,
+                            "evidence": evidence_compact,
+                            "owner": owner,
+                            "operator_steps": operator_steps,
+                            "expected_signal": expected_signal,
+                            "rollback_guard": rollback_guard,
+                            "goal": _infer_goal_tag(f"{core} {evidence_compact} {desc}"),
+                            "line": _build_weekly_line(
+                                priority=p,
+                                group=group,
+                                title=core,
+                                description=desc,
+                                evidence=evidence_compact,
+                                owner=owner,
+                            ),
                         }
                     )
 
@@ -12466,11 +13685,36 @@ def write_dashboard_md(
                 p = str(c.get("priority", "P1") or "P1").strip().upper()
                 asin = str(c.get("asin", "") or "").strip().upper()
                 group = str(c.get("group", "") or "").strip().lower() or "review"
+                title = str(c.get("title", "") or "").strip()
+                desc = str(c.get("description", "") or "").strip()
+                evidence = str(c.get("evidence", "") or "").strip()
+                owner = str(c.get("owner", "") or "").strip()
+                operator_steps = str(c.get("operator_steps", "") or "").strip()
+                expected_signal = str(c.get("expected_signal", "") or "").strip()
+                rollback_guard = str(c.get("rollback_guard", "") or "").strip()
+                goal = str(c.get("goal", "") or "").strip()
+                if not goal:
+                    goal = _infer_goal_tag(f"{title} {desc} {evidence}")
                 used_lines.add(line)
                 if asin:
                     used_asins.add(asin)
                 used_groups.add(group)
-                picked.append({"priority": p, "line": line, "goal": _infer_goal_tag(line)})
+                picked.append(
+                    {
+                        "priority": p,
+                        "group": group,
+                        "asin": asin,
+                        "line": line,
+                        "title": title,
+                        "description": desc,
+                        "evidence": evidence,
+                        "owner": owner,
+                        "operator_steps": operator_steps,
+                        "expected_signal": expected_signal,
+                        "rollback_guard": rollback_guard,
+                        "goal": goal,
+                    }
+                )
 
             _pop_best(lambda c: True)
             while len(picked) < 3:
@@ -12637,38 +13881,54 @@ def write_dashboard_md(
                     ai_items.append(
                         {
                             "priority": it.get("priority", ""),
+                            "title": title,
                             "text": text,
                             "goal": it.get("goal", ""),
                             "evidence": str(it.get("evidence", "") or "").strip(),
+                            "owner": "",
                         }
                     )
             for it in (weekly_actions or [])[:3]:
-                raw = str(it.get("line", "") or "").strip()
-                if not raw:
+                p = str(it.get("priority", "") or "").strip().upper()
+                title = str(it.get("title", "") or "").strip()
+                desc = str(it.get("description", "") or "").strip()
+                evidence = str(it.get("evidence", "") or "").strip()
+                owner = str(it.get("owner", "") or "").strip()
+                text = title
+                if desc:
+                    text = f"{title}：{desc}" if title else desc
+                if not text:
+                    raw = str(it.get("line", "") or "").strip()
+                    if raw:
+                        raw = _strip_md_links(raw)
+                        raw = raw.replace("**", "").replace("`", "").strip()
+                    text = raw
+                if not text:
                     continue
-                p = ""
-                m = re.search(r"`(P[0-2])`", raw)
-                if m:
-                    p = m.group(1)
-                    raw = raw.replace(m.group(0), "").strip()
-                raw = _strip_md_links(raw)
-                raw = raw.replace("**", "").replace("`", "").strip()
-                if raw:
-                    rule_items.append({"priority": p, "text": raw, "goal": _infer_goal_tag(raw), "evidence": ""})
+                rule_items.append(
+                    {
+                        "priority": p,
+                        "title": title,
+                        "text": text,
+                        "goal": str(it.get("goal", "") or "").strip() or _infer_goal_tag(text),
+                        "evidence": evidence,
+                        "owner": owner,
+                    }
+                )
             for a in (picked_alerts or [])[:2]:
                 p = str(a.get("priority", "P1") or "P1").strip().upper()
                 title = str(a.get("title", "") or "").strip()
                 detail = str(a.get("detail", "") or "").strip()
                 if not title:
                     continue
-                text = f"{title}（{detail}）" if detail else title
-                rule_items.append({"priority": p, "text": text, "goal": _infer_goal_tag(text), "evidence": ""})
+                text = title
+                rule_items.append({"priority": p, "title": title, "text": text, "goal": _infer_goal_tag(text), "evidence": detail, "owner": ""})
 
             def _normalize_items(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
                 uniq: List[Dict[str, str]] = []
                 seen: set[str] = set()
                 for it in items:
-                    key = _norm_text(it.get("text", ""))
+                    key = _norm_text(f"{it.get('title', '')} {it.get('text', '')}")
                     if not key or key in seen:
                         continue
                     seen.add(key)
@@ -12694,6 +13954,8 @@ def write_dashboard_md(
                     p = it.get("priority", "")
                     text = it.get("text", "")
                     goal = it.get("goal", "")
+                    evidence = _short_text(_strip_md_links(str(it.get("evidence", "") or "")).replace("|", "｜"), 72)
+                    owner = _short_text(_strip_md_links(str(it.get("owner", "") or "")), 24)
                     tone = ""
                     if p == "P0":
                         tone = " tone-risk"
@@ -12703,7 +13965,15 @@ def write_dashboard_md(
                         tone = " tone-opp"
                     goal_tag = f' <span class="tag">目标:{html.escape(goal)}</span>' if goal else ""
                     badge = f"<code>{p}</code> " if p else ""
-                    lines.append(f"<div class=\"decision-item{tone}\">{badge}{html.escape(text)}{goal_tag}</div>")
+                    lines.append(f"<div class=\"decision-item{tone}\">{badge}{html.escape(text)}{goal_tag}")
+                    meta_parts: List[str] = []
+                    if evidence:
+                        meta_parts.append(f"依据: {evidence}")
+                    if owner:
+                        meta_parts.append(f"责任: {owner}")
+                    if meta_parts:
+                        lines.append(f"<div class=\"decision-meta\">{' · '.join([html.escape(x) for x in meta_parts])}</div>")
+                    lines.append("</div>")
                 lines.append("</div>")
 
             # AI 建议（弱提示、默认折叠）
@@ -12719,6 +13989,7 @@ def write_dashboard_md(
                     p = it.get("priority", "")
                     text = it.get("text", "")
                     goal = it.get("goal", "")
+                    evidence = _short_text(_strip_md_links(str(it.get("evidence", "") or "")).replace("|", "｜"), 60)
                     tone = ""
                     if p == "P0":
                         tone = " tone-risk"
@@ -12728,7 +13999,10 @@ def write_dashboard_md(
                         tone = " tone-opp"
                     goal_tag = f' <span class="tag">目标:{html.escape(goal)}</span>' if goal else ""
                     badge = f"<code>{p}</code> " if p else ""
-                    lines.append(f"<div class=\"decision-item{tone}\">{badge}{html.escape(text)}{goal_tag}</div>")
+                    lines.append(f"<div class=\"decision-item{tone}\">{badge}{html.escape(text)}{goal_tag}")
+                    if evidence:
+                        lines.append(f"<div class=\"decision-meta\">依据: {html.escape(evidence)}</div>")
+                    lines.append("</div>")
                 lines.append("</div>")
             lines.append("</details>")
             lines.append("<div class=\"hint\">更多见：<a href=\"../dashboard/task_summary.csv\">任务汇总</a> / <a href=\"../dashboard/action_board.csv\">Action Board</a></div>")
@@ -12756,6 +14030,20 @@ def write_dashboard_md(
             lines.append('<div id="visTimelinePanel" class="timeline-panel"></div>')
         else:
             lines.append('<div class="hint">（暂无生命周期时间轴数据）</div>')
+        lines.append("</div>")
+
+        # 生命周期阶段线（交互版）：不替换甘特图，作为补充对比视图
+        lines.append('<div class="card-item">')
+        lines.append('<div class="hero-title">生命周期阶段线（交互对比）</div>')
+        lines.append('<div class="hint">按单个 ASIN 展示“阶段随时间变化”的折线视图，便于理解阶段切换顺序与持续时长。</div>')
+        if vis_timeline_b64:
+            lines.append('<div id="phaseLineControls" class="phase-line-controls"></div>')
+            lines.append(
+                f'<div id="phaseLineChart" class="phase-line-chart" data-vis="{vis_timeline_b64}"></div>'
+            )
+            lines.append('<div id="phaseLinePanel" class="phase-line-panel"></div>')
+        else:
+            lines.append('<div class="hint">（暂无可用于阶段线的生命周期数据）</div>')
         lines.append("</div>")
         lines.append("## 2) 阶段化指标（启动/成长/成熟）")
         lines.append("")
@@ -12976,12 +14264,28 @@ def write_dashboard_md(
             lines.append('<div class="action-grid">')
             for it in weekly_actions[:3]:
                 raw_line = str(it.get("line", "") or "").strip()
-                parsed = _parse_weekly_action_line(raw_line)
-                p = str(parsed.get("priority", "") or "").strip().upper()
-                group = str(parsed.get("group", "") or "").strip()
-                title = str(parsed.get("title", "") or "").strip()
-                evidence = str(parsed.get("evidence", "") or "").strip()
-                owner = str(parsed.get("owner", "") or "").strip()
+                p = str(it.get("priority", "") or "").strip().upper()
+                group_key = str(it.get("group", "") or "").strip().lower()
+                group = _group_tag(group_key) if group_key else ""
+                title = str(it.get("title", "") or "").strip()
+                desc = str(it.get("description", "") or "").strip()
+                evidence = str(it.get("evidence", "") or "").strip()
+                owner = str(it.get("owner", "") or "").strip()
+                operator_steps = str(it.get("operator_steps", "") or "").strip()
+                expected_signal = str(it.get("expected_signal", "") or "").strip()
+                rollback_guard = str(it.get("rollback_guard", "") or "").strip()
+                if (not p) or (not title):
+                    parsed = _parse_weekly_action_line(raw_line)
+                    if not p:
+                        p = str(parsed.get("priority", "") or "").strip().upper()
+                    if not group:
+                        group = str(parsed.get("group", "") or "").strip()
+                    if not title:
+                        title = str(parsed.get("title", "") or "").strip()
+                    if not evidence:
+                        evidence = str(parsed.get("evidence", "") or "").strip()
+                    if not owner:
+                        owner = str(parsed.get("owner", "") or "").strip()
 
                 tone = ""
                 if p == "P0":
@@ -12997,25 +14301,33 @@ def write_dashboard_md(
                     lines.append(f'<span class="badge badge-{p.lower()}">{html.escape(p)}</span>')
                 if group:
                     lines.append(f'<span class="tag">{html.escape(group)}</span>')
-                goal = _infer_goal_tag(f"{title} {evidence}")
+                goal = _infer_goal_tag(f"{title} {desc} {evidence} {operator_steps}")
                 if goal:
                     lines.append(f'<span class="tag">目标:{html.escape(goal)}</span>')
                 lines.append('</div>')
                 if title:
                     asin_guess = ""
                     try:
-                        m = re.search(r"\\bB0[A-Z0-9]{8}\\b", raw_line, flags=re.I)
+                        m = re.search(r"\\bB0[A-Z0-9]{8}\\b", f"{raw_line} {title}", flags=re.I)
                         if m:
                             asin_guess = m.group(0).upper()
                     except Exception:
                         asin_guess = ""
-                    prod_label = _compact_product_label(asin_guess, "")
+                    prod_label = _strip_md_links(_compact_product_label(asin_guess, ""))
                     if prod_label and prod_label not in title:
                         title = f"{prod_label} · {title}"
-                    title = _short_text(title, 80)
+                    title = _short_text(title, 72)
                     lines.append(f'<div class="action-title">{html.escape(title)}</div>')
+                if desc:
+                    lines.append(f'<div class="action-meta">描述: {html.escape(_short_text(desc, 64))}</div>')
                 if evidence:
                     lines.append(f'<div class="action-meta">证据: {html.escape(_short_text(evidence, 60))}</div>')
+                if operator_steps:
+                    lines.append(f'<div class="action-meta">执行: {html.escape(_short_text(operator_steps, 68))}</div>')
+                if expected_signal:
+                    lines.append(f'<div class="action-meta">观察: {html.escape(_short_text(expected_signal, 58))}</div>')
+                if rollback_guard:
+                    lines.append(f'<div class="action-meta">回滚: {html.escape(_short_text(rollback_guard, 58))}</div>')
                 if owner:
                     lines.append(f'<div class="action-owner">责任: {html.escape(owner)}</div>')
                 lines.append('</div>')
@@ -13225,7 +14537,13 @@ def write_dashboard_md(
 
                 lines.append("")
                 lines.append('<a id="review"></a>')
-                lines.append("### L0+ 执行复盘（按类目 Top3 + 异常） - [打开复盘表](../ops/action_review.csv)")
+                review_links = ["[打开复盘表](../ops/action_review.csv)"]
+                try:
+                    if out_path is not None and (Path(out_path).parent.parent / "ops" / "action_review_summary.csv").exists():
+                        review_links.append("[闭环评分汇总](../ops/action_review_summary.csv)")
+                except Exception:
+                    pass
+                lines.append(f"### L0+ 执行复盘（按类目 Top3 + 异常） - {' | '.join(review_links)}")
                 lines.append("")
                 lines.append("- 说明：按商品分类聚合；每类展示 Top3 复盘动作 + 1 条异常。")
 
@@ -13290,22 +14608,33 @@ def write_dashboard_md(
                         continue
                     ok = sub[sub["status"] == "ok"].copy()
                     if not ok.empty:
-                        try:
-                            ok["score"] = ok.apply(
-                                lambda r: float(r.get("delta_sales", 0.0))
-                                - max(float(r.get("delta_spend", 0.0)), 0.0) * 0.5
-                                + (0.0 if float(r.get("delta_acos", 0.0)) >= 0 else abs(float(r.get("delta_acos", 0.0))) * 100.0),
-                                axis=1,
-                            )
-                            ok = ok.sort_values(["score"], ascending=[False])
-                        except Exception:
-                            ok = ok.sort_values(["delta_sales"], ascending=[False])
+                        if "action_loop_score" in ok.columns:
+                            try:
+                                ok["action_loop_score"] = pd.to_numeric(ok.get("action_loop_score"), errors="coerce").fillna(0.0)
+                                ok = ok.sort_values(["action_loop_score", "delta_sales"], ascending=[False, False])
+                            except Exception:
+                                ok = ok.sort_values(["delta_sales"], ascending=[False])
+                        else:
+                            try:
+                                ok["score"] = ok.apply(
+                                    lambda r: float(r.get("delta_sales", 0.0))
+                                    - max(float(r.get("delta_spend", 0.0)), 0.0) * 0.5
+                                    + (0.0 if float(r.get("delta_acos", 0.0)) >= 0 else abs(float(r.get("delta_acos", 0.0))) * 100.0),
+                                    axis=1,
+                                )
+                                ok = ok.sort_values(["score"], ascending=[False])
+                            except Exception:
+                                ok = ok.sort_values(["delta_sales"], ascending=[False])
                         top = ok.head(3).copy()
                         top["delta_sales"] = top["delta_sales"].map(lambda x: _fmt_signed_usd(x))
                         top["delta_spend"] = top["delta_spend"].map(lambda x: _fmt_signed_usd(x))
                         top["delta_acos"] = top["delta_acos"].map(
                             lambda x: (f"{float(x):+.4f}".rstrip("0").rstrip(".") if x != 0 else "0")
                         )
+                        if "action_loop_score" in top.columns:
+                            top["action_loop_score"] = pd.to_numeric(top.get("action_loop_score"), errors="coerce").fillna(0.0).round(1)
+                        if "action_loop_label" in top.columns:
+                            top["action_loop_label"] = top["action_loop_label"].astype(str).fillna("").str.strip()
                     else:
                         top = pd.DataFrame()
 
@@ -13317,7 +14646,7 @@ def write_dashboard_md(
                         lines.append(
                             _df_to_md_table(
                                 top,
-                                [c for c in ["action_brief", "delta_sales", "delta_spend", "delta_acos"] if c in top.columns],
+                                [c for c in ["action_brief", "action_loop_score", "action_loop_label", "delta_sales", "delta_spend", "delta_acos"] if c in top.columns],
                             )
                         )
 
@@ -14067,13 +15396,7 @@ def write_dashboard_md(
                 pass
 
             view = action_board.head(20).copy()
-            # 链接跳转：类目/ASIN/生命周期 -> drilldown
-            if "product_category" in view.columns:
-                view["product_category"] = view["product_category"].map(lambda x: _cat_md_link(str(x or ""), "./category_drilldown.md"))
-            if "asin_hint" in view.columns:
-                view["asin_hint"] = view["asin_hint"].map(lambda x: _asin_md_link(str(x or ""), "./asin_drilldown.md"))
-            if "current_phase" in view.columns:
-                view["current_phase"] = view["current_phase"].map(lambda x: _phase_md_link(str(x or ""), "./phase_drilldown.md"))
+            # 运营聚焦版不再把 action 原始字段改成 Markdown 链接，避免行动文本出现链接噪音。
 
             # 操作手册联动：从动作表一键跳回“怎么查/怎么做”
             try:
@@ -14109,17 +15432,34 @@ def write_dashboard_md(
 
             # 运营聚焦：合并行动描述
             try:
+                def _human_action_label(action_type: object) -> str:
+                    act_raw = str(action_type or "").strip().upper()
+                    mapping = {
+                        "NEGATE": "否定低意图词",
+                        "BID_DOWN": "下调高成本词出价",
+                        "BID_UP": "提升高转化词出价",
+                        "BUDGET_UP": "提高高效活动预算",
+                        "REVIEW": "排查异常投放对象",
+                        "PAUSE": "暂停低效对象",
+                        "BUDGET_DOWN": "下调低效预算",
+                    }
+                    return mapping.get(act_raw, act_raw or "执行广告动作")
+
                 def _fmt_action_row(r: pd.Series) -> str:
                     p = str(r.get("priority", "") or "").strip().upper()
                     obj = str(r.get("object_name", "") or "").strip()
-                    act = str(r.get("action_type", "") or "").strip().upper()
+                    act = _human_action_label(r.get("action_type", ""))
                     val = str(r.get("action_value", "") or "").strip()
                     asin_hint = str(r.get("asin_hint", "") or "").strip().upper()
                     product_name = r.get("product_name", "")
                     product_label = _format_product_label(asin_hint, product_name) if (asin_hint or product_name) else ""
+                    product_label = _strip_md_links(str(product_label or "")).replace("**", "").strip()
+                    style = str(r.get("execution_style", "") or "").strip()
                     core = " ".join([x for x in [act, obj, val] if x]).strip()
                     if product_label:
                         core = f"{product_label} {core}".strip()
+                    if style:
+                        core = f"{core}（{style}）".strip()
                     if p:
                         core = f"`{p}` {core}".strip()
                     return core.strip()
@@ -14133,19 +15473,39 @@ def write_dashboard_md(
                 evid = []
                 for _, r in view.iterrows():
                     parts = []
+                    part_keys: set[str] = set()
+                    def _append_part(text: str) -> None:
+                        t = str(text or "").strip()
+                        if not t:
+                            return
+                        key = t.split("=", 1)[0].strip().lower() if "=" in t else t
+                        if key in part_keys:
+                            return
+                        part_keys.add(key)
+                        parts.append(t)
+
                     if "e_spend" in r and r.get("e_spend") is not None:
-                        parts.append(f"花费={_fmt_usd(r.get('e_spend'))}")
+                        _append_part(f"花费={_fmt_usd(r.get('e_spend'))}")
                     if "e_orders" in r and r.get("e_orders") is not None:
-                        parts.append(f"订单={_fmt_num(r.get('e_orders'), nd=0)}")
+                        e_orders = _fmt_num(r.get("e_orders"), nd=0)
+                        if e_orders:
+                            _append_part(f"订单={e_orders}")
                     if "e_acos" in r and r.get("e_acos") is not None:
-                        parts.append(f"ACOS={_fmt_num(r.get('e_acos'), nd=4)}")
+                        e_acos = _fmt_num(r.get("e_acos"), nd=4)
+                        if e_acos:
+                            _append_part(f"ACOS={e_acos}")
                     if "asin_delta_sales" in r and r.get("asin_delta_sales") is not None:
                         ds = _fmt_signed_usd(r.get("asin_delta_sales"))
                         if ds:
-                            parts.append(f"ΔSales={ds}")
+                            _append_part(f"ΔSales={ds}")
                     if "blocked_reason" in r and str(r.get("blocked_reason") or "").strip():
-                        parts.append(f"阻断={str(r.get('blocked_reason') or '').strip()}")
-                    evid.append(" | ".join([p for p in parts if p]))
+                        _append_part(f"阻断={str(r.get('blocked_reason') or '').strip()}")
+                    if "decision_basis" in r and str(r.get("decision_basis") or "").strip():
+                        basis_parts = [x.strip() for x in str(r.get("decision_basis") or "").split("|") if x.strip()]
+                        for bp in basis_parts[:2]:
+                            clean_bp = bp.replace("spend=", "花费=").replace("orders=", "订单=").replace("acos=", "ACOS=")
+                            _append_part(clean_bp)
+                    evid.append(" ｜ ".join([p for p in parts if p]))
                 view["evidence_brief"] = evid
             except Exception:
                 view["evidence_brief"] = ""
@@ -14229,11 +15589,11 @@ def write_dashboard_md(
                 view["action_brief"] = view.apply(
                     lambda r: _short_text(
                         f"{r.get('action_brief','')}" + (f" · 目标:{r.get('goal','')}" if r.get("goal","") else ""),
-                        80,
+                        96,
                     ),
                     axis=1,
                 )
-                view["evidence_brief"] = view["evidence_brief"].map(lambda x: _short_text(x, 72))
+                view["evidence_brief"] = view["evidence_brief"].map(lambda x: _short_text(x, 88))
             except Exception:
                 pass
 
@@ -17442,12 +18802,14 @@ def write_dashboard_outputs(
 
     同时写入：
     - dashboard/action_board_full.csv（全量含重复，便于追溯）
+    - dashboard/action_execution_guide.csv（动作执行手册：数据依据 + 可执行步骤 + 回滚护栏）
     - dashboard/asin_cockpit.csv（ASIN 总览：focus + drivers + 动作量汇总）
     - dashboard/keyword_topics.csv（关键词主题 n-gram：压缩 search_term 报表的海量搜索词）
     - dashboard/keyword_topics_segment_top.csv（Segment Top：类目×生命周期 → Top 浪费/贡献主题，各 TopN）
     - dashboard/keyword_topics_action_hints.csv（主题建议：把主题落到 top_campaigns/top_ad_groups，形成可分派清单；scale 方向会标注/阻断库存风险）
     - dashboard/keyword_topics_asin_context.csv（主题→产品语境：只用高置信 term→asin，把主题落到类目/ASIN/生命周期/库存覆盖）
     - dashboard/keyword_topics_category_phase_summary.csv（主题→类目/生命周期汇总：先按类目/阶段看主题的 spend/sales/waste_spend，再下钻到 ASIN）
+    - dashboard/placement_rebalance_plan.csv（广告位预算平移建议：同 campaign 内 from->to）
 
     返回（主要路径）：
     - dashboard/shop_scorecard.json
@@ -17467,6 +18829,7 @@ def write_dashboard_outputs(
     dash_md_path = None
     keyword_topics_path = None
     keyword_topics_hints_path = None
+    placement_rebalance_plan: pd.DataFrame = pd.DataFrame()
 
     # 供 shop_scorecard “抓重点汇总”使用（即便中途异常也避免 UnboundLocalError）
     action_board: pd.DataFrame = pd.DataFrame()
@@ -17542,7 +18905,12 @@ def write_dashboard_outputs(
             asin_top_targetings=asin_top_targetings,
             asin_top_placements=asin_top_placements,
         )
-        action_board_full = score_action_board(action_board=action_board_full, asin_focus_all=asin_focus_all, policy=policy)
+        action_board_full = score_action_board(
+            action_board=action_board_full,
+            asin_focus_all=asin_focus_all,
+            policy=policy,
+            action_review=action_review if isinstance(action_review, pd.DataFrame) else None,
+        )
         # 操作手册联动：把动作表一键接回“怎么查/怎么做”的固定流程（不影响口径/算数逻辑）
         action_board_full = enrich_action_board_with_playbook_scene(action_board_full)
         # 全量文件（含重复）
@@ -17563,6 +18931,41 @@ def write_dashboard_outputs(
             action_board.to_csv(action_board_path, index=False, encoding="utf-8-sig")
         else:
             pd.DataFrame(columns=["priority", "action_type"]).to_csv(action_board_path, index=False, encoding="utf-8-sig")
+
+        # 3.005) action_execution_guide.csv（动作执行手册：数据依据+操作步骤+回滚护栏）
+        action_execution_guide_path = dashboard_dir / "action_execution_guide.csv"
+        try:
+            action_execution_guide = build_action_execution_guide(
+                action_board=action_board_all if isinstance(action_board_all, pd.DataFrame) else action_board,
+                max_rows=500,
+            )
+        except Exception:
+            action_execution_guide = pd.DataFrame()
+        if action_execution_guide is not None and not action_execution_guide.empty:
+            action_execution_guide.to_csv(action_execution_guide_path, index=False, encoding="utf-8-sig")
+        else:
+            pd.DataFrame(
+                columns=[
+                    "priority",
+                    "owner_suggested",
+                    "ad_type",
+                    "level",
+                    "campaign",
+                    "object_name",
+                    "action_type",
+                    "blocked",
+                    "blocked_reason",
+                    "decision_basis",
+                    "strategy_context",
+                    "action_intensity",
+                    "execution_style",
+                    "operator_steps",
+                    "expected_signal",
+                    "rollback_guard",
+                    "action_priority_score",
+                    "playbook_url",
+                ]
+            ).to_csv(action_execution_guide_path, index=False, encoding="utf-8-sig")
 
         # 3.01) campaign_action_view.csv（按 campaign 聚合 Action Board）
         campaign_action_view = None
@@ -17830,6 +19233,45 @@ def write_dashboard_outputs(
                     "note",
                 ]
             ).to_csv(budget_transfer_plan_path, index=False, encoding="utf-8-sig")
+
+        # 3.605) placement_rebalance_plan.csv（广告位预算重分配：同 Campaign 优先平移）
+        placement_rebalance_plan_path = dashboard_dir / "placement_rebalance_plan.csv"
+        try:
+            placement_rebalance_plan = build_placement_rebalance_plan(
+                action_board_dedup_all=action_board_all if isinstance(action_board_all, pd.DataFrame) else None,
+                stage=stage,
+                policy=policy if isinstance(policy, OpsPolicy) else None,
+                max_rows=300,
+            )
+        except Exception:
+            placement_rebalance_plan = pd.DataFrame()
+        if placement_rebalance_plan is not None and not placement_rebalance_plan.empty:
+            placement_rebalance_plan.to_csv(placement_rebalance_plan_path, index=False, encoding="utf-8-sig")
+        else:
+            pd.DataFrame(
+                columns=[
+                    "priority",
+                    "transfer_type",
+                    "ad_type",
+                    "campaign",
+                    "from_placement",
+                    "to_placement",
+                    "amount_usd_estimated",
+                    "shift_ratio",
+                    "from_spend",
+                    "from_acos",
+                    "to_spend",
+                    "to_acos",
+                    "from_action_priority_score",
+                    "to_action_priority_score",
+                    "owner",
+                    "execution_style",
+                    "reason",
+                    "expected_signal",
+                    "rollback_guard",
+                    "next_step",
+                ]
+            ).to_csv(placement_rebalance_plan_path, index=False, encoding="utf-8-sig")
 
         # 3.61) unlock_scale_tasks.csv（放量解锁任务：可分工）
         unlock_scale_tasks_full_table = None
@@ -18150,6 +19592,9 @@ def write_dashboard_outputs(
         # 4.8) keyword_topics_action_hints.csv（主题建议：可分派清单）
         keyword_hints_cols = [
             "priority",
+            "hint_priority_score",
+            "owner",
+            "risk_level",
             "direction",
             "hint_action",
             "ad_type",
@@ -18167,6 +19612,9 @@ def write_dashboard_outputs(
             "top_campaigns",
             "top_ad_groups",
             "top_match_types",
+            "execution_style",
+            "expected_signal",
+            "rollback_guard",
             "context_asin_count",
             "context_top_asins",
             "context_profit_directions",
@@ -18461,6 +19909,7 @@ def write_dashboard_outputs(
                     lifecycle_timeline=build_lifecycle_timeline_view(lifecycle_timeline_table if isinstance(lifecycle_timeline_table, pd.DataFrame) else None),
                     policy=policy,
                     budget_transfer_plan=budget_transfer_plan_effective,
+                    placement_rebalance_plan=placement_rebalance_plan if isinstance(placement_rebalance_plan, pd.DataFrame) else None,
                     unlock_scale_tasks=unlock_scale_tasks_table if isinstance(unlock_scale_tasks_table, pd.DataFrame) else None,
                     data_quality_hints=data_quality_hints,
                     action_review=action_review if isinstance(action_review, pd.DataFrame) else None,
@@ -18529,6 +19978,7 @@ def write_dashboard_outputs(
                 keyword_topics = _read_csv(dashboard_dir / "keyword_topics.csv") if "dashboard_dir" in locals() else pd.DataFrame()
                 asin_cockpit = _read_csv(dashboard_dir / "asin_cockpit.csv") if "dashboard_dir" in locals() else pd.DataFrame()
                 unlock_scale_tasks = _read_csv(dashboard_dir / "unlock_scale_tasks.csv") if "dashboard_dir" in locals() else pd.DataFrame()
+                placement_rebalance_plan = _read_csv(dashboard_dir / "placement_rebalance_plan.csv") if "dashboard_dir" in locals() else pd.DataFrame()
                 compare_summary = _read_csv(dashboard_dir / "compare_summary.csv") if "dashboard_dir" in locals() else pd.DataFrame()
                 lifecycle_timeline = build_lifecycle_timeline_view(_read_csv(dashboard_dir / "lifecycle_timeline.csv") if "dashboard_dir" in locals() else pd.DataFrame())
 
@@ -18552,6 +20002,7 @@ def write_dashboard_outputs(
                     lifecycle_timeline=build_lifecycle_timeline_view(lifecycle_timeline if isinstance(lifecycle_timeline, pd.DataFrame) and not lifecycle_timeline.empty else None),
                     policy=policy,
                     budget_transfer_plan={},
+                    placement_rebalance_plan=placement_rebalance_plan if not placement_rebalance_plan.empty else None,
                     unlock_scale_tasks=unlock_scale_tasks if not unlock_scale_tasks.empty else None,
                     data_quality_hints=None,
                     action_review=None,

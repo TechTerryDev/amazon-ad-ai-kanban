@@ -39,6 +39,21 @@
     "top_actions": 60,
     "_comment_compare_ignore_last_days": "compare 窗口忽略最近 N 天（默认 0=不忽略，建议 1~2 用于规避归因延迟噪声）。",
     "compare_ignore_last_days": 1,
+    "promo_adjustment": {
+      "_comment": "compare 季节性/促销校正：仅影响 compare_summary 的 corrected 字段，不改原始 delta_*。用于减少大促尖峰导致的误判。",
+      "enabled": true,
+      "_comment_baseline_lookback_days": "促销基线回看天数（建议 21~42）。",
+      "baseline_lookback_days": 28,
+      "_comment_baseline_min_periods": "滚动中位数最少样本天数（防止新店空窗）。",
+      "baseline_min_periods": 7,
+      "_comment_spike_thresholds": "尖峰阈值：销量/花费强度超过阈值时触发校正（两组阈值任一命中）。",
+      "sales_spike_threshold": 2.0,
+      "spend_spike_threshold": 1.5,
+      "sales_spike_threshold_alt": 1.6,
+      "spend_spike_threshold_alt": 2.0,
+      "_comment_damp_ratio": "尖峰增量保留比例（0~1）：值越小越保守。",
+      "damp_ratio": 0.35
+    },
     "budget_transfer_opportunity": {
       "_comment": "机会池→预算迁移联动：当本期 profit-based 预算迁移没有 scale 侧（预算只能回收/RESERVE）时，用机会池把回收预算迁移到“更可能承接机会ASIN”的 Campaign。金额为估算值（基于本期花费 proxy），执行时请结合实际预算/花费节奏校准。",
       "enabled": true,
@@ -50,6 +65,26 @@
       "min_target_opp_spend": 15.0,
       "_comment_prefer_same_ad_type": "优先同广告类型迁移（SP→SP / SB→SB / SD→SD），更符合实际执行；true=先同类型匹配，再跨类型补齐。",
       "prefer_same_ad_type": true
+    },
+    "placement_rebalance": {
+      "_comment": "广告位预算平移（placement_rebalance_plan.csv）：把同 Campaign 内低效 placement 的预算小步转到高效 placement。建议先小步试投，再按48h复盘结果加码。",
+      "enabled": true,
+      "_comment_min_shift_ratio": "单次最小平移比例（0~1），防止建议过小没有执行意义。",
+      "min_shift_ratio": 0.10,
+      "_comment_base_shift_ratio": "基础平移比例（0~1），在风险不高时也会执行的小步平移比例。",
+      "base_shift_ratio": 0.12,
+      "_comment_max_shift_ratio": "单次最大平移比例（0~1），防止一次性动作过猛。",
+      "max_shift_ratio": 0.35,
+      "_comment_severity_weight": "风险放大系数：from_acos 偏离目标越多，平移比例增长越快。",
+      "severity_weight": 0.10,
+      "_comment_fallback_severity": "缺少 from_acos 时的默认风险强度（0~2）。",
+      "fallback_severity": 0.60,
+      "_comment_min_shift_usd": "单次最小平移金额（美元）。",
+      "min_shift_usd": 5.0,
+      "_comment_stage_waste_floor_ratio": "阶段浪费阈值系数：最小平移金额还会与 stage_waste_spend*该系数比较，取更大值。",
+      "stage_waste_floor_ratio": 0.10,
+      "_comment_max_down_per_campaign": "每个 Campaign 最多输出多少条 from_placement 建议。",
+      "max_down_per_campaign": 12
     },
     "unlock_tasks": {
       "_comment": "放量解锁任务（unlock_scale_tasks.csv）收敛策略：全量任务会很长，运营通常只需要 P0/P1 的 Top 列表；全量会另存为 unlock_scale_tasks_full.csv 便于追溯。",
@@ -260,7 +295,11 @@
       "phase_scale_penalty_decline": 10.0,
       "phase_scale_penalty_inactive": 20.0,
       "profit_reduce_scale_penalty": 15.0,
-      "profit_scale_scale_boost": 5.0
+      "profit_scale_scale_boost": 5.0,
+      "_comment_action_loop": "动作闭环联动（读取 ops/action_review.csv）：同类动作历史效果更好时在同优先级内前置，避免反复优先执行低效动作。",
+      "weight_action_loop_score": 12.0,
+      "action_loop_min_support": 2,
+      "action_loop_recent_window_days": 7
     }
   }
 }

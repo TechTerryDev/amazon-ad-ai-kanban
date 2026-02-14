@@ -41,6 +41,11 @@ python main.py
 ### 4) 查看结果
 - 入口文件：`data/output/<时间戳>/START_HERE.html`
 - 每店铺聚焦版：`data/output/<时间戳>/<shop>/reports/dashboard.html`
+- 多店铺 Owner 轻量总览：`data/output/<时间戳>/OWNER_OVERVIEW.csv`
+- 多店铺 Owner 排序总览（含统一优先级分）：`data/output/<时间戳>/OWNER_OVERVIEW.md` / `.html`
+- 店铺环比（含促销/季节性校正列）：`data/output/<时间戳>/<shop>/dashboard/compare_summary.csv`
+- 广告位预算平移建议：`data/output/<时间戳>/<shop>/dashboard/placement_rebalance_plan.csv`
+- 已回填执行日志时，会额外输出：`data/output/<时间戳>/<shop>/ops/action_review_summary.csv`
 
 ---
 
@@ -114,6 +119,49 @@ python main.py --input-dir data/input --out-dir data/output --ai-prompt-only
 ## 配置说明
 - 运营策略：`config/ops_policy.json`
 - 总选项档位：`config/ops_profile.json`（建议日常只改这里）
+- 生命周期参数：`src/lifecycle/lifecycle_config.json`（支持 `category_default/category_overrides` 做类目阈值覆盖）
+- 生命周期阶段连续性：`launch_days` 现在按“首单后连续窗口”判定 launch，不再因短期波动出现 `launch→mature→launch` 回跳。
+- 生命周期稳定性：`phase_min_segment_days` 控制阶段最短驻留天数（默认 3 天），用于吸收 1-2 天抖动段。
+
+### 生命周期类目阈值覆盖示例（`src/lifecycle/lifecycle_config.json`）
+```json
+{
+  "category_default": {
+    "min_mature_orders": 20,
+    "low_inventory": 20
+  },
+  "category_overrides": [
+    {
+      "name": "fast_moving",
+      "match": ["beauty", "grocery"],
+      "min_mature_orders": 35,
+      "low_inventory": 35
+    },
+    {
+      "name": "slow_moving",
+      "match": ["furniture", "home decor"],
+      "min_mature_orders": 10,
+      "min_peak_sales_roll": 6
+    }
+  ]
+}
+```
+
+### 动作闭环与促销校正参数（`config/ops_policy.json`）
+- `dashboard.promo_adjustment.*`：控制 compare 的促销/季节性校正（只影响 `*_corrected` 字段）
+- `dashboard.action_scoring.weight_action_loop_score`：闭环分权重（越高越偏向历史高分动作）
+- `dashboard.action_scoring.action_loop_min_support`：动作闭环最低样本数
+- `dashboard.action_scoring.action_loop_recent_window_days`：闭环统计回看天数
+
+### 广告执行优先级（本次增强）
+- `dashboard/action_execution_guide.csv` 新增“可执行版动作手册”：每条动作给出 `decision_basis / execution_style / operator_steps / expected_signal / rollback_guard`，方便运营按步骤执行而不是只看规则结论。
+- `reports/dashboard.md` 的“决策建议（Top5）/本周行动（Top3）”改为运营可读卡片：每条建议固定展示 `描述 / 证据 / 执行 / 观察 / 回滚 / 责任`，不再使用长串 `|` 拼接文本。
+- `reports/dashboard.md` 新增“生命周期阶段线（交互对比）”：按单个 ASIN 展示阶段随时间变化，作为甘特图的并行解释视图（不替代原时间轴）；支持按类目/阶段/关键词筛选后再下钻单品。
+- `reports/dashboard.md` 的 `Action Board（运营聚焦版）` 改为中文动作短语 + 执行风格（如“否定低意图词（先止损后保量）”），并清理链接噪音，便于运营一眼读懂。
+- `dashboard/action_board.csv` 与 `dashboard/action_execution_guide.csv` 增加 `strategy_context / action_intensity`，按“生命周期阶段 + 利润方向”输出不同话术和动作强度（L1谨慎/L2标准/L3强动作）。
+- `dashboard/keyword_topics_action_hints.csv` 新增 `hint_priority_score / owner / risk_level`，并补充 `execution_style / expected_signal / rollback_guard`，建议不再只有“规则判定”，而是“先做什么、观察什么、何时回滚”。
+- `dashboard/placement_rebalance_plan.csv` 提供广告位预算 from→to 建议（优先同 Campaign 平移；无承接位时回收到 `RESERVE`），并新增 `execution_style / expected_signal / rollback_guard / next_step`。
+- `config/ops_policy.json -> dashboard.placement_rebalance.*` 支持广告位平移阈值配置（平移比例、最小金额、每个 Campaign 的建议条数等）。
 
 ---
 

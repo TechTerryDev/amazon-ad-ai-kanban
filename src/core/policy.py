@@ -288,6 +288,29 @@ class ActionScoringPolicy:
     profit_reduce_scale_penalty: float = 15.0
     profit_scale_scale_boost: float = 5.0
 
+    # 动作闭环评分联动（来自 action_review）
+    # - 目标：让“历史有效动作”在同优先级内更靠前
+    weight_action_loop_score: float = 12.0
+    action_loop_min_support: int = 2
+    action_loop_recent_window_days: int = 7
+
+
+@dataclass(frozen=True)
+class PromoAdjustmentPolicy:
+    """
+    compare 季节性/促销尖峰校正参数（只影响 corrected 字段，不覆盖原始 delta）。
+    """
+
+    enabled: bool = True
+    baseline_lookback_days: int = 28
+    baseline_min_periods: int = 7
+    sales_spike_threshold: float = 2.0
+    spend_spike_threshold: float = 1.5
+    sales_spike_threshold_alt: float = 1.6
+    spend_spike_threshold_alt: float = 2.0
+    # 对尖峰增量保留比例（0~1）；值越小，校正越保守
+    damp_ratio: float = 0.35
+
 
 @dataclass(frozen=True)
 class BudgetTransferOpportunityPolicy:
@@ -317,6 +340,33 @@ class BudgetTransferOpportunityPolicy:
     min_target_opp_spend: float = 5.0
     # 优先在同广告类型内迁移（SP→SP/SB→SB/SD→SD）
     prefer_same_ad_type: bool = True
+
+
+@dataclass(frozen=True)
+class PlacementRebalancePolicy:
+    """
+    广告位预算平移策略（placement_rebalance_plan.csv，支持配置化）。
+
+    目标：
+    - 让 placement 层 from->to 平移不再“写死阈值”，可按店铺风格校准；
+    - 保留“先小步试投、再复盘放大”的执行节奏，避免一次性过猛调整。
+    """
+
+    enabled: bool = True
+
+    # 平移比例：shift_ratio = clamp(base_shift_ratio + severity * severity_weight, min, max)
+    min_shift_ratio: float = 0.10
+    base_shift_ratio: float = 0.12
+    max_shift_ratio: float = 0.35
+    severity_weight: float = 0.10
+    fallback_severity: float = 0.60
+
+    # 最小平移金额：max(min_shift_usd, stage_waste_spend * stage_waste_floor_ratio)
+    min_shift_usd: float = 5.0
+    stage_waste_floor_ratio: float = 0.10
+
+    # 单个 Campaign 最多从多少个“低效广告位”发起平移建议
+    max_down_per_campaign: int = 12
 
 
 @dataclass(frozen=True)
@@ -447,6 +497,7 @@ class OpsPolicy:
     dashboard_top_actions: int = 60
     # compare 窗口忽略最近 N 天（默认 0=不忽略）
     dashboard_compare_ignore_last_days: int = 0
+    dashboard_promo_adjustment: PromoAdjustmentPolicy = field(default_factory=PromoAdjustmentPolicy)
     dashboard_scale_window: ScaleWindowPolicy = field(default_factory=ScaleWindowPolicy)
     dashboard_focus_scoring: FocusScoringPolicy = field(default_factory=FocusScoringPolicy)
     dashboard_signal_scoring: SignalScoringPolicy = field(default_factory=SignalScoringPolicy)
@@ -455,6 +506,7 @@ class OpsPolicy:
     dashboard_inventory_sigmoid: InventorySigmoidPolicy = field(default_factory=InventorySigmoidPolicy)
     dashboard_profit_guard: ProfitGuardPolicy = field(default_factory=ProfitGuardPolicy)
     dashboard_budget_transfer_opportunity: BudgetTransferOpportunityPolicy = field(default_factory=BudgetTransferOpportunityPolicy)
+    dashboard_placement_rebalance: PlacementRebalancePolicy = field(default_factory=PlacementRebalancePolicy)
     dashboard_unlock_tasks: UnlockTasksPolicy = field(default_factory=UnlockTasksPolicy)
     dashboard_shop_alerts: ShopAlertsPolicy = field(default_factory=ShopAlertsPolicy)
     dashboard_keyword_topics: KeywordTopicsPolicy = field(default_factory=KeywordTopicsPolicy)
@@ -520,586 +572,7 @@ def load_ops_policy(path: Path) -> OpsPolicy:
         data = json.loads(raw)
         if not isinstance(data, dict):
             return base
-
-        inv = data.get("inventory") if isinstance(data.get("inventory"), dict) else {}
-        kw = data.get("keyword_funnel") if isinstance(data.get("keyword_funnel"), dict) else {}
-        cop = data.get("campaign_ops") if isinstance(data.get("campaign_ops"), dict) else {}
-        dash = data.get("dashboard") if isinstance(data.get("dashboard"), dict) else {}
-
-        low_thr = max(0, _to_int(inv.get("low_inventory_threshold"), base.low_inventory_threshold))
-        block_scale = _to_bool(inv.get("block_scale_when_low_inventory"), base.block_scale_when_low_inventory)
-        cover_below = max(
-            0.0,
-            _to_float(inv.get("block_scale_when_cover_days_below"), base.block_scale_when_cover_days_below),
-        )
-        inv_cat_default = inv.get("category_default") if isinstance(inv.get("category_default"), dict) else {}
-        inv_cat_overrides_raw = inv.get("category_overrides") if isinstance(inv.get("category_overrides"), list) else []
-        inv_cat_overrides = [x for x in inv_cat_overrides_raw if isinstance(x, dict)]
-        inv_cat_default = inv.get("category_default") if isinstance(inv.get("category_default"), dict) else {}
-        inv_cat_overrides_raw = inv.get("category_overrides") if isinstance(inv.get("category_overrides"), list) else []
-        inv_cat_overrides = [x for x in inv_cat_overrides_raw if isinstance(x, dict)]
-
-        top_n = max(1, _to_int(kw.get("top_n"), base.keyword_funnel_top_n))
-
-        windows = cop.get("windows_days")
-        if isinstance(windows, list):
-            windows2 = []
-            for x in windows:
-                n = _to_int(x, 0)
-                if n > 0:
-                    windows2.append(n)
-            windows2 = sorted({int(x) for x in windows2})
-        else:
-            windows2 = list(base.campaign_windows_days)
-
-        min_spend = max(0.0, _to_float(cop.get("min_spend"), base.campaign_min_spend))
-        top_asins = max(1, _to_int(cop.get("top_asins_per_campaign"), base.campaign_top_asins_per_campaign))
-
-        mult = cop.get("phase_acos_multiplier")
-        mult2 = dict(base.phase_acos_multiplier)
-        if isinstance(mult, dict):
-            for k, v in mult.items():
-                kk = str(k).strip().lower()
-                if not kk:
-                    continue
-                mult2[kk] = _to_float(v, mult2.get(kk, 1.0))
-
-        dash_top_asins = max(1, _to_int(dash.get("top_asins"), base.dashboard_top_asins))
-        dash_top_actions = max(1, _to_int(dash.get("top_actions"), base.dashboard_top_actions))
-        dash_ignore_last_days = max(0, _to_int(dash.get("compare_ignore_last_days"), base.dashboard_compare_ignore_last_days))
-        dash_ignore_last_days = max(0, _to_int(dash.get("compare_ignore_last_days"), base.dashboard_compare_ignore_last_days))
-
-        # “可放量窗口”阈值（可配置；没有则用默认）
-        sw_base = base.dashboard_scale_window
-        sw_data = dash.get("scale_window") if isinstance(dash.get("scale_window"), dict) else {}
-        sw_cat_default = sw_data.get("category_default") if isinstance(sw_data.get("category_default"), dict) else {}
-        sw_cat_overrides_raw = sw_data.get("category_overrides") if isinstance(sw_data.get("category_overrides"), list) else []
-        sw_cat_overrides = [x for x in sw_cat_overrides_raw if isinstance(x, dict)]
-        exclude_phases = list(sw_base.exclude_phases)
-        if isinstance(sw_data.get("exclude_phases"), list):
-            tmp: List[str] = []
-            for x in sw_data.get("exclude_phases"):
-                s = str(x or "").strip().lower()
-                if s:
-                    tmp.append(s)
-            if tmp:
-                exclude_phases = tmp
-        scale_window = ScaleWindowPolicy(
-            min_sales_per_day_7d=max(
-                0.0,
-                _to_float(sw_data.get("min_sales_per_day_7d"), sw_base.min_sales_per_day_7d),
-            ),
-            min_delta_sales=max(
-                0.0,
-                _to_float(sw_data.get("min_delta_sales"), sw_base.min_delta_sales),
-            ),
-            min_inventory_cover_days_7d=max(
-                0.0,
-                _to_float(
-                    sw_data.get("min_inventory_cover_days_7d"),
-                    sw_base.min_inventory_cover_days_7d,
-                ),
-            ),
-            max_tacos_roll=max(0.0, _to_float(sw_data.get("max_tacos_roll"), sw_base.max_tacos_roll)),
-            max_marginal_tacos=max(0.0, _to_float(sw_data.get("max_marginal_tacos"), sw_base.max_marginal_tacos)),
-            exclude_phases=exclude_phases,
-            require_no_oos=_to_bool(sw_data.get("require_no_oos"), sw_base.require_no_oos),
-            require_no_low_inventory=_to_bool(sw_data.get("require_no_low_inventory"), sw_base.require_no_low_inventory),
-            require_oos_with_ad_spend_days_zero=_to_bool(
-                sw_data.get("require_oos_with_ad_spend_days_zero"),
-                sw_base.require_oos_with_ad_spend_days_zero,
-            ),
-            category_default=sw_cat_default,
-            category_overrides=sw_cat_overrides,
-        )
-
-        # ASIN Focus 评分（可配置；没有则用默认）
-        fs_base = base.dashboard_focus_scoring
-        fs_data = dash.get("focus_scoring") if isinstance(dash.get("focus_scoring"), dict) else {}
-        fs = FocusScoringPolicy(
-            base_spend_log_multiplier=max(
-                0.0,
-                _to_float(fs_data.get("base_spend_log_multiplier"), fs_base.base_spend_log_multiplier),
-            ),
-            base_spend_score_cap=max(
-                0.0,
-                _to_float(fs_data.get("base_spend_score_cap"), fs_base.base_spend_score_cap),
-            ),
-            weight_flag_oos=_to_float(fs_data.get("weight_flag_oos"), fs_base.weight_flag_oos),
-            weight_flag_low_inventory=_to_float(fs_data.get("weight_flag_low_inventory"), fs_base.weight_flag_low_inventory),
-            weight_oos_with_ad_spend_days=_to_float(fs_data.get("weight_oos_with_ad_spend_days"), fs_base.weight_oos_with_ad_spend_days),
-            weight_oos_with_sessions_days=_to_float(fs_data.get("weight_oos_with_sessions_days"), fs_base.weight_oos_with_sessions_days),
-            weight_presale_order_days=_to_float(fs_data.get("weight_presale_order_days"), fs_base.weight_presale_order_days),
-            weight_spend_up_no_sales=_to_float(fs_data.get("weight_spend_up_no_sales"), fs_base.weight_spend_up_no_sales),
-            weight_marginal_tacos_worse=_to_float(fs_data.get("weight_marginal_tacos_worse"), fs_base.weight_marginal_tacos_worse),
-            weight_decline_or_inactive_spend=_to_float(fs_data.get("weight_decline_or_inactive_spend"), fs_base.weight_decline_or_inactive_spend),
-            weight_phase_down_recent=_to_float(fs_data.get("weight_phase_down_recent"), fs_base.weight_phase_down_recent),
-            weight_high_ad_dependency=_to_float(fs_data.get("weight_high_ad_dependency"), fs_base.weight_high_ad_dependency),
-            weight_inventory_zero_still_spend=_to_float(fs_data.get("weight_inventory_zero_still_spend"), fs_base.weight_inventory_zero_still_spend),
-            high_ad_dependency_threshold=max(
-                0.0,
-                min(
-                    1.0,
-                    _to_float(fs_data.get("high_ad_dependency_threshold"), fs_base.high_ad_dependency_threshold),
-                ),
-            ),
-            marginal_tacos_worse_ratio=max(
-                0.0,
-                _to_float(fs_data.get("marginal_tacos_worse_ratio"), fs_base.marginal_tacos_worse_ratio),
-            ),
-            weight_sessions_up_cvr_down=_to_float(fs_data.get("weight_sessions_up_cvr_down"), fs_base.weight_sessions_up_cvr_down),
-            cvr_signal_min_sessions_prev=max(
-                0.0,
-                _to_float(fs_data.get("cvr_signal_min_sessions_prev"), fs_base.cvr_signal_min_sessions_prev),
-            ),
-            cvr_signal_min_delta_sessions=max(
-                0.0,
-                _to_float(fs_data.get("cvr_signal_min_delta_sessions"), fs_base.cvr_signal_min_delta_sessions),
-            ),
-            cvr_signal_min_cvr_drop=max(
-                0.0,
-                min(
-                    1.0,
-                    _to_float(fs_data.get("cvr_signal_min_cvr_drop"), fs_base.cvr_signal_min_cvr_drop),
-                ),
-            ),
-            cvr_signal_min_ad_spend_roll=max(
-                0.0,
-                _to_float(fs_data.get("cvr_signal_min_ad_spend_roll"), fs_base.cvr_signal_min_ad_spend_roll),
-            ),
-            weight_organic_down=_to_float(fs_data.get("weight_organic_down"), fs_base.weight_organic_down),
-            organic_signal_min_organic_sales_prev=max(
-                0.0,
-                _to_float(fs_data.get("organic_signal_min_organic_sales_prev"), fs_base.organic_signal_min_organic_sales_prev),
-            ),
-            organic_signal_min_delta_organic_sales=max(
-                0.0,
-                _to_float(fs_data.get("organic_signal_min_delta_organic_sales"), fs_base.organic_signal_min_delta_organic_sales),
-            ),
-            organic_signal_drop_ratio=max(
-                0.0,
-                min(
-                    1.0,
-                    _to_float(fs_data.get("organic_signal_drop_ratio"), fs_base.organic_signal_drop_ratio),
-                ),
-            ),
-            aov_signal_min_orders_prev=max(
-                0.0,
-                _to_float(fs_data.get("aov_signal_min_orders_prev"), fs_base.aov_signal_min_orders_prev),
-            ),
-            aov_signal_min_delta_aov=max(
-                0.0,
-                _to_float(fs_data.get("aov_signal_min_delta_aov"), fs_base.aov_signal_min_delta_aov),
-            ),
-            aov_signal_drop_ratio=max(
-                0.0,
-                min(
-                    1.0,
-                    _to_float(fs_data.get("aov_signal_drop_ratio"), fs_base.aov_signal_drop_ratio),
-                ),
-            ),
-            gross_margin_signal_min_sales=max(
-                0.0,
-                _to_float(fs_data.get("gross_margin_signal_min_sales"), fs_base.gross_margin_signal_min_sales),
-            ),
-            gross_margin_signal_low_threshold=max(
-                -1.0,
-                min(
-                    1.0,
-                    _to_float(fs_data.get("gross_margin_signal_low_threshold"), fs_base.gross_margin_signal_low_threshold),
-                ),
-            ),
-        )
-
-        # Sigmoid 多维评分（可配置；没有则用默认）
-        sigs_base = base.dashboard_signal_scoring
-        sigs_data = dash.get("signal_scoring") if isinstance(dash.get("signal_scoring"), dict) else {}
-        signal_scoring = SignalScoringPolicy(
-            product_sales_weight=max(
-                0.0,
-                _to_float(sigs_data.get("product_sales_weight"), sigs_base.product_sales_weight),
-            ),
-            product_sessions_weight=max(
-                0.0,
-                _to_float(sigs_data.get("product_sessions_weight"), sigs_base.product_sessions_weight),
-            ),
-            product_organic_sales_weight=max(
-                0.0,
-                _to_float(sigs_data.get("product_organic_sales_weight"), sigs_base.product_organic_sales_weight),
-            ),
-            product_profit_weight=max(
-                0.0,
-                _to_float(sigs_data.get("product_profit_weight"), sigs_base.product_profit_weight),
-            ),
-            product_steepness=max(
-                0.0,
-                _to_float(sigs_data.get("product_steepness"), sigs_base.product_steepness),
-            ),
-            ad_acos_weight=max(
-                0.0,
-                _to_float(sigs_data.get("ad_acos_weight"), sigs_base.ad_acos_weight),
-            ),
-            ad_cvr_weight=max(
-                0.0,
-                _to_float(sigs_data.get("ad_cvr_weight"), sigs_base.ad_cvr_weight),
-            ),
-            ad_spend_up_no_sales_weight=max(
-                0.0,
-                _to_float(sigs_data.get("ad_spend_up_no_sales_weight"), sigs_base.ad_spend_up_no_sales_weight),
-            ),
-            ad_steepness=max(
-                0.0,
-                _to_float(sigs_data.get("ad_steepness"), sigs_base.ad_steepness),
-            ),
-        )
-
-        # 阶段化指标权重（可配置；没有则用默认）
-        ss_base = base.dashboard_stage_scoring
-        ss_data = dash.get("stage_scoring") if isinstance(dash.get("stage_scoring"), dict) else {}
-
-        def _parse_phase_list(v: object, default: List[str]) -> List[str]:
-            try:
-                if not isinstance(v, list):
-                    return list(default)
-                out: List[str] = []
-                for x in v:
-                    s = str(x or "").strip().lower()
-                    if s:
-                        out.append(s)
-                return out if out else list(default)
-            except Exception:
-                return list(default)
-
-        stage_scoring = StageScoringPolicy(
-            launch_phases=_parse_phase_list(ss_data.get("launch_phases"), ss_base.launch_phases),
-            growth_phases=_parse_phase_list(ss_data.get("growth_phases"), ss_base.growth_phases),
-            new_phases=_parse_phase_list(ss_data.get("new_phases"), ss_base.new_phases),
-            mature_phases=_parse_phase_list(ss_data.get("mature_phases"), ss_base.mature_phases),
-            decline_phases=_parse_phase_list(ss_data.get("decline_phases"), ss_base.decline_phases),
-            median_min_samples=max(
-                1,
-                _to_int(ss_data.get("median_min_samples"), ss_base.median_min_samples),
-            ),
-            min_impressions_7d=max(
-                0.0,
-                _to_float(ss_data.get("min_impressions_7d"), ss_base.min_impressions_7d),
-            ),
-            min_clicks_7d=max(
-                0.0,
-                _to_float(ss_data.get("min_clicks_7d"), ss_base.min_clicks_7d),
-            ),
-            min_orders_7d=max(
-                0.0,
-                _to_float(ss_data.get("min_orders_7d"), ss_base.min_orders_7d),
-            ),
-            min_sales_7d=max(
-                0.0,
-                _to_float(ss_data.get("min_sales_7d"), ss_base.min_sales_7d),
-            ),
-            min_orders_7d_mature=max(
-                0.0,
-                _to_float(ss_data.get("min_orders_7d_mature"), ss_base.min_orders_7d_mature),
-            ),
-            new_ctr_low_ratio=max(
-                0.0,
-                _to_float(ss_data.get("new_ctr_low_ratio"), ss_base.new_ctr_low_ratio),
-            ),
-            new_cvr_low_ratio=max(
-                0.0,
-                _to_float(ss_data.get("new_cvr_low_ratio"), ss_base.new_cvr_low_ratio),
-            ),
-            new_cpa_high_ratio=max(
-                0.0,
-                _to_float(ss_data.get("new_cpa_high_ratio"), ss_base.new_cpa_high_ratio),
-            ),
-            mature_cpa_high_ratio=max(
-                0.0,
-                _to_float(ss_data.get("mature_cpa_high_ratio"), ss_base.mature_cpa_high_ratio),
-            ),
-            mature_acos_high_ratio=max(
-                0.0,
-                _to_float(ss_data.get("mature_acos_high_ratio"), ss_base.mature_acos_high_ratio),
-            ),
-            mature_ad_share_shift_abs=max(
-                0.0,
-                _to_float(ss_data.get("mature_ad_share_shift_abs"), ss_base.mature_ad_share_shift_abs),
-            ),
-            mature_spend_shift_ratio=max(
-                0.0,
-                _to_float(ss_data.get("mature_spend_shift_ratio"), ss_base.mature_spend_shift_ratio),
-            ),
-            weight_new_low_ctr=_to_float(ss_data.get("weight_new_low_ctr"), ss_base.weight_new_low_ctr),
-            weight_new_low_cvr=_to_float(ss_data.get("weight_new_low_cvr"), ss_base.weight_new_low_cvr),
-            weight_new_high_cpa=_to_float(ss_data.get("weight_new_high_cpa"), ss_base.weight_new_high_cpa),
-            weight_mature_high_cpa=_to_float(ss_data.get("weight_mature_high_cpa"), ss_base.weight_mature_high_cpa),
-            weight_mature_high_acos=_to_float(ss_data.get("weight_mature_high_acos"), ss_base.weight_mature_high_acos),
-            weight_mature_ad_share_shift=_to_float(
-                ss_data.get("weight_mature_ad_share_shift"),
-                ss_base.weight_mature_ad_share_shift,
-            ),
-            weight_mature_spend_shift=_to_float(
-                ss_data.get("weight_mature_spend_shift"),
-                ss_base.weight_mature_spend_shift,
-            ),
-            max_stage_tags=max(1, _to_int(ss_data.get("max_stage_tags"), ss_base.max_stage_tags)),
-        )
-
-        # Action Board 优先级（可配置；没有则用默认）
-        as_base = base.dashboard_action_scoring
-        as_data = dash.get("action_scoring") if isinstance(dash.get("action_scoring"), dict) else {}
-        action_scoring = ActionScoringPolicy(
-            base_score_p0=_to_float(as_data.get("base_score_p0"), as_base.base_score_p0),
-            base_score_p1=_to_float(as_data.get("base_score_p1"), as_base.base_score_p1),
-            base_score_p2=_to_float(as_data.get("base_score_p2"), as_base.base_score_p2),
-            base_score_other=_to_float(as_data.get("base_score_other"), as_base.base_score_other),
-            spend_log_multiplier=_to_float(as_data.get("spend_log_multiplier"), as_base.spend_log_multiplier),
-            weight_focus_score=_to_float(as_data.get("weight_focus_score"), as_base.weight_focus_score),
-            weight_hint_confidence=_to_float(as_data.get("weight_hint_confidence"), as_base.weight_hint_confidence),
-            low_hint_confidence_threshold=max(
-                0.0,
-                min(
-                    1.0,
-                    _to_float(
-                        as_data.get("low_hint_confidence_threshold"),
-                        as_base.low_hint_confidence_threshold,
-                    ),
-                ),
-            ),
-            low_hint_scale_penalty=_to_float(as_data.get("low_hint_scale_penalty"), as_base.low_hint_scale_penalty),
-            phase_scale_penalty_decline=_to_float(
-                as_data.get("phase_scale_penalty_decline"),
-                as_base.phase_scale_penalty_decline,
-            ),
-            phase_scale_penalty_inactive=_to_float(
-                as_data.get("phase_scale_penalty_inactive"),
-                as_base.phase_scale_penalty_inactive,
-            ),
-            profit_reduce_scale_penalty=_to_float(
-                as_data.get("profit_reduce_scale_penalty"),
-                as_base.profit_reduce_scale_penalty,
-            ),
-            profit_scale_scale_boost=_to_float(
-                as_data.get("profit_scale_scale_boost"),
-                as_base.profit_scale_scale_boost,
-            ),
-        )
-
-        # 库存调速（Sigmoid）建议（只用于提示）
-        sig_base = base.dashboard_inventory_sigmoid
-        sig_data = dash.get("inventory_sigmoid") if isinstance(dash.get("inventory_sigmoid"), dict) else {}
-        sig_min = max(0.0, _to_float(sig_data.get("min_modifier"), sig_base.min_modifier))
-        sig_max = max(sig_min, _to_float(sig_data.get("max_modifier"), sig_base.max_modifier))
-        inventory_sigmoid = InventorySigmoidPolicy(
-            enabled=_to_bool(sig_data.get("enabled"), sig_base.enabled),
-            optimal_cover_days=max(0.0, _to_float(sig_data.get("optimal_cover_days"), sig_base.optimal_cover_days)),
-            steepness=max(0.0, _to_float(sig_data.get("steepness"), sig_base.steepness)),
-            min_modifier=sig_min,
-            max_modifier=sig_max,
-            min_change_ratio=max(0.0, _to_float(sig_data.get("min_change_ratio"), sig_base.min_change_ratio)),
-            min_ad_spend_roll=max(0.0, _to_float(sig_data.get("min_ad_spend_roll"), sig_base.min_ad_spend_roll)),
-        )
-
-        # 利润护栏（Break-even）
-        pg_base = base.dashboard_profit_guard
-        pg_data = dash.get("profit_guard") if isinstance(dash.get("profit_guard"), dict) else {}
-        profit_guard = ProfitGuardPolicy(
-            enabled=_to_bool(pg_data.get("enabled"), pg_base.enabled),
-            target_net_margin=max(
-                -1.0,
-                min(1.0, _to_float(pg_data.get("target_net_margin"), pg_base.target_net_margin)),
-            ),
-            min_sales_7d=max(0.0, _to_float(pg_data.get("min_sales_7d"), pg_base.min_sales_7d)),
-            min_ad_spend_roll=max(0.0, _to_float(pg_data.get("min_ad_spend_roll"), pg_base.min_ad_spend_roll)),
-        )
-
-        # 库存调速（Sigmoid）建议（只用于提示）
-        sig_base = base.dashboard_inventory_sigmoid
-        sig_data = dash.get("inventory_sigmoid") if isinstance(dash.get("inventory_sigmoid"), dict) else {}
-        sig_min = max(0.0, _to_float(sig_data.get("min_modifier"), sig_base.min_modifier))
-        sig_max = max(sig_min, _to_float(sig_data.get("max_modifier"), sig_base.max_modifier))
-        inventory_sigmoid = InventorySigmoidPolicy(
-            enabled=_to_bool(sig_data.get("enabled"), sig_base.enabled),
-            optimal_cover_days=max(0.0, _to_float(sig_data.get("optimal_cover_days"), sig_base.optimal_cover_days)),
-            steepness=max(0.0, _to_float(sig_data.get("steepness"), sig_base.steepness)),
-            min_modifier=sig_min,
-            max_modifier=sig_max,
-            min_change_ratio=max(0.0, _to_float(sig_data.get("min_change_ratio"), sig_base.min_change_ratio)),
-            min_ad_spend_roll=max(0.0, _to_float(sig_data.get("min_ad_spend_roll"), sig_base.min_ad_spend_roll)),
-        )
-
-        # 利润护栏（Break-even）
-        pg_base = base.dashboard_profit_guard
-        pg_data = dash.get("profit_guard") if isinstance(dash.get("profit_guard"), dict) else {}
-        profit_guard = ProfitGuardPolicy(
-            enabled=_to_bool(pg_data.get("enabled"), pg_base.enabled),
-            target_net_margin=max(
-                -1.0,
-                min(1.0, _to_float(pg_data.get("target_net_margin"), pg_base.target_net_margin)),
-            ),
-            min_sales_7d=max(0.0, _to_float(pg_data.get("min_sales_7d"), pg_base.min_sales_7d)),
-            min_ad_spend_roll=max(0.0, _to_float(pg_data.get("min_ad_spend_roll"), pg_base.min_ad_spend_roll)),
-        )
-
-        # 机会池 -> 预算迁移（可配置；没有则用默认）
-        bto_base = base.dashboard_budget_transfer_opportunity
-        bto_data = dash.get("budget_transfer_opportunity") if isinstance(dash.get("budget_transfer_opportunity"), dict) else {}
-        budget_transfer_opportunity = BudgetTransferOpportunityPolicy(
-            enabled=_to_bool(bto_data.get("enabled"), bto_base.enabled),
-            suggested_add_pct=max(0.0, _to_float(bto_data.get("suggested_add_pct"), bto_base.suggested_add_pct)),
-            max_target_campaigns=max(1, _to_int(bto_data.get("max_target_campaigns"), bto_base.max_target_campaigns)),
-            min_target_opp_spend=max(0.0, _to_float(bto_data.get("min_target_opp_spend"), bto_base.min_target_opp_spend)),
-            prefer_same_ad_type=_to_bool(bto_data.get("prefer_same_ad_type"), bto_base.prefer_same_ad_type),
-        )
-
-        # 放量解锁任务收敛策略（可配置；没有则用默认）
-        ut_base = base.dashboard_unlock_tasks
-        ut_data = dash.get("unlock_tasks") if isinstance(dash.get("unlock_tasks"), dict) else {}
-        include_pr = list(ut_base.include_priorities)
-        if isinstance(ut_data.get("include_priorities"), list):
-            tmp: List[str] = []
-            for x in ut_data.get("include_priorities"):
-                s = str(x or "").strip().upper()
-                if s:
-                    tmp.append(s)
-            if tmp:
-                include_pr = tmp
-        unlock_tasks_policy = UnlockTasksPolicy(
-            top_n=max(1, _to_int(ut_data.get("top_n"), ut_base.top_n)),
-            include_priorities=include_pr,
-            dashboard_top_n=max(1, _to_int(ut_data.get("dashboard_top_n"), ut_base.dashboard_top_n)),
-            dashboard_prefer_unique_asin=_to_bool(
-                ut_data.get("dashboard_prefer_unique_asin"),
-                ut_base.dashboard_prefer_unique_asin,
-            ),
-        )
-
-        # Shop Alerts（规则化告警）阈值（可配置；没有则用默认）
-        sa_base = base.dashboard_shop_alerts
-        sa_data = dash.get("shop_alerts") if isinstance(dash.get("shop_alerts"), dict) else {}
-        pdr_base = sa_base.phase_down_recent
-        pdr_data = sa_data.get("phase_down_recent") if isinstance(sa_data.get("phase_down_recent"), dict) else {}
-        p0_spend_sum = max(0.0, _to_float(pdr_data.get("p0_spend_sum"), pdr_base.p0_spend_sum))
-        p0_spend_share = _to_float(pdr_data.get("p0_spend_share"), pdr_base.p0_spend_share)
-        if p0_spend_share < 0:
-            p0_spend_share = 0.0
-        if p0_spend_share > 1:
-            p0_spend_share = 1.0
-        p0_spend_sum_min_when_share = max(
-            0.0,
-            _to_float(pdr_data.get("p0_spend_sum_min_when_share"), pdr_base.p0_spend_sum_min_when_share),
-        )
-        p0_asin_count_min = max(1, _to_int(pdr_data.get("p0_asin_count_min"), pdr_base.p0_asin_count_min))
-        phase_down_recent_policy = PhaseDownRecentAlertPolicy(
-            enabled=_to_bool(pdr_data.get("enabled"), pdr_base.enabled),
-            p0_spend_sum=p0_spend_sum,
-            p0_spend_share=p0_spend_share,
-            p0_spend_sum_min_when_share=p0_spend_sum_min_when_share,
-            p0_asin_count_min=p0_asin_count_min,
-        )
-        shop_alerts_policy = ShopAlertsPolicy(phase_down_recent=phase_down_recent_policy)
-
-        # 关键词主题（n-gram）（可配置；没有则用默认）
-        kt_base = base.dashboard_keyword_topics
-        kt_data = dash.get("keyword_topics") if isinstance(dash.get("keyword_topics"), dict) else {}
-        n_values = list(kt_base.n_values)
-        if isinstance(kt_data.get("n_values"), list):
-            tmp: List[int] = []
-            for x in kt_data.get("n_values"):
-                n = _to_int(x, 0)
-                if 1 <= n <= 5:
-                    tmp.append(int(n))
-            tmp2 = sorted({int(x) for x in tmp if int(x) > 0})
-            if tmp2:
-                n_values = tmp2
-        md_min_n = _to_int(kt_data.get("md_min_n"), kt_base.md_min_n)
-        if md_min_n < 1:
-            md_min_n = 1
-        if md_min_n > 5:
-            md_min_n = 5
-        keyword_topics_policy = KeywordTopicsPolicy(
-            enabled=_to_bool(kt_data.get("enabled"), kt_base.enabled),
-            n_values=n_values,
-            min_term_spend=max(0.0, _to_float(kt_data.get("min_term_spend"), kt_base.min_term_spend)),
-            max_terms=max(1, _to_int(kt_data.get("max_terms"), kt_base.max_terms)),
-            max_rows=max(1, _to_int(kt_data.get("max_rows"), kt_base.max_rows)),
-            top_terms_per_ngram=max(
-                1,
-                _to_int(kt_data.get("top_terms_per_ngram"), kt_base.top_terms_per_ngram),
-            ),
-            md_top_n=max(1, _to_int(kt_data.get("md_top_n"), kt_base.md_top_n)),
-            md_min_n=md_min_n,
-            action_hints_enabled=_to_bool(kt_data.get("action_hints_enabled"), kt_base.action_hints_enabled),
-            action_hints_top_waste=max(
-                0,
-                _to_int(kt_data.get("action_hints_top_waste"), kt_base.action_hints_top_waste),
-            ),
-            action_hints_top_scale=max(
-                0,
-                _to_int(kt_data.get("action_hints_top_scale"), kt_base.action_hints_top_scale),
-            ),
-            action_hints_min_waste_spend=max(
-                0.0,
-                _to_float(kt_data.get("action_hints_min_waste_spend"), kt_base.action_hints_min_waste_spend),
-            ),
-            action_hints_min_waste_ratio=max(
-                0.0,
-                min(
-                    1.0,
-                    _to_float(kt_data.get("action_hints_min_waste_ratio"), kt_base.action_hints_min_waste_ratio),
-                ),
-            ),
-            action_hints_scale_acos_multiplier=max(
-                0.0,
-                _to_float(kt_data.get("action_hints_scale_acos_multiplier"), kt_base.action_hints_scale_acos_multiplier),
-            ),
-            action_hints_min_sales=max(
-                0.0,
-                _to_float(kt_data.get("action_hints_min_sales"), kt_base.action_hints_min_sales),
-            ),
-            action_hints_top_entities=max(
-                1,
-                _to_int(kt_data.get("action_hints_top_entities"), kt_base.action_hints_top_entities),
-            ),
-            asin_context_enabled=_to_bool(kt_data.get("asin_context_enabled"), kt_base.asin_context_enabled),
-            asin_context_min_confidence=max(
-                0.0,
-                min(
-                    1.0,
-                    _to_float(kt_data.get("asin_context_min_confidence"), kt_base.asin_context_min_confidence),
-                ),
-            ),
-            asin_context_top_asins_per_topic=max(
-                1,
-                _to_int(kt_data.get("asin_context_top_asins_per_topic"), kt_base.asin_context_top_asins_per_topic),
-            ),
-        )
-
-        return OpsPolicy(
-            low_inventory_threshold=low_thr,
-            block_scale_when_low_inventory=block_scale,
-            block_scale_when_cover_days_below=cover_below,
-            inventory_category_default=inv_cat_default,
-            inventory_category_overrides=inv_cat_overrides,
-            keyword_funnel_top_n=top_n,
-            campaign_windows_days=windows2,
-            campaign_min_spend=min_spend,
-            campaign_top_asins_per_campaign=top_asins,
-            phase_acos_multiplier=mult2,
-            dashboard_top_asins=dash_top_asins,
-            dashboard_top_actions=dash_top_actions,
-            dashboard_compare_ignore_last_days=dash_ignore_last_days,
-            dashboard_scale_window=scale_window,
-            dashboard_focus_scoring=fs,
-            dashboard_signal_scoring=signal_scoring,
-            dashboard_stage_scoring=stage_scoring,
-            dashboard_action_scoring=action_scoring,
-            dashboard_inventory_sigmoid=inventory_sigmoid,
-            dashboard_profit_guard=profit_guard,
-            dashboard_budget_transfer_opportunity=budget_transfer_opportunity,
-            dashboard_unlock_tasks=unlock_tasks_policy,
-            dashboard_shop_alerts=shop_alerts_policy,
-            dashboard_keyword_topics=keyword_topics_policy,
-        )
+        return load_ops_policy_dict(data)
     except Exception:
         return base
 
@@ -1286,6 +759,7 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
             "top_asins",
             "top_actions",
             "compare_ignore_last_days",
+            "promo_adjustment",
             "scale_window",
             "focus_scoring",
             "signal_scoring",
@@ -1294,6 +768,7 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
             "inventory_sigmoid",
             "profit_guard",
             "budget_transfer_opportunity",
+            "placement_rebalance",
             "unlock_tasks",
             "shop_alerts",
             "keyword_topics",
@@ -1303,6 +778,22 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
     check_int(dash, "top_asins", base.dashboard_top_asins, "dashboard", min_v=1)
     check_int(dash, "top_actions", base.dashboard_top_actions, "dashboard", min_v=1)
     check_int(dash, "compare_ignore_last_days", base.dashboard_compare_ignore_last_days, "dashboard", min_v=0, max_v=14)
+
+    # ===== dashboard.promo_adjustment =====
+    pa = dash.get("promo_adjustment")
+    if pa is not None and not isinstance(pa, dict):
+        warnings.append("类型不匹配：`dashboard.promo_adjustment` 期望为 object/dict；将使用默认策略。")
+        pa = {}
+    pa = pa if isinstance(pa, dict) else {}
+    warn_unknown_keys(pa, {f.name for f in fields(PromoAdjustmentPolicy)}, "dashboard.promo_adjustment")
+    check_bool(pa, "enabled", base.dashboard_promo_adjustment.enabled, "dashboard.promo_adjustment")
+    check_int(pa, "baseline_lookback_days", base.dashboard_promo_adjustment.baseline_lookback_days, "dashboard.promo_adjustment", min_v=7, max_v=120)
+    check_int(pa, "baseline_min_periods", base.dashboard_promo_adjustment.baseline_min_periods, "dashboard.promo_adjustment", min_v=1, max_v=30)
+    check_float(pa, "sales_spike_threshold", base.dashboard_promo_adjustment.sales_spike_threshold, "dashboard.promo_adjustment", min_v=1.0, max_v=10.0)
+    check_float(pa, "spend_spike_threshold", base.dashboard_promo_adjustment.spend_spike_threshold, "dashboard.promo_adjustment", min_v=1.0, max_v=10.0)
+    check_float(pa, "sales_spike_threshold_alt", base.dashboard_promo_adjustment.sales_spike_threshold_alt, "dashboard.promo_adjustment", min_v=1.0, max_v=10.0)
+    check_float(pa, "spend_spike_threshold_alt", base.dashboard_promo_adjustment.spend_spike_threshold_alt, "dashboard.promo_adjustment", min_v=1.0, max_v=10.0)
+    check_float(pa, "damp_ratio", base.dashboard_promo_adjustment.damp_ratio, "dashboard.promo_adjustment", min_v=0.0, max_v=1.0)
 
     # ===== dashboard.scale_window =====
     sw = dash.get("scale_window")
@@ -1484,6 +975,16 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
         min_v=0.0,
         max_v=1.0,
     )
+    check_float(
+        ac,
+        "weight_action_loop_score",
+        base.dashboard_action_scoring.weight_action_loop_score,
+        "dashboard.action_scoring",
+        min_v=-100.0,
+        max_v=100.0,
+    )
+    check_int(ac, "action_loop_min_support", base.dashboard_action_scoring.action_loop_min_support, "dashboard.action_scoring", min_v=1, max_v=200)
+    check_int(ac, "action_loop_recent_window_days", base.dashboard_action_scoring.action_loop_recent_window_days, "dashboard.action_scoring", min_v=1, max_v=90)
 
     # ===== dashboard.budget_transfer_opportunity =====
     bto = dash.get("budget_transfer_opportunity")
@@ -1495,6 +996,23 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
     check_float(bto, "suggested_add_pct", base.dashboard_budget_transfer_opportunity.suggested_add_pct, "dashboard.budget_transfer_opportunity", min_v=0.0)
     check_int(bto, "max_target_campaigns", base.dashboard_budget_transfer_opportunity.max_target_campaigns, "dashboard.budget_transfer_opportunity", min_v=1)
     check_float(bto, "min_target_opp_spend", base.dashboard_budget_transfer_opportunity.min_target_opp_spend, "dashboard.budget_transfer_opportunity", min_v=0.0)
+
+    # ===== dashboard.placement_rebalance =====
+    prb = dash.get("placement_rebalance")
+    if prb is not None and not isinstance(prb, dict):
+        warnings.append("类型不匹配：`dashboard.placement_rebalance` 期望为 object/dict；将使用默认策略。")
+        prb = {}
+    prb = prb if isinstance(prb, dict) else {}
+    warn_unknown_keys(prb, {f.name for f in fields(PlacementRebalancePolicy)}, "dashboard.placement_rebalance")
+    check_bool(prb, "enabled", base.dashboard_placement_rebalance.enabled, "dashboard.placement_rebalance")
+    check_float(prb, "min_shift_ratio", base.dashboard_placement_rebalance.min_shift_ratio, "dashboard.placement_rebalance", min_v=0.0, max_v=1.0)
+    check_float(prb, "base_shift_ratio", base.dashboard_placement_rebalance.base_shift_ratio, "dashboard.placement_rebalance", min_v=0.0, max_v=1.0)
+    check_float(prb, "max_shift_ratio", base.dashboard_placement_rebalance.max_shift_ratio, "dashboard.placement_rebalance", min_v=0.0, max_v=1.0)
+    check_float(prb, "severity_weight", base.dashboard_placement_rebalance.severity_weight, "dashboard.placement_rebalance", min_v=0.0, max_v=2.0)
+    check_float(prb, "fallback_severity", base.dashboard_placement_rebalance.fallback_severity, "dashboard.placement_rebalance", min_v=0.0, max_v=2.0)
+    check_float(prb, "min_shift_usd", base.dashboard_placement_rebalance.min_shift_usd, "dashboard.placement_rebalance", min_v=0.0)
+    check_float(prb, "stage_waste_floor_ratio", base.dashboard_placement_rebalance.stage_waste_floor_ratio, "dashboard.placement_rebalance", min_v=0.0, max_v=1.0)
+    check_int(prb, "max_down_per_campaign", base.dashboard_placement_rebalance.max_down_per_campaign, "dashboard.placement_rebalance", min_v=1, max_v=50)
 
     # ===== dashboard.unlock_tasks =====
     ut = dash.get("unlock_tasks")
@@ -1597,6 +1115,7 @@ def ops_policy_effective_to_dict(policy: OpsPolicy) -> Dict[str, object]:
                 "top_asins": int(policy.dashboard_top_asins),
                 "top_actions": int(policy.dashboard_top_actions),
                 "compare_ignore_last_days": int(policy.dashboard_compare_ignore_last_days),
+                "promo_adjustment": asdict(policy.dashboard_promo_adjustment),
                 "scale_window": asdict(policy.dashboard_scale_window),
                 "focus_scoring": asdict(policy.dashboard_focus_scoring),
                 "signal_scoring": asdict(policy.dashboard_signal_scoring),
@@ -1605,6 +1124,7 @@ def ops_policy_effective_to_dict(policy: OpsPolicy) -> Dict[str, object]:
                 "inventory_sigmoid": asdict(policy.dashboard_inventory_sigmoid),
                 "profit_guard": asdict(policy.dashboard_profit_guard),
                 "budget_transfer_opportunity": asdict(policy.dashboard_budget_transfer_opportunity),
+                "placement_rebalance": asdict(policy.dashboard_placement_rebalance),
                 "unlock_tasks": asdict(policy.dashboard_unlock_tasks),
                 "shop_alerts": {
                     "phase_down_recent": asdict(policy.dashboard_shop_alerts.phase_down_recent),
@@ -1834,6 +1354,9 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
             0.0,
             _to_float(inv.get("block_scale_when_cover_days_below"), base.block_scale_when_cover_days_below),
         )
+        inv_cat_default = inv.get("category_default") if isinstance(inv.get("category_default"), dict) else {}
+        inv_cat_overrides_raw = inv.get("category_overrides") if isinstance(inv.get("category_overrides"), list) else []
+        inv_cat_overrides = [x for x in inv_cat_overrides_raw if isinstance(x, dict)]
 
         top_n = max(1, _to_int(kw.get("top_n"), base.keyword_funnel_top_n))
 
@@ -1862,6 +1385,21 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
 
         dash_top_asins = max(1, _to_int(dash.get("top_asins"), base.dashboard_top_asins))
         dash_top_actions = max(1, _to_int(dash.get("top_actions"), base.dashboard_top_actions))
+        dash_ignore_last_days = max(0, _to_int(dash.get("compare_ignore_last_days"), base.dashboard_compare_ignore_last_days))
+
+        # compare 季节性/促销校正（可配置；没有则用默认）
+        pa_base = base.dashboard_promo_adjustment
+        pa_data = dash.get("promo_adjustment") if isinstance(dash.get("promo_adjustment"), dict) else {}
+        promo_adjustment = PromoAdjustmentPolicy(
+            enabled=_to_bool(pa_data.get("enabled"), pa_base.enabled),
+            baseline_lookback_days=max(7, _to_int(pa_data.get("baseline_lookback_days"), pa_base.baseline_lookback_days)),
+            baseline_min_periods=max(1, _to_int(pa_data.get("baseline_min_periods"), pa_base.baseline_min_periods)),
+            sales_spike_threshold=max(1.0, _to_float(pa_data.get("sales_spike_threshold"), pa_base.sales_spike_threshold)),
+            spend_spike_threshold=max(1.0, _to_float(pa_data.get("spend_spike_threshold"), pa_base.spend_spike_threshold)),
+            sales_spike_threshold_alt=max(1.0, _to_float(pa_data.get("sales_spike_threshold_alt"), pa_base.sales_spike_threshold_alt)),
+            spend_spike_threshold_alt=max(1.0, _to_float(pa_data.get("spend_spike_threshold_alt"), pa_base.spend_spike_threshold_alt)),
+            damp_ratio=max(0.0, min(1.0, _to_float(pa_data.get("damp_ratio"), pa_base.damp_ratio))),
+        )
 
         # “可放量窗口”阈值（可配置；没有则用默认）
         sw_base = base.dashboard_scale_window
@@ -2209,6 +1747,46 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
                 as_data.get("profit_scale_scale_boost"),
                 as_base.profit_scale_scale_boost,
             ),
+            weight_action_loop_score=_to_float(
+                as_data.get("weight_action_loop_score"),
+                as_base.weight_action_loop_score,
+            ),
+            action_loop_min_support=max(
+                1,
+                _to_int(as_data.get("action_loop_min_support"), as_base.action_loop_min_support),
+            ),
+            action_loop_recent_window_days=max(
+                1,
+                _to_int(as_data.get("action_loop_recent_window_days"), as_base.action_loop_recent_window_days),
+            ),
+        )
+
+        # 库存调速（Sigmoid）建议（只用于提示）
+        sig_base = base.dashboard_inventory_sigmoid
+        sig_data = dash.get("inventory_sigmoid") if isinstance(dash.get("inventory_sigmoid"), dict) else {}
+        sig_min = max(0.0, _to_float(sig_data.get("min_modifier"), sig_base.min_modifier))
+        sig_max = max(sig_min, _to_float(sig_data.get("max_modifier"), sig_base.max_modifier))
+        inventory_sigmoid = InventorySigmoidPolicy(
+            enabled=_to_bool(sig_data.get("enabled"), sig_base.enabled),
+            optimal_cover_days=max(0.0, _to_float(sig_data.get("optimal_cover_days"), sig_base.optimal_cover_days)),
+            steepness=max(0.0, _to_float(sig_data.get("steepness"), sig_base.steepness)),
+            min_modifier=sig_min,
+            max_modifier=sig_max,
+            min_change_ratio=max(0.0, _to_float(sig_data.get("min_change_ratio"), sig_base.min_change_ratio)),
+            min_ad_spend_roll=max(0.0, _to_float(sig_data.get("min_ad_spend_roll"), sig_base.min_ad_spend_roll)),
+        )
+
+        # 利润护栏（Break-even）
+        pg_base = base.dashboard_profit_guard
+        pg_data = dash.get("profit_guard") if isinstance(dash.get("profit_guard"), dict) else {}
+        profit_guard = ProfitGuardPolicy(
+            enabled=_to_bool(pg_data.get("enabled"), pg_base.enabled),
+            target_net_margin=max(
+                -1.0,
+                min(1.0, _to_float(pg_data.get("target_net_margin"), pg_base.target_net_margin)),
+            ),
+            min_sales_7d=max(0.0, _to_float(pg_data.get("min_sales_7d"), pg_base.min_sales_7d)),
+            min_ad_spend_roll=max(0.0, _to_float(pg_data.get("min_ad_spend_roll"), pg_base.min_ad_spend_roll)),
         )
 
         # 机会池 -> 预算迁移（可配置；没有则用默认）
@@ -2220,6 +1798,27 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
             max_target_campaigns=max(1, _to_int(bto_data.get("max_target_campaigns"), bto_base.max_target_campaigns)),
             min_target_opp_spend=max(0.0, _to_float(bto_data.get("min_target_opp_spend"), bto_base.min_target_opp_spend)),
             prefer_same_ad_type=_to_bool(bto_data.get("prefer_same_ad_type"), bto_base.prefer_same_ad_type),
+        )
+
+        # placement 层预算平移（可配置；没有则用默认）
+        prb_base = base.dashboard_placement_rebalance
+        prb_data = dash.get("placement_rebalance") if isinstance(dash.get("placement_rebalance"), dict) else {}
+        min_shift_ratio = max(0.0, min(1.0, _to_float(prb_data.get("min_shift_ratio"), prb_base.min_shift_ratio)))
+        base_shift_ratio = max(min_shift_ratio, min(1.0, _to_float(prb_data.get("base_shift_ratio"), prb_base.base_shift_ratio)))
+        max_shift_ratio = max(base_shift_ratio, min(1.0, _to_float(prb_data.get("max_shift_ratio"), prb_base.max_shift_ratio)))
+        placement_rebalance_policy = PlacementRebalancePolicy(
+            enabled=_to_bool(prb_data.get("enabled"), prb_base.enabled),
+            min_shift_ratio=min_shift_ratio,
+            base_shift_ratio=base_shift_ratio,
+            max_shift_ratio=max_shift_ratio,
+            severity_weight=max(0.0, _to_float(prb_data.get("severity_weight"), prb_base.severity_weight)),
+            fallback_severity=max(0.0, _to_float(prb_data.get("fallback_severity"), prb_base.fallback_severity)),
+            min_shift_usd=max(0.0, _to_float(prb_data.get("min_shift_usd"), prb_base.min_shift_usd)),
+            stage_waste_floor_ratio=max(
+                0.0,
+                min(1.0, _to_float(prb_data.get("stage_waste_floor_ratio"), prb_base.stage_waste_floor_ratio)),
+            ),
+            max_down_per_campaign=max(1, _to_int(prb_data.get("max_down_per_campaign"), prb_base.max_down_per_campaign)),
         )
 
         # 放量解锁任务收敛策略（可配置；没有则用默认）
@@ -2358,12 +1957,17 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
             phase_acos_multiplier=mult2,
             dashboard_top_asins=dash_top_asins,
             dashboard_top_actions=dash_top_actions,
+            dashboard_compare_ignore_last_days=dash_ignore_last_days,
+            dashboard_promo_adjustment=promo_adjustment,
             dashboard_scale_window=scale_window,
             dashboard_focus_scoring=fs,
             dashboard_signal_scoring=signal_scoring,
             dashboard_stage_scoring=stage_scoring,
             dashboard_action_scoring=action_scoring,
+            dashboard_inventory_sigmoid=inventory_sigmoid,
+            dashboard_profit_guard=profit_guard,
             dashboard_budget_transfer_opportunity=budget_transfer_opportunity,
+            dashboard_placement_rebalance=placement_rebalance_policy,
             dashboard_unlock_tasks=unlock_tasks_policy,
             dashboard_shop_alerts=shop_alerts_policy,
             dashboard_keyword_topics=keyword_topics_policy,

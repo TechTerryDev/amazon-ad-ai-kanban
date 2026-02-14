@@ -452,6 +452,7 @@ def _write_start_here(
         lines.append(f"- {L('dashboard/inventory_sigmoid_watchlist.csv')}：库存调速建议（Sigmoid，仅建议，不影响排序）")
         lines.append(f"- {L('dashboard/profit_guard_watchlist.csv')}：利润护栏 Watchlist（Break-even：安全ACOS/CPC 超线提示）")
         lines.append(f"- {L('dashboard/budget_transfer_plan.csv')}：预算迁移净表（估算金额；执行时以实际预算/花费节奏校准）")
+        lines.append(f"- {L('dashboard/placement_rebalance_plan.csv')}：广告位预算平移建议（同 Campaign 内 from→to；无承接时回收到 RESERVE）")
         lines.append(f"- {L('dashboard/unlock_scale_tasks.csv')}：放量解锁任务表（可分工：广告/供应链/运营/美工）")
         lines.append(f"- {L('dashboard/unlock_scale_tasks_full.csv')}：放量解锁任务表全量（含更多任务/优先级，便于追溯）")
         lines.append(f"- {L('dashboard/drivers_top_asins.csv')}：变化来源（近7天 vs 前7天 Top ASIN）")
@@ -462,11 +463,14 @@ def _write_start_here(
         lines.append(f"- {L('dashboard/keyword_topics_category_phase_summary.csv')}：关键词主题→类目/生命周期汇总（先按类目/阶段看主题，再下钻到 ASIN）")
         lines.append(f"- {L('dashboard/campaign_action_view.csv')}：Campaign 行动聚合（从 Action Board 归并，方便先按 campaign 排查）")
         lines.append(f"- {L('dashboard/action_board.csv')}：动作看板（去重后的运营视图；P0/P1 优先；可按类目/生命周期筛选）")
+        lines.append(f"- {L('dashboard/action_execution_guide.csv')}：动作执行手册（每条动作给出数据依据、执行步骤、观察信号与回滚护栏）")
         lines.append(f"- {L('dashboard/action_board_full.csv')}：动作看板全量（含重复，便于追溯）")
         lines.append(f"- {L('dashboard/shop_scorecard.json')}：店铺 KPI/诊断（结构化）")
         lines.append(f"- {L('ops/execution_log_template.xlsx')}：L0+ 执行回填模板（手工执行后回填，用于下次复盘）")
         if (shop_dir / "ops" / "action_review.csv").exists():
             lines.append(f"- {L('ops/action_review.csv')}：L0+ 动作复盘（已生成：基于历史 execution_log 复盘 7/14 天效果）")
+            if (shop_dir / "ops" / "action_review_summary.csv").exists():
+                lines.append(f"- {L('ops/action_review_summary.csv')}：L0+ 动作闭环评分汇总（按窗口/动作类型统计 positive_rate 与平均分）")
         else:
             lines.append("- （可选）`ops/action_review.csv`：L0+ 动作复盘（需要你提供已回填的 execution_log，并运行时指定 `--ops-log-root <目录>`）")
         if render_full_report:
@@ -750,6 +754,7 @@ def _write_run_start_here(
             "- [配置校验](#policy)",
             "- [轻量汇总](#summary)",
             "- [Owner 汇总](OWNER_OVERVIEW.html)",
+            "- [Owner 轻量表](OWNER_OVERVIEW.csv)",
             "",
             '<a id="shops"></a>',
             "## 店铺列表（快速入口）",
@@ -1235,9 +1240,14 @@ def _write_run_start_here(
                     "ad_spend_recent_7d": c7.get("ad_spend_recent") if isinstance(c7, dict) else "",
                     "tacos_recent_7d": c7.get("tacos_recent") if isinstance(c7, dict) else "",
                     "delta_sales_7d": c7.get("delta_sales") if isinstance(c7, dict) else "",
+                    "delta_sales_7d_corrected": c7.get("delta_sales_corrected") if isinstance(c7, dict) else "",
                     "delta_ad_spend_7d": c7.get("delta_ad_spend") if isinstance(c7, dict) else "",
+                    "delta_ad_spend_7d_corrected": c7.get("delta_ad_spend_corrected") if isinstance(c7, dict) else "",
                     "delta_profit_7d": c7.get("delta_profit") if isinstance(c7, dict) else "",
+                    "delta_profit_7d_corrected": c7.get("delta_profit_corrected") if isinstance(c7, dict) else "",
                     "marginal_tacos_7d": c7.get("marginal_tacos") if isinstance(c7, dict) else "",
+                    "marginal_tacos_7d_corrected": c7.get("marginal_tacos_corrected") if isinstance(c7, dict) else "",
+                    "promo_adjusted_7d": c7.get("promo_or_seasonality_adjusted") if isinstance(c7, dict) else "",
                 }
             )
 
@@ -1324,9 +1334,14 @@ def _write_run_start_here(
                 "ad_spend_recent_7d",
                 "tacos_recent_7d",
                 "delta_sales_7d",
+                "delta_sales_7d_corrected",
                 "delta_ad_spend_7d",
+                "delta_ad_spend_7d_corrected",
                 "delta_profit_7d",
+                "delta_profit_7d_corrected",
                 "marginal_tacos_7d",
+                "marginal_tacos_7d_corrected",
+                "promo_adjusted_7d",
             ]
             lines.append("| " + " | ".join(headers) + " |")
             lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
@@ -1421,6 +1436,117 @@ def _write_owner_overview(out_dir: Path, shops: List[str]) -> None:
             "说明：只做“入口级聚合”，便于负责人快速定位重点；口径来源保持与各店铺 Dashboard 一致。",
             "",
         ]
+
+        # 轻量 CSV：便于 owner 在 Excel/BI 里快速筛选多店铺优先级
+        try:
+            overview_rows: List[Dict[str, object]] = []
+            for s in shops:
+                shop = str(s or "").strip()
+                if not shop:
+                    continue
+                sc = _read_json(out_dir / shop / "dashboard" / "shop_scorecard.json")
+                scorecard = sc.get("scorecard") if isinstance(sc.get("scorecard"), dict) else {}
+                biz = scorecard.get("biz_kpi") if isinstance(scorecard.get("biz_kpi"), dict) else {}
+                actions = scorecard.get("actions") if isinstance(scorecard.get("actions"), dict) else {}
+                watchlists = scorecard.get("watchlists") if isinstance(scorecard.get("watchlists"), dict) else {}
+                compares = scorecard.get("compares") if isinstance(scorecard.get("compares"), list) else []
+                c7 = {}
+                for c in compares:
+                    if isinstance(c, dict) and int(c.get("window_days") or 0) == 7:
+                        c7 = c
+                        break
+                actions_p0 = int(actions.get("p0_count", 0) or 0)
+                actions_blocked = int(actions.get("blocked_count", 0) or 0)
+                watch_profit_reduce = int(watchlists.get("profit_reduce_count", 0) or 0)
+                watch_oos_spend = int(watchlists.get("oos_with_ad_spend_count", 0) or 0)
+                watch_spend_up_no_sales = int(watchlists.get("spend_up_no_sales_count", 0) or 0)
+                watch_phase_down_recent = int(watchlists.get("phase_down_recent_count", 0) or 0)
+                watch_scale_opportunity = int(watchlists.get("scale_opportunity_count", 0) or 0)
+                delta_sales_7d = float(c7.get("delta_sales", 0) or 0)
+                delta_profit_7d = float(c7.get("delta_profit", 0) or 0)
+                risk_score = (
+                    watch_profit_reduce * 3.0
+                    + watch_oos_spend * 2.0
+                    + watch_spend_up_no_sales * 2.0
+                    + watch_phase_down_recent * 2.0
+                )
+                p0_blocked_score = actions_p0 * 1.5 + actions_blocked * 1.2
+                trend_score = max(0.0, -delta_sales_7d) / 200.0 + max(0.0, -delta_profit_7d) / 100.0
+                opportunity_score = watch_scale_opportunity * 0.8
+                owner_priority_score = round(float(risk_score + p0_blocked_score + trend_score + opportunity_score), 2)
+                overview_rows.append(
+                    {
+                        "shop": shop,
+                        "sales_total": biz.get("sales_total", 0),
+                        "profit_total": biz.get("profit_total", 0),
+                        "ad_spend_total": biz.get("ad_spend_total", 0),
+                        "tacos_total": biz.get("tacos_total", 0),
+                        "actions_total": actions.get("total", 0),
+                        "actions_p0": actions_p0,
+                        "actions_blocked": actions_blocked,
+                        "watch_profit_reduce": watch_profit_reduce,
+                        "watch_oos_spend": watch_oos_spend,
+                        "watch_spend_up_no_sales": watch_spend_up_no_sales,
+                        "watch_phase_down_recent": watch_phase_down_recent,
+                        "watch_scale_opportunity": watch_scale_opportunity,
+                        "delta_sales_7d": delta_sales_7d,
+                        "delta_ad_spend_7d": c7.get("delta_ad_spend", 0),
+                        "delta_profit_7d": delta_profit_7d,
+                        "promo_adjusted_7d": c7.get("promo_or_seasonality_adjusted", False),
+                        "owner_priority_score": owner_priority_score,
+                        "owner_priority_risk_score": round(float(risk_score), 2),
+                        "owner_priority_p0_blocked_score": round(float(p0_blocked_score), 2),
+                        "owner_priority_trend_score": round(float(trend_score), 2),
+                        "owner_priority_opportunity_score": round(float(opportunity_score), 2),
+                    }
+                )
+            overview_df = pd.DataFrame(overview_rows)
+            if not overview_df.empty:
+                overview_df = overview_df.sort_values(
+                    ["owner_priority_score", "actions_p0", "actions_blocked", "shop"],
+                    ascending=[False, False, False, True],
+                ).copy()
+            overview_df.to_csv(out_dir / "OWNER_OVERVIEW.csv", index=False, encoding="utf-8-sig")
+
+            lines += ["## Owner Priority 排序（统一优先级分）", ""]
+            if overview_df.empty:
+                lines += ["- （暂无数据）", ""]
+            else:
+                top = overview_df.head(12).copy()
+                cols = [
+                    "shop",
+                    "owner_priority_score",
+                    "actions_p0",
+                    "actions_blocked",
+                    "watch_profit_reduce",
+                    "watch_oos_spend",
+                    "watch_spend_up_no_sales",
+                    "watch_phase_down_recent",
+                    "watch_scale_opportunity",
+                    "delta_sales_7d",
+                    "delta_profit_7d",
+                    "promo_adjusted_7d",
+                ]
+                keep = [c for c in cols if c in top.columns]
+                lines += ["| " + " | ".join(keep) + " |", "| " + " | ".join(["---"] * len(keep)) + " |"]
+                for _, rr in top[keep].iterrows():
+                    vals: List[str] = []
+                    for c in keep:
+                        v = rr.get(c)
+                        if isinstance(v, bool):
+                            vals.append("Y" if v else "N")
+                        elif isinstance(v, float):
+                            vals.append(f"{v:.2f}")
+                        else:
+                            vals.append(str(v))
+                    lines.append("| " + " | ".join(vals) + " |")
+                lines += [
+                    "",
+                    "说明：owner_priority_score = 风险分 + P0/阻断分 + 近期下行分 + 机会分（仅用于跨店排序，不改各店原始口径）。",
+                    "",
+                ]
+        except Exception:
+            pass
 
         # ===== 1) Top 风险 =====
         risk_sources = [
@@ -2111,6 +2237,7 @@ def run(
                 product_analysis_shop=pa_shop,
                 lifecycle_board=lifecycle_board_df,
                 windows_days=list(windows_days),
+                policy=policy,
             )
         except Exception:
             diagnostics["shop_scorecard"] = {}

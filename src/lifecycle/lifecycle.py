@@ -17,7 +17,7 @@ ASIN 生命周期识别（面向运营的“动态周期”方法，不是硬阈
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -45,8 +45,13 @@ class LifecycleConfig:
     # 判定成熟/衰退阈值（相对峰值的比例）
     mature_ratio: float = 0.85
     decline_ratio: float = 0.65
+    # 阶段最短驻留天数（<=1 表示关闭；仅平滑阶段标签，不改任何指标口径）
+    phase_min_segment_days: int = 3
     # 库存阈值（用于 flag）
     low_inventory: int = 20
+    # 品类差异化阈值（可选）：支持按 category/match 覆盖上述生命周期参数
+    category_default: Dict[str, object] = field(default_factory=dict)
+    category_overrides: List[Dict[str, object]] = field(default_factory=list)
 
 
 _PHASE_TREND_RANK: Dict[str, int] = {
@@ -101,6 +106,86 @@ def _to_date(x: object) -> Optional[dt.date]:
         return dt.date.fromisoformat(s) if s else None
     except Exception:
         return None
+
+
+def _norm_category(v: object) -> str:
+    try:
+        s = str(v or "").strip()
+        if not s or s.lower() == "nan":
+            return ""
+        return s
+    except Exception:
+        return ""
+
+
+def _pick_category_override(category: str, cfg: LifecycleConfig) -> Dict[str, object]:
+    base = dict(getattr(cfg, "category_default", {}) or {})
+    cat = _norm_category(category).lower()
+    overrides = getattr(cfg, "category_overrides", []) or []
+    if not isinstance(overrides, list):
+        return base
+    for rule in overrides:
+        if not isinstance(rule, dict):
+            continue
+        exact = _norm_category(rule.get("category")).lower()
+        if exact and cat and exact == cat:
+            out = dict(base)
+            out.update(rule)
+            return out
+        match = rule.get("match") if isinstance(rule.get("match"), list) else []
+        if cat and isinstance(match, list):
+            for kw in match:
+                k = _norm_category(kw).lower()
+                if k and k in cat:
+                    out = dict(base)
+                    out.update(rule)
+                    return out
+    return base
+
+
+def _resolve_lifecycle_cfg_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> LifecycleConfig:
+    """
+    基于商品分类为当前 ASIN 解析生命周期阈值覆盖。
+    """
+    if ts is None or ts.empty:
+        return cfg
+    cat_col = None
+    for c in ("商品分类", "product_category"):
+        if c in ts.columns:
+            cat_col = c
+            break
+    if not cat_col:
+        return cfg
+
+    try:
+        vals = ts[cat_col].dropna().astype(str).tolist()
+    except Exception:
+        vals = []
+    vals = [_norm_category(x) for x in vals]
+    vals = [x for x in vals if x]
+    if not vals:
+        return cfg
+
+    category = pd.Series(vals).value_counts(dropna=False).index[0] if vals else ""
+    override = _pick_category_override(str(category), cfg)
+    if not override:
+        return cfg
+
+    base = asdict(cfg)
+    allowed = set(base.keys())
+    changed = False
+    for k, v in override.items():
+        if k in {"name", "category", "match", "keywords"}:
+            continue
+        if k in allowed:
+            base[k] = v
+            changed = True
+    if not changed:
+        return cfg
+    try:
+        return LifecycleConfig(**base)  # type: ignore[arg-type]
+    except Exception:
+        return cfg
 
 
 def _first_date_where(df: pd.DataFrame, mask: pd.Series) -> Optional[dt.date]:
@@ -484,6 +569,72 @@ def _rolling(series: pd.Series, n: int) -> pd.Series:
         return series
 
 
+def _phase_segments(phases: List[str]) -> List[Tuple[int, int, str]]:
+    """
+    把 phase 序列切成连续段：(start_idx, end_idx, phase)。
+    """
+    if not phases:
+        return []
+    out: List[Tuple[int, int, str]] = []
+    s = 0
+    cur = str(phases[0])
+    for i in range(1, len(phases)):
+        ph = str(phases[i])
+        if ph != cur:
+            out.append((s, i - 1, cur))
+            s = i
+            cur = ph
+    out.append((s, len(phases) - 1, cur))
+    return out
+
+
+def _smooth_cycle_phases(phases: List[str], min_days: int) -> List[str]:
+    """
+    对单个周期的 phase 做“最短驻留天数”平滑，减少 1 天抖动段。
+
+    规则（保守）：
+    - 仅处理中间短段（首段/尾段不改，避免破坏边界语义）；
+    - pre_launch 不平滑；
+    - 仅处理“夹心抖动”：A - x(短段) - A，短段直接并到 A。
+
+    这样做比“直接并到更长邻段”更稳，能显著降低抖动，同时避免把阶段语义改得过猛。
+    """
+    min_days2 = int(min_days or 0)
+    if min_days2 <= 1 or not phases:
+        return [str(x) for x in phases]
+
+    protected = {"pre_launch"}
+    out = [str(x) for x in phases]
+
+    changed = True
+    while changed:
+        changed = False
+        segs = _phase_segments(out)
+        if len(segs) <= 2:
+            break
+
+        for i in range(1, len(segs) - 1):
+            s, e, ph = segs[i]
+            seg_len = int(e - s + 1)
+            if seg_len >= min_days2 or ph in protected:
+                continue
+
+            _, _, lph = segs[i - 1]
+            _, _, rph = segs[i + 1]
+            if lph != rph:
+                continue
+            target = lph
+            if target == ph:
+                continue
+
+            for j in range(s, e + 1):
+                out[j] = target
+            changed = True
+            break
+
+    return out
+
+
 def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataFrame:
     """
     输入：单个 ASIN 的按日数据（必须包含 date）
@@ -492,6 +643,7 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
     if ts is None or ts.empty or CAN.date not in ts.columns:
         return pd.DataFrame()
 
+    cfg_eff = _resolve_lifecycle_cfg_for_asin(ts, cfg)
     ts = _coerce_cols(ts)
     ts = ts.sort_values(CAN.date).copy()
     dmin = ts[CAN.date].min()
@@ -512,17 +664,17 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
     active = _active_flag(ts)
     ts["active"] = active.astype(int)
     # 周期切分优先按库存（断货->到货），缺库存列时再回退到 active（历史兼容）
-    inv_cycle = _assign_cycle_id_by_inventory(ts, cfg)
+    inv_cycle = _assign_cycle_id_by_inventory(ts, cfg_eff)
     if inv_cycle is not None:
         ts["cycle_id"] = inv_cycle.astype(int)
     else:
-        ts["cycle_id"] = _assign_cycle_id(active, cfg).astype(int)
+        ts["cycle_id"] = _assign_cycle_id(active, cfg_eff).astype(int)
 
     # rolling 指标（用于动态阶段判断）
-    ts["sales_roll"] = _rolling(ts["销售额"], cfg.roll_days)
-    ts["sessions_roll"] = _rolling(ts["Sessions"], cfg.roll_days)
-    ts["ad_spend_roll"] = _rolling(ts["广告花费"], cfg.roll_days)
-    ts["profit_roll"] = _rolling(ts["毛利润"], cfg.roll_days)
+    ts["sales_roll"] = _rolling(ts["销售额"], cfg_eff.roll_days)
+    ts["sessions_roll"] = _rolling(ts["Sessions"], cfg_eff.roll_days)
+    ts["ad_spend_roll"] = _rolling(ts["广告花费"], cfg_eff.roll_days)
+    ts["profit_roll"] = _rolling(ts["毛利润"], cfg_eff.roll_days)
 
     ts["tacos_roll"] = ts.apply(lambda r: safe_div(r["广告花费"], r["销售额"]) if r["销售额"] > 0 else 0.0, axis=1)
     ts["cvr_roll"] = ts.apply(lambda r: safe_div(r["订单量"], r["Sessions"]) if r["Sessions"] > 0 else 0.0, axis=1)
@@ -534,6 +686,7 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
     phases: List[str] = []
     for cid, g in ts.groupby("cycle_id", dropna=False, sort=False):
         g = g.copy()
+        cycle_phases: List[str] = []
         # 累计口径（用于成熟期门槛）
         try:
             g["cum_sales"] = pd.to_numeric(g.get("销售额", 0.0), errors="coerce").fillna(0.0).cumsum()
@@ -570,58 +723,66 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
             sales_r = float(r["sales_roll"] or 0.0)
             slope = float(r["sales_slope"] or 0.0)
 
-            if not is_active:
+            # 首单前：只要“在售（FBA可售>0）或有流量/广告行为”，都归为 pre_launch
+            # 这样可避免 pre_launch 被 1-2 天零活动切碎成 pre_launch→inactive→pre_launch。
+            if first_sale_date is None or d < first_sale_date:
+                in_stock_prelaunch = False
+                try:
+                    in_stock_prelaunch = float(r.get("FBA可售", 0.0) or 0.0) > 0
+                except Exception:
+                    in_stock_prelaunch = False
+                phase = "pre_launch" if (is_active or in_stock_prelaunch) else "inactive"
+            elif not is_active:
                 phase = "inactive"
             else:
-                # 正式开售/启动前：pre_launch（以“可售>0 且出单”的首单为主锚点）
-                if first_sale_date is None or d < first_sale_date:
-                    phase = "pre_launch"
+                # 相对峰值比例（动态周期）
+                ratio = 0.0 if peak <= 0 else sales_r / peak
+                days_since_first_sale = (d - first_sale_date).days if isinstance(first_sale_date, dt.date) else 0
+                days_since_first_stock = (d - first_stock_date).days if isinstance(first_stock_date, dt.date) else 0
+                cum_sales = float(r.get("cum_sales", 0.0) or 0.0)
+                cum_orders = float(r.get("cum_orders", 0.0) or 0.0)
+
+                # 成熟期门槛（避免新品/低体量误判）
+                mature_gate = True
+                min_days = int(cfg_eff.min_mature_days or 0)
+                if min_days > 0 and days_since_first_sale < min_days:
+                    mature_gate = False
+                if min_days > 0 and isinstance(first_stock_date, dt.date) and days_since_first_stock < min_days:
+                    mature_gate = False
+                min_orders = float(cfg_eff.min_mature_orders or 0.0)
+                if min_orders > 0 and cum_orders < min_orders:
+                    mature_gate = False
+                min_sales = float(cfg_eff.min_mature_sales or 0.0)
+                if min_sales > 0 and cum_sales < min_sales:
+                    mature_gate = False
+                min_peak = float(cfg_eff.min_peak_sales_roll or 0.0)
+                if min_peak > 0 and peak < min_peak:
+                    mature_gate = False
+
+                # launch：首单后的连续窗口（默认 14 天，可配置）
+                # 说明：这里不再附加 ratio 条件，避免出现 launch→mature→launch 的“阶段回跳”。
+                if days_since_first_sale <= int(cfg_eff.launch_days or 14):
+                    phase = "launch"
+                # growth：销售在爬坡（斜率为正），且未到成熟段
+                elif ratio < cfg_eff.mature_ratio and slope >= 0:
+                    phase = "growth"
+                # mature：接近峰值且变化不大
+                elif ratio >= cfg_eff.mature_ratio and abs(slope) < max(1e-6, peak * 0.02) and mature_gate:
+                    phase = "mature"
+                # decline：明显低于峰值且斜率为负
+                elif ratio <= cfg_eff.decline_ratio and slope < 0:
+                    phase = "decline"
                 else:
-                    # 相对峰值比例（动态周期）
-                    ratio = 0.0 if peak <= 0 else sales_r / peak
-                    days_since_first_sale = (d - first_sale_date).days if isinstance(first_sale_date, dt.date) else 0
-                    days_since_first_stock = (d - first_stock_date).days if isinstance(first_stock_date, dt.date) else 0
-                    cum_sales = float(r.get("cum_sales", 0.0) or 0.0)
-                    cum_orders = float(r.get("cum_orders", 0.0) or 0.0)
+                    phase = "stable"
 
-                    # 成熟期门槛（避免新品/低体量误判）
-                    mature_gate = True
-                    min_days = int(cfg.min_mature_days or 0)
-                    if min_days > 0 and days_since_first_sale < min_days:
-                        mature_gate = False
-                    if min_days > 0 and isinstance(first_stock_date, dt.date) and days_since_first_stock < min_days:
-                        mature_gate = False
-                    min_orders = float(cfg.min_mature_orders or 0.0)
-                    if min_orders > 0 and cum_orders < min_orders:
-                        mature_gate = False
-                    min_sales = float(cfg.min_mature_sales or 0.0)
-                    if min_sales > 0 and cum_sales < min_sales:
-                        mature_gate = False
-                    min_peak = float(cfg.min_peak_sales_roll or 0.0)
-                    if min_peak > 0 and peak < min_peak:
-                        mature_gate = False
+            cycle_phases.append(phase)
 
-                    # launch：刚开始出单的一段时间（默认 14 天，可配置）
-                    if days_since_first_sale <= int(cfg.launch_days or 14) and ratio < cfg.mature_ratio:
-                        phase = "launch"
-                    # growth：销售在爬坡（斜率为正），且未到成熟段
-                    elif ratio < cfg.mature_ratio and slope >= 0:
-                        phase = "growth"
-                    # mature：接近峰值且变化不大
-                    elif ratio >= cfg.mature_ratio and abs(slope) < max(1e-6, peak * 0.02) and mature_gate:
-                        phase = "mature"
-                    # decline：明显低于峰值且斜率为负
-                    elif ratio <= cfg.decline_ratio and slope < 0:
-                        phase = "decline"
-                    else:
-                        phase = "stable"
-
-            phases.append(phase)
+        phases.extend(_smooth_cycle_phases(cycle_phases, int(cfg_eff.phase_min_segment_days or 0)))
 
     ts["lifecycle_phase"] = phases
 
     # flags：库存/断货风险（不改 phase，只做标记）
-    ts["flag_low_inventory"] = ((ts["FBA可售"] > 0) & (ts["FBA可售"] <= cfg.low_inventory)).astype(int)
+    ts["flag_low_inventory"] = ((ts["FBA可售"] > 0) & (ts["FBA可售"] <= cfg_eff.low_inventory)).astype(int)
     # 断货判定标准：只看库存（FBA可售==0）
     ts["flag_oos"] = (ts["FBA可售"] == 0).astype(int)
     # 断货异常：断货但仍有 Sessions/仍有广告花费（用于排查变体/配送设置/广告异常等）

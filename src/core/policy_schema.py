@@ -138,6 +138,20 @@ class ActionScoringSchema(_BaseModel):
     phase_scale_penalty_inactive: Optional[float] = None
     profit_reduce_scale_penalty: Optional[float] = None
     profit_scale_scale_boost: Optional[float] = None
+    weight_action_loop_score: Optional[float] = None
+    action_loop_min_support: Optional[int] = None
+    action_loop_recent_window_days: Optional[int] = None
+
+
+class PromoAdjustmentSchema(_BaseModel):
+    enabled: Optional[bool] = None
+    baseline_lookback_days: Optional[int] = None
+    baseline_min_periods: Optional[int] = None
+    sales_spike_threshold: Optional[float] = None
+    spend_spike_threshold: Optional[float] = None
+    sales_spike_threshold_alt: Optional[float] = None
+    spend_spike_threshold_alt: Optional[float] = None
+    damp_ratio: Optional[float] = None
 
 
 class InventorySigmoidSchema(_BaseModel):
@@ -163,6 +177,18 @@ class BudgetTransferOpportunitySchema(_BaseModel):
     max_target_campaigns: Optional[int] = None
     min_target_opp_spend: Optional[float] = None
     prefer_same_ad_type: Optional[bool] = None
+
+
+class PlacementRebalanceSchema(_BaseModel):
+    enabled: Optional[bool] = None
+    min_shift_ratio: Optional[float] = None
+    base_shift_ratio: Optional[float] = None
+    max_shift_ratio: Optional[float] = None
+    severity_weight: Optional[float] = None
+    fallback_severity: Optional[float] = None
+    min_shift_usd: Optional[float] = None
+    stage_waste_floor_ratio: Optional[float] = None
+    max_down_per_campaign: Optional[int] = None
 
 
 class UnlockTasksSchema(_BaseModel):
@@ -210,6 +236,7 @@ class DashboardSchema(_BaseModel):
     top_asins: Optional[int] = None
     top_actions: Optional[int] = None
     compare_ignore_last_days: Optional[int] = None
+    promo_adjustment: Optional[PromoAdjustmentSchema] = None
     scale_window: Optional[ScaleWindowSchema] = None
     focus_scoring: Optional[FocusScoringSchema] = None
     signal_scoring: Optional[SignalScoringSchema] = None
@@ -218,6 +245,7 @@ class DashboardSchema(_BaseModel):
     inventory_sigmoid: Optional[InventorySigmoidSchema] = None
     profit_guard: Optional[ProfitGuardSchema] = None
     budget_transfer_opportunity: Optional[BudgetTransferOpportunitySchema] = None
+    placement_rebalance: Optional[PlacementRebalanceSchema] = None
     unlock_tasks: Optional[UnlockTasksSchema] = None
     shop_alerts: Optional[ShopAlertsSchema] = None
     keyword_topics: Optional[KeywordTopicsSchema] = None
