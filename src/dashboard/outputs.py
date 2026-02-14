@@ -17952,119 +17952,224 @@ def _build_trend_explorer_payload(
             ac_base = _rolling_median(acos_n, i, window=7)
             od_base = _rolling_median(orders_n, i, window=7)
             cv_base = _rolling_median(cvr_n, i, window=7)
+            spend_diff = float(sp - sp_base) if (sp is not None and sp_base is not None) else 0.0
+            spend_ratio = float(sp / max(0.5, sp_base)) if (sp is not None and sp_base is not None) else 1.0
+            sales_diff = float(s - s_base) if (s is not None and s_base is not None) else 0.0
+            sales_ratio = float(s / max(1.0, s_base)) if (s is not None and s_base is not None) else 1.0
+            acos_diff = float(ac - ac_base) if (ac is not None and ac_base is not None) else 0.0
+            acos_drop = float(ac_base - ac) if (ac is not None and ac_base is not None) else 0.0
+            cvr_ratio = float(cv / max(0.1, cv_base)) if (cv is not None and cv_base is not None) else 1.0
 
-            # 疑似“加预算/提价”：花费明显抬升。
-            if sp is not None and sp_base is not None and sp >= 8 and sp_base >= 4:
-                diff = float(sp - sp_base)
-                ratio = float(sp / max(0.5, sp_base))
-                if diff >= 8 and ratio >= 1.55:
-                    conf = 0.62 + min(0.22, (ratio - 1.0) * 0.2) + min(0.12, diff / 80.0)
-                    _push(
-                        idx=i,
-                        event_type="spend_up",
-                        label="疑似加预算/提价（AdSpend 放量）",
-                        confidence=conf,
-                        evidence=f"{d} AdSpend {sp_base:.2f}→{sp:.2f}（+{diff:.2f}）",
-                    )
+            spend_up = bool(
+                (sp is not None)
+                and (sp_base is not None)
+                and (sp >= 8)
+                and (sp_base >= 4)
+                and (spend_diff >= 8)
+                and (spend_ratio >= 1.55)
+            )
+            spend_down = bool(
+                (sp is not None)
+                and (sp_base is not None)
+                and (sp_base >= 8)
+                and (spend_diff <= -8)
+                and (spend_ratio <= 0.6)
+            )
+            sales_up = bool(
+                (s is not None)
+                and (s_base is not None)
+                and (s_base >= 15)
+                and (sales_diff >= 15)
+                and (sales_ratio >= 1.45)
+            )
+            sales_down = bool(
+                (s is not None)
+                and (s_base is not None)
+                and (s_base >= 20)
+                and (sales_diff <= -15)
+                and (sales_ratio <= 0.68)
+            )
+            acos_worse = bool(
+                (ac is not None)
+                and (ac_base is not None)
+                and (sp is not None)
+                and (sp >= 8)
+                and (ac >= 30)
+                and (acos_diff >= 10)
+            )
+            acos_better = bool(
+                (ac is not None)
+                and (ac_base is not None)
+                and (acos_drop >= 8)
+            )
+            cvr_drop = bool(
+                (cv is not None)
+                and (cv_base is not None)
+                and (od_base is not None)
+                and (od_base >= 1)
+                and (cv_base >= 4)
+                and (cvr_ratio <= 0.65)
+            )
+            stock_risk = bool(
+                (inv is not None)
+                and (od is not None)
+                and (inv > 0)
+                and (od >= 2)
+                and (inv <= 4)
+            )
 
-            # 疑似“收紧流量”：花费明显回落。
-            if sp is not None and sp_base is not None and sp_base >= 8:
-                diff = float(sp - sp_base)
-                ratio = float(sp / max(0.5, sp_base))
-                if diff <= -8 and ratio <= 0.6:
-                    conf = 0.6 + min(0.18, (1.0 - ratio) * 0.25) + min(0.1, abs(diff) / 90.0)
-                    _push(
-                        idx=i,
-                        event_type="spend_down",
-                        label="疑似降预算/限流（AdSpend 回落）",
-                        confidence=conf,
-                        evidence=f"{d} AdSpend {sp_base:.2f}→{sp:.2f}（{diff:.2f}）",
-                    )
+            # 关系型事件优先：更贴近“运营动作 + 结果”的解释链。
+            if spend_up and sales_down:
+                conf = 0.84 + min(0.08, (spend_ratio - 1.0) * 0.06) + min(0.06, abs(sales_diff) / 120.0)
+                _push(
+                    idx=i,
+                    event_type="spend_up_sales_down",
+                    label="投入上升但销量走弱（疑似投放效率恶化）",
+                    confidence=conf,
+                    evidence=f"{d} AdSpend {sp_base:.2f}→{sp:.2f} ｜ Sales {s_base:.2f}→{s:.2f}",
+                    risk=True,
+                    cooldown_days=1,
+                )
+            if spend_up and acos_worse:
+                conf = 0.85 + min(0.07, (spend_ratio - 1.0) * 0.05) + min(0.06, acos_diff / 50.0)
+                _push(
+                    idx=i,
+                    event_type="spend_up_acos_up",
+                    label="投入上升且 ACOS 恶化（疑似预算放量过快）",
+                    confidence=conf,
+                    evidence=f"{d} AdSpend {sp_base:.2f}→{sp:.2f} ｜ ACOS {ac_base:.2f}%→{ac:.2f}%",
+                    risk=True,
+                    cooldown_days=1,
+                )
+            if spend_up and cvr_drop:
+                conf = 0.82 + min(0.08, (spend_ratio - 1.0) * 0.05) + min(0.06, (1.0 - cvr_ratio) * 0.2)
+                _push(
+                    idx=i,
+                    event_type="spend_up_cvr_drop",
+                    label="投入上升但转化下滑（流量质量风险）",
+                    confidence=conf,
+                    evidence=f"{d} AdSpend {sp_base:.2f}→{sp:.2f} ｜ CVR {cv_base:.2f}%→{cv:.2f}%",
+                    risk=True,
+                    cooldown_days=1,
+                )
+            if sales_up and stock_risk:
+                conf = 0.83 + min(0.08, (sales_ratio - 1.0) * 0.08) + min(0.06, (4.0 - float(inv)) / 4.0)
+                _push(
+                    idx=i,
+                    event_type="sales_up_stock_risk",
+                    label="需求放量且库存承压（缺货风险）",
+                    confidence=conf,
+                    evidence=f"{d} Sales {s_base:.2f}→{s:.2f} ｜ 库存覆盖≈{inv:.2f}天",
+                    risk=True,
+                    cooldown_days=2,
+                )
+            if spend_up and sales_up and acos_better:
+                conf = 0.8 + min(0.08, (spend_ratio - 1.0) * 0.05) + min(0.08, acos_drop / 45.0)
+                _push(
+                    idx=i,
+                    event_type="spend_up_sales_up",
+                    label="投入放量且销量提升（放量有效）",
+                    confidence=conf,
+                    evidence=f"{d} AdSpend {sp_base:.2f}→{sp:.2f} ｜ Sales {s_base:.2f}→{s:.2f} ｜ ACOS {ac_base:.2f}%→{ac:.2f}%",
+                    cooldown_days=1,
+                )
+            if spend_down and sales_down and (not stock_risk):
+                conf = 0.76 + min(0.08, (1.0 - spend_ratio) * 0.08) + min(0.06, abs(sales_diff) / 140.0)
+                _push(
+                    idx=i,
+                    event_type="spend_down_sales_down",
+                    label="投入收紧且销量下滑（疑似控量过度）",
+                    confidence=conf,
+                    evidence=f"{d} AdSpend {sp_base:.2f}→{sp:.2f} ｜ Sales {s_base:.2f}→{s:.2f}",
+                    risk=True,
+                    cooldown_days=1,
+                )
 
-            # 效率风险：ACOS 抬升明显且投入不低。
-            if ac is not None and ac_base is not None and sp is not None and sp >= 8:
-                ac_diff = float(ac - ac_base)
-                if ac >= 30 and ac_diff >= 10:
-                    conf = 0.66 + min(0.22, ac_diff / 45.0) + min(0.08, sp / 150.0)
-                    _push(
-                        idx=i,
-                        event_type="efficiency_risk",
-                        label="效率风险节点（ACOS 抬升）",
-                        confidence=conf,
-                        evidence=f"{d} ACOS {ac_base:.2f}%→{ac:.2f}%",
-                        risk=True,
-                        cooldown_days=1,
-                    )
-
-            # 效率修复：ACOS 回落且销售改善。
-            if ac is not None and ac_base is not None and s is not None and s_base is not None and s_base >= 10:
-                ac_diff = float(ac_base - ac)
-                s_ratio = float(s / max(1.0, s_base))
-                if ac_diff >= 8 and s_ratio >= 1.2:
-                    conf = 0.64 + min(0.2, ac_diff / 40.0) + min(0.1, (s_ratio - 1.0) * 0.25)
-                    _push(
-                        idx=i,
-                        event_type="efficiency_recover",
-                        label="效率修复节点（ACOS 回落 + Sales 回升）",
-                        confidence=conf,
-                        evidence=f"{d} ACOS {ac_base:.2f}%→{ac:.2f}% ｜ Sales {s_base:.2f}→{s:.2f}",
-                    )
-
-            # 需求放量。
-            if s is not None and s_base is not None and s_base >= 15:
-                diff = float(s - s_base)
-                ratio = float(s / max(1.0, s_base))
-                if diff >= 15 and ratio >= 1.45:
-                    conf = 0.62 + min(0.2, (ratio - 1.0) * 0.2) + min(0.12, diff / 120.0)
-                    _push(
-                        idx=i,
-                        event_type="sales_spike",
-                        label="需求放量节点（Sales 上冲）",
-                        confidence=conf,
-                        evidence=f"{d} Sales {s_base:.2f}→{s:.2f}（+{diff:.2f}）",
-                    )
-
-            # 需求走弱。
-            if s is not None and s_base is not None and s_base >= 20:
-                diff = float(s - s_base)
-                ratio = float(s / max(1.0, s_base))
-                if diff <= -15 and ratio <= 0.68:
-                    conf = 0.62 + min(0.18, (1.0 - ratio) * 0.28) + min(0.12, abs(diff) / 120.0)
-                    _push(
-                        idx=i,
-                        event_type="sales_drop",
-                        label="需求走弱节点（Sales 回落）",
-                        confidence=conf,
-                        evidence=f"{d} Sales {s_base:.2f}→{s:.2f}（{diff:.2f}）",
-                        risk=True,
-                    )
-
-            # 库存承压节点（结合订单）。
-            if inv is not None and od is not None and inv > 0 and od >= 2:
-                if inv <= 4:
-                    conf = 0.7 + min(0.2, (4.0 - inv) / 6.0) + min(0.08, od / 25.0)
-                    _push(
-                        idx=i,
-                        event_type="stock_risk",
-                        label="库存承压节点（覆盖天数偏低）",
-                        confidence=conf,
-                        evidence=f"{d} 库存覆盖≈{inv:.2f}天，订单={od:.2f}",
-                        risk=True,
-                        cooldown_days=3,
-                    )
-
-            # 转化下滑节点（CVR 突降）。
-            if cv is not None and cv_base is not None and od_base is not None and od_base >= 1:
-                if cv_base >= 4 and cv <= cv_base * 0.65:
-                    conf = 0.6 + min(0.2, (1.0 - (cv / max(0.1, cv_base))) * 0.3)
-                    _push(
-                        idx=i,
-                        event_type="cvr_drop",
-                        label="转化下滑节点（CVR 下降）",
-                        confidence=conf,
-                        evidence=f"{d} CVR {cv_base:.2f}%→{cv:.2f}%",
-                        risk=True,
-                    )
+            # 单指标兜底事件（关系事件未命中时再补充）。
+            if spend_up and not (sales_down or acos_worse or cvr_drop):
+                conf = 0.62 + min(0.18, (spend_ratio - 1.0) * 0.16) + min(0.1, spend_diff / 100.0)
+                _push(
+                    idx=i,
+                    event_type="spend_up",
+                    label="投入放量（AdSpend 明显抬升）",
+                    confidence=conf,
+                    evidence=f"{d} AdSpend {sp_base:.2f}→{sp:.2f}",
+                    cooldown_days=1,
+                )
+            if spend_down and not sales_down:
+                conf = 0.6 + min(0.16, (1.0 - spend_ratio) * 0.2) + min(0.08, abs(spend_diff) / 110.0)
+                _push(
+                    idx=i,
+                    event_type="spend_down",
+                    label="投入收紧（AdSpend 明显回落）",
+                    confidence=conf,
+                    evidence=f"{d} AdSpend {sp_base:.2f}→{sp:.2f}",
+                    cooldown_days=1,
+                )
+            if acos_worse and not spend_up:
+                conf = 0.66 + min(0.18, acos_diff / 50.0)
+                _push(
+                    idx=i,
+                    event_type="efficiency_risk",
+                    label="效率风险节点（ACOS 抬升）",
+                    confidence=conf,
+                    evidence=f"{d} ACOS {ac_base:.2f}%→{ac:.2f}%",
+                    risk=True,
+                    cooldown_days=1,
+                )
+            if acos_better and sales_up and not spend_up:
+                conf = 0.64 + min(0.16, acos_drop / 45.0)
+                _push(
+                    idx=i,
+                    event_type="efficiency_recover",
+                    label="效率修复节点（ACOS 回落）",
+                    confidence=conf,
+                    evidence=f"{d} ACOS {ac_base:.2f}%→{ac:.2f}%",
+                    cooldown_days=1,
+                )
+            if sales_up and not spend_up:
+                conf = 0.62 + min(0.16, (sales_ratio - 1.0) * 0.16) + min(0.1, sales_diff / 140.0)
+                _push(
+                    idx=i,
+                    event_type="sales_spike",
+                    label="需求放量节点（Sales 上冲）",
+                    confidence=conf,
+                    evidence=f"{d} Sales {s_base:.2f}→{s:.2f}",
+                    cooldown_days=1,
+                )
+            if sales_down and not spend_down:
+                conf = 0.62 + min(0.16, (1.0 - sales_ratio) * 0.18) + min(0.1, abs(sales_diff) / 140.0)
+                _push(
+                    idx=i,
+                    event_type="sales_drop",
+                    label="需求走弱节点（Sales 回落）",
+                    confidence=conf,
+                    evidence=f"{d} Sales {s_base:.2f}→{s:.2f}",
+                    risk=True,
+                    cooldown_days=1,
+                )
+            if stock_risk:
+                conf = 0.7 + min(0.18, (4.0 - float(inv)) / 6.0) + min(0.08, float(od) / 25.0)
+                _push(
+                    idx=i,
+                    event_type="stock_risk",
+                    label="库存承压节点（覆盖天数偏低）",
+                    confidence=conf,
+                    evidence=f"{d} 库存覆盖≈{inv:.2f}天，订单={od:.2f}",
+                    risk=True,
+                    cooldown_days=2,
+                )
+            if cvr_drop and not spend_up:
+                conf = 0.6 + min(0.18, (1.0 - cvr_ratio) * 0.24)
+                _push(
+                    idx=i,
+                    event_type="cvr_drop",
+                    label="转化下滑节点（CVR 下降）",
+                    confidence=conf,
+                    evidence=f"{d} CVR {cv_base:.2f}%→{cv:.2f}%",
+                    risk=True,
+                    cooldown_days=1,
+                )
 
         # 去重后再做“按置信度限流”，避免节点刷屏。
         events = sorted(
@@ -18212,6 +18317,12 @@ def _build_trend_explorer_payload(
         "target_down": "收量",
         "spend_up": "投入放量",
         "spend_down": "投入收紧",
+        "spend_up_sales_down": "投入升但销量降",
+        "spend_up_acos_up": "投入升且ACOS恶化",
+        "spend_up_cvr_drop": "投入升但转化降",
+        "sales_up_stock_risk": "放量但库存承压",
+        "spend_up_sales_up": "投入升且销量升",
+        "spend_down_sales_down": "投入降且销量降",
         "efficiency_risk": "效率风险",
         "efficiency_recover": "效率修复",
         "sales_spike": "需求放量",
