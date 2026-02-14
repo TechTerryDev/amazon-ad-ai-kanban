@@ -346,6 +346,8 @@ def _rewrite_md_href_to_html_if_exists(href: str, base_dir: Optional[Path]) -> s
             "asin_drilldown.md",
             "category_drilldown.md",
             "phase_drilldown.md",
+            "lifecycle_overview.md",
+            "trend_explorer.md",
             "keyword_topics.md",
             "data_quality.md",
             "ai_suggestions.md",
@@ -2523,6 +2525,411 @@ function _initPhaseLineChart(){
   }
 }
 """
+        if name_lower == "trend_explorer.html":
+            extra_head = (
+                extra_head
+                + """
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+"""
+            )
+            extra_css = (
+                extra_css
+                + """
+  .trend-hint{
+    margin:8px 0 10px;
+    color:var(--muted);
+    font-size:12px;
+  }
+  .trend-controls{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    margin:10px 0 12px;
+    font-size:12px;
+    color:var(--muted);
+  }
+  .trend-controls .ctl{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    padding:6px 10px;
+    border-radius:10px;
+    border:1px solid var(--border);
+    background:rgba(255,255,255,.7);
+  }
+  @media (prefers-color-scheme: dark){
+    .trend-controls .ctl{background:rgba(2,6,23,.4);}
+  }
+  .trend-controls input,
+  .trend-controls select{
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:4px 8px;
+    font:inherit;
+    color:var(--text);
+    background:transparent;
+  }
+  .trend-chart-main,
+  .trend-chart-sub{
+    width:100%;
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    background:var(--card);
+  }
+  .trend-chart-main{height:420px;}
+  .trend-chart-sub{height:260px;margin-top:12px;}
+  .trend-summary{
+    margin-top:10px;
+    padding:10px 12px;
+    border-radius:12px;
+    border:1px dashed var(--border);
+    color:var(--muted);
+    font-size:12px;
+    line-height:1.65;
+  }
+  .trend-summary .label{
+    font-weight:700;
+    color:var(--text);
+    margin-bottom:6px;
+  }
+"""
+            )
+            extra_js = (
+                extra_js
+                + r"""
+function _trendDecode(b64){
+  try{
+    const bytes=Uint8Array.from(atob(b64), c=>c.charCodeAt(0));
+    return new TextDecoder('utf-8').decode(bytes);
+  }catch(e){return '';}
+}
+function _trendEsc(s){
+  return String(s||'')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
+function _trendPhaseColor(phase){
+  const map={
+    'pre_launch':'rgba(161,161,170,.18)',
+    'launch':'rgba(34,197,94,.16)',
+    'growth':'rgba(22,163,74,.16)',
+    'stable':'rgba(59,130,246,.15)',
+    'mature':'rgba(99,102,241,.14)',
+    'decline':'rgba(249,115,22,.17)',
+    'inactive':'rgba(239,68,68,.14)',
+    'unknown':'rgba(148,163,184,.14)'
+  };
+  return map[String(phase||'').trim()] || map.unknown;
+}
+function _initTrendExplorer(){
+  const hostMain=_qs('#trendChartMain');
+  const hostSub=_qs('#trendChartSub');
+  const summary=_qs('#trendSummary');
+  const controls=_qs('#trendControls');
+  if(!hostMain || !hostSub || !summary || !controls){ return; }
+  if(!(window.echarts && window.echarts.init)){
+    summary.innerHTML='<div class="label">提示</div><div>ECharts 加载失败，请检查网络或稍后重试。</div>';
+    return;
+  }
+  const dataB64=hostMain.getAttribute('data-trend') || '';
+  if(!dataB64){
+    summary.innerHTML='<div class="label">提示</div><div>暂无趋势数据。</div>';
+    return;
+  }
+  let payload=null;
+  try{ payload=JSON.parse(_trendDecode(dataB64) || '{}'); }catch(e){ payload=null; }
+  const allItems=(payload && Array.isArray(payload.asins)) ? payload.asins : [];
+  if(!allItems.length){
+    summary.innerHTML='<div class="label">提示</div><div>暂无趋势数据。</div>';
+    return;
+  }
+
+  controls.innerHTML = [
+    '<div class="ctl"><label>类目</label><select id="trendCategory"></select></div>',
+    '<div class="ctl"><label>ASIN</label><select id="trendAsin"></select></div>',
+    '<div class="ctl"><label>搜索</label><input id="trendQuery" placeholder="产品名/ASIN" /></div>',
+    '<div class="ctl"><button class="btn" id="trendPrev" type="button">上一条</button></div>',
+    '<div class="ctl"><button class="btn" id="trendNext" type="button">下一条</button></div>',
+    '<div class="ctl"><button class="btn" id="trendReset" type="button">重置</button></div>'
+  ].join('');
+
+  const selCategory=document.getElementById('trendCategory');
+  const selAsin=document.getElementById('trendAsin');
+  const query=document.getElementById('trendQuery');
+  const btnPrev=document.getElementById('trendPrev');
+  const btnNext=document.getElementById('trendNext');
+  const btnReset=document.getElementById('trendReset');
+
+  function _itemName(it){
+    const n=String((it && it.name) || '').trim();
+    const a=String((it && it.asin) || '').trim();
+    return n || a || '-';
+  }
+  function _itemCategory(it){
+    return String((it && it.category) || '（未分类）').trim() || '（未分类）';
+  }
+  function _allCategories(){
+    const set=new Set();
+    allItems.forEach(it=>set.add(_itemCategory(it)));
+    return Array.from(set.values()).sort((a,b)=>a.localeCompare(b,'zh'));
+  }
+  function _toPairs(dates, values){
+    const out=[];
+    const ds=Array.isArray(dates)?dates:[];
+    const vs=Array.isArray(values)?values:[];
+    const n=Math.min(ds.length, vs.length);
+    for(let i=0;i<n;i++){
+      out.push([ds[i], vs[i]===undefined ? null : vs[i]]);
+    }
+    return out;
+  }
+  function _maxNum(arr){
+    let m=0;
+    (Array.isArray(arr)?arr:[]).forEach(v=>{
+      const n=Number(v);
+      if(Number.isFinite(n) && n>m){m=n;}
+    });
+    return m;
+  }
+  function _fmtNum(v, nd){
+    const n=Number(v);
+    if(!Number.isFinite(n)){ return '-'; }
+    return n.toFixed(Number(nd||0));
+  }
+
+  selCategory.innerHTML = ['<option value="">全部类目</option>']
+    .concat(_allCategories().map(cat=>'<option value="'+_trendEsc(cat)+'">'+_trendEsc(cat)+'</option>'))
+    .join('');
+
+  function _filteredItems(){
+    const cat=String(selCategory ? (selCategory.value||'') : '').trim();
+    const q=String(query ? (query.value||'') : '').trim().toLowerCase();
+    return allItems.filter(it=>{
+      if(cat && _itemCategory(it)!==cat){ return false; }
+      if(!q){ return true; }
+      const hay=(_itemName(it)+' '+String((it && it.asin)||'')).toLowerCase();
+      return hay.indexOf(q)>=0;
+    });
+  }
+
+  function _refreshAsinOptions(){
+    const list=_filteredItems();
+    const cur=String(selAsin ? (selAsin.value||'') : '').trim();
+    if(!selAsin){ return list; }
+    selAsin.innerHTML = list.map(it=>{
+      const asin=String((it && it.asin) || '').trim() || '-';
+      return '<option value="'+_trendEsc(asin)+'">'+_trendEsc(_itemName(it))+' ('+_trendEsc(asin)+') · '+_trendEsc(_itemCategory(it))+'</option>';
+    }).join('');
+    if(!list.length){
+      selAsin.innerHTML='<option value="">（无匹配）</option>';
+      return list;
+    }
+    const hasCur=list.some(it=>String((it && it.asin)||'').trim()===cur);
+    selAsin.value = hasCur ? cur : String((list[0] && list[0].asin) || '').trim();
+    return list;
+  }
+
+  function _getCurrentItem(list){
+    const items=Array.isArray(list) ? list : _filteredItems();
+    const asin=String(selAsin ? (selAsin.value||'') : '').trim();
+    if(!asin){ return null; }
+    for(let i=0;i<items.length;i++){
+      const it=items[i] || {};
+      if(String(it.asin||'').trim()===asin){ return it; }
+    }
+    return null;
+  }
+
+  const mainChart=echarts.init(hostMain);
+  const subChart=echarts.init(hostSub);
+  let syncing=false;
+  mainChart.on('datazoom', ()=>{
+    if(syncing){ return; }
+    syncing=true;
+    try{
+      const dz=((mainChart.getOption() || {}).dataZoom || [])[0] || {};
+      subChart.dispatchAction({type:'dataZoom', dataZoomIndex:0, start:dz.start, end:dz.end});
+      subChart.dispatchAction({type:'dataZoom', dataZoomIndex:1, start:dz.start, end:dz.end});
+    }catch(e){}
+    syncing=false;
+  });
+
+  function _render(){
+    const list=_refreshAsinOptions();
+    const item=_getCurrentItem(list);
+    if(!item){
+      mainChart.clear();
+      subChart.clear();
+      summary.innerHTML='<div class="label">提示</div><div>当前筛选条件下没有可展示的 ASIN。</div>';
+      return;
+    }
+
+    const dates=Array.isArray(item.dates) ? item.dates : [];
+    const s=item.series || {};
+    const salesPairs=_toPairs(dates, s.sales);
+    const adSpendPairs=_toPairs(dates, s.ad_spend);
+    const acosPairs=_toPairs(dates, s.acos);
+    const tacosPairs=_toPairs(dates, s.tacos);
+    const ordersPairs=_toPairs(dates, s.orders);
+    const cvrPairs=_toPairs(dates, s.cvr);
+    const invCoverPairs=_toPairs(dates, s.inventory_cover);
+    const ratingCountPairs=_toPairs(dates, s.rating_count);
+    const ratingPairs=_toPairs(dates, s.rating);
+
+    const maxMain=Math.max(1, _maxNum(s.sales), _maxNum(s.ad_spend));
+    const eventSeries=(Array.isArray(item.events) ? item.events : []).map(ev=>{
+      const d=String((ev && ev.date) || '').trim();
+      return {
+        value:[d, maxMain*1.04],
+        priority:String((ev && ev.priority) || '').trim(),
+        label:String((ev && ev.label) || '').trim()
+      };
+    }).filter(x=>x.value[0]);
+
+    const phaseAreas=(Array.isArray(item.phase_ranges) ? item.phase_ranges : []).map(seg=>{
+      const st=String((seg && seg.start) || '').trim();
+      const ed=String((seg && seg.end) || '').trim();
+      const ph=String((seg && seg.phase) || 'unknown').trim();
+      if(!st || !ed){ return null; }
+      return [
+        {xAxis:st, itemStyle:{color:_trendPhaseColor(ph), borderWidth:0}},
+        {xAxis:ed}
+      ];
+    }).filter(Boolean);
+
+    const eventByDate={};
+    eventSeries.forEach(ev=>{
+      const d=String(ev.value[0]||'');
+      if(!eventByDate[d]){ eventByDate[d]=[]; }
+      eventByDate[d].push((ev.priority ? ('['+ev.priority+'] ') : '') + ev.label);
+    });
+
+    mainChart.setOption({
+      animation:false,
+      grid:{left:58,right:58,top:34,bottom:46},
+      legend:{top:4,data:['Sales','AdSpend','ACOS','TACOS','动作事件']},
+      tooltip:{
+        trigger:'axis',
+        axisPointer:{type:'cross'},
+        formatter:function(params){
+          const ps=Array.isArray(params)?params:[];
+          if(!ps.length){ return ''; }
+          const d=String((ps[0].axisValueLabel || ps[0].axisValue || '')).trim();
+          const lines=['<div style="font-weight:700;margin-bottom:6px;">'+_trendEsc(d)+'</div>'];
+          ps.forEach(function(p){
+            if(!p || !p.seriesName){ return; }
+            if(p.seriesName==='动作事件'){ return; }
+            const val=Array.isArray(p.value)?p.value[1]:p.value;
+            lines.push('<div>'+_trendEsc(p.marker || '')+_trendEsc(p.seriesName)+': '+_trendEsc(_fmtNum(val,2))+'</div>');
+          });
+          const evs=eventByDate[d] || [];
+          if(evs.length){
+            lines.push('<div style="margin-top:6px;color:#f59e0b;">事件：'+_trendEsc(evs.slice(0,3).join('；'))+'</div>');
+          }
+          return lines.join('');
+        }
+      },
+      toolbox:{feature:{saveAsImage:{title:'导出'}}},
+      xAxis:{type:'time',axisLabel:{hideOverlap:true}},
+      yAxis:[
+        {type:'value',name:'USD',splitLine:{lineStyle:{opacity:.2}}},
+        {type:'value',name:'%',splitLine:{show:false}}
+      ],
+      dataZoom:[
+        {type:'inside',xAxisIndex:0,start:0,end:100},
+        {type:'slider',xAxisIndex:0,start:0,end:100,bottom:6}
+      ],
+      series:[
+        {name:'Sales',type:'line',smooth:true,symbol:'none',lineStyle:{width:2},data:salesPairs,color:'#2563eb',
+          markArea:{silent:true,data:phaseAreas}
+        },
+        {name:'AdSpend',type:'line',smooth:true,symbol:'none',lineStyle:{width:2},data:adSpendPairs,color:'#f97316'},
+        {name:'ACOS',type:'line',smooth:true,symbol:'none',lineStyle:{width:1.8},yAxisIndex:1,data:acosPairs,color:'#ef4444'},
+        {name:'TACOS',type:'line',smooth:true,symbol:'none',lineStyle:{width:1.8},yAxisIndex:1,data:tacosPairs,color:'#14b8a6'},
+        {name:'动作事件',type:'scatter',yAxisIndex:0,data:eventSeries,symbolSize:8,color:'#f59e0b'}
+      ]
+    }, true);
+
+    subChart.setOption({
+      animation:false,
+      grid:{left:58,right:58,top:30,bottom:38},
+      legend:{top:2,data:['Orders','CVR','库存覆盖','评分数','评分']},
+      tooltip:{trigger:'axis',axisPointer:{type:'cross'}},
+      xAxis:{type:'time',axisLabel:{hideOverlap:true}},
+      yAxis:[
+        {type:'value',name:'数量/天数',splitLine:{lineStyle:{opacity:.2}}},
+        {type:'value',name:'%'}
+      ],
+      dataZoom:[
+        {type:'inside',xAxisIndex:0,start:0,end:100},
+        {type:'inside',xAxisIndex:0,start:0,end:100}
+      ],
+      series:[
+        {name:'Orders',type:'line',smooth:true,symbol:'none',lineStyle:{width:2},data:ordersPairs,color:'#0ea5e9'},
+        {name:'CVR',type:'line',smooth:true,symbol:'none',lineStyle:{width:1.8},yAxisIndex:1,data:cvrPairs,color:'#22c55e'},
+        {name:'库存覆盖',type:'line',smooth:true,symbol:'none',lineStyle:{width:1.6},data:invCoverPairs,color:'#8b5cf6'},
+        {name:'评分数',type:'line',smooth:true,symbol:'none',lineStyle:{width:1.6},data:ratingCountPairs,color:'#1d4ed8'},
+        {name:'评分',type:'line',smooth:true,symbol:'none',lineStyle:{width:1.3},data:ratingPairs,color:'#0891b2'}
+      ]
+    }, true);
+
+    const latestIdx=Math.max(0, dates.length-1);
+    const latestDate=dates[latestIdx] || '-';
+    const latestSales=(s.sales||[])[latestIdx];
+    const latestSpend=(s.ad_spend||[])[latestIdx];
+    const latestAcos=(s.acos||[])[latestIdx];
+    const latestTacos=(s.tacos||[])[latestIdx];
+    const latestOrders=(s.orders||[])[latestIdx];
+    const latestCvr=(s.cvr||[])[latestIdx];
+    summary.innerHTML = [
+      '<div class="label">'+_trendEsc(_itemName(item))+' ('+_trendEsc(String(item.asin||''))+')</div>',
+      '<div>类目：'+_trendEsc(_itemCategory(item))+' ｜ 观察区间：'+_trendEsc(String(item.date_start||''))+' ~ '+_trendEsc(String(item.date_end||''))+' ｜ 记录天数：'+_trendEsc(String(dates.length))+'</div>',
+      '<div>最新点('+_trendEsc(latestDate)+')：Sales='+_trendEsc(_fmtNum(latestSales,2))+'，AdSpend='+_trendEsc(_fmtNum(latestSpend,2))+'，ACOS='+_trendEsc(_fmtNum(latestAcos,2))+'%，TACOS='+_trendEsc(_fmtNum(latestTacos,2))+'%，Orders='+_trendEsc(_fmtNum(latestOrders,2))+'，CVR='+_trendEsc(_fmtNum(latestCvr,2))+'%</div>',
+      '<div>阶段区间：'+_trendEsc(String((item.phase_ranges||[]).length))+' 段 ｜ 动作事件：'+_trendEsc(String((item.events||[]).length))+' 条</div>',
+      '<div>提示：本图是趋势探索视图，不改变任何业务口径；事件点用于定位操作时机，不替代 Action Board 明细。</div>'
+    ].join('');
+  }
+
+  _refreshAsinOptions();
+  _render();
+  if(selCategory){ selCategory.addEventListener('change', _render); }
+  if(selAsin){ selAsin.addEventListener('change', _render); }
+  if(query){ query.addEventListener('input', _render); }
+  if(btnPrev){
+    btnPrev.addEventListener('click', ()=>{
+      if(!selAsin || !selAsin.options || selAsin.options.length===0){ return; }
+      selAsin.selectedIndex=Math.max(0, selAsin.selectedIndex-1);
+      _render();
+    });
+  }
+  if(btnNext){
+    btnNext.addEventListener('click', ()=>{
+      if(!selAsin || !selAsin.options || selAsin.options.length===0){ return; }
+      selAsin.selectedIndex=Math.min(selAsin.options.length-1, selAsin.selectedIndex+1);
+      _render();
+    });
+  }
+  if(btnReset){
+    btnReset.addEventListener('click', ()=>{
+      if(selCategory){ selCategory.value=''; }
+      if(query){ query.value=''; }
+      _refreshAsinOptions();
+      _render();
+    });
+  }
+  window.addEventListener('resize', ()=>{
+    try{ mainChart.resize(); }catch(e){}
+    try{ subChart.resize(); }catch(e){}
+  });
+}
+document.addEventListener('DOMContentLoaded', ()=>{
+  try{ _initTrendExplorer(); }catch(e){}
+});
+"""
+            )
         if extra_css:
             css = css + "\n" + extra_css
 
@@ -12658,6 +13065,7 @@ def write_dashboard_md(
         quick_links.append("[广告位预算平移](../dashboard/placement_rebalance_plan.csv)")
         quick_links.append("[任务汇总](../dashboard/task_summary.csv)")
         quick_links.append("[环比摘要](../dashboard/compare_summary.csv)")
+        quick_links.append("[趋势图分析](./trend_explorer.md)")
         quick_links.append("[生命周期时间轴表](../dashboard/lifecycle_timeline.csv)")
         quick_links.append("[Campaign筛选表](../dashboard/campaign_action_view.csv)")
         if isinstance(action_review, pd.DataFrame) and (not action_review.empty):
@@ -17071,6 +17479,369 @@ def build_lifecycle_timeline_view(lifecycle_timeline: pd.DataFrame) -> pd.DataFr
     if cols:
         return df[cols].copy()
     return df.copy()
+
+
+def _build_trend_explorer_payload(
+    product_analysis_shop: Optional[pd.DataFrame],
+    lifecycle_segments: Optional[pd.DataFrame],
+    action_board: Optional[pd.DataFrame],
+    asin_cockpit: Optional[pd.DataFrame],
+    max_asins: int = 60,
+) -> Dict[str, object]:
+    """
+    构建趋势图探索页 payload（按 ASIN 的日级时序）。
+
+    Args:
+        product_analysis_shop: 店铺维度产品分析明细（按日）。
+        lifecycle_segments: 生命周期分段数据（含 phase/date_start/date_end）。
+        action_board: 动作建议表（用于事件标注）。
+        asin_cockpit: ASIN 总览（用于 focus_score 排序）。
+        max_asins: 最多保留 ASIN 数量，避免页面过重。
+
+    Returns:
+        Dict[str, object]: 可直接序列化到前端的 payload。
+    """
+    if product_analysis_shop is None or (not isinstance(product_analysis_shop, pd.DataFrame)) or product_analysis_shop.empty:
+        return {}
+
+    def _pick_col(df: pd.DataFrame, candidates: List[str]) -> str:
+        for c in candidates:
+            if c in df.columns:
+                return c
+        return ""
+
+    pa = product_analysis_shop.copy()
+    date_col = _pick_col(pa, ["日期", "date", "Date"])
+    asin_col = _pick_col(pa, ["ASIN", "asin"])
+    if not date_col or not asin_col:
+        return {}
+
+    name_col = _pick_col(pa, ["品名", "product_name", "标题", "title"])
+    category_col = _pick_col(pa, ["分类", "product_category", "category"])
+
+    pa["_date"] = pd.to_datetime(pa[date_col], errors="coerce").dt.date
+    pa["_asin"] = pa[asin_col].astype(str).fillna("").str.upper().str.strip()
+    pa = pa[(pa["_asin"] != "") & pa["_date"].notna()].copy()
+    if pa.empty:
+        return {}
+
+    pa["_name"] = pa[name_col].astype(str).fillna("").str.strip() if name_col else ""
+    if "_name" in pa.columns:
+        pa["_name"] = pa["_name"].map(lambda x: "" if str(x).strip().lower() == "nan" else str(x).strip())
+    pa["_category"] = pa[category_col].map(_norm_product_category) if category_col else "（未分类）"
+    pa["_category"] = pa["_category"].fillna("（未分类）").astype(str).str.strip().replace({"": "（未分类）"})
+
+    metric_map = {
+        "sales": ["销售额", "sales"],
+        "ad_spend": ["广告花费", "ad_spend"],
+        "ad_sales": ["广告销售额", "ad_sales"],
+        "orders": ["订单量", "orders"],
+        "sessions": ["Sessions", "sessions"],
+        "inventory": ["FBA可售", "inventory"],
+        "rating_count": ["评分数", "rating_count"],
+        "rating": ["星级评分", "rating"],
+    }
+    metric_cols: Dict[str, str] = {}
+    for k, cands in metric_map.items():
+        metric_cols[k] = _pick_col(pa, cands)
+        if metric_cols[k]:
+            pa[f"_m_{k}"] = pd.to_numeric(pa[metric_cols[k]], errors="coerce")
+        else:
+            pa[f"_m_{k}"] = pd.NA
+
+    pa = pa.sort_values(["_asin", "_date"]).copy()
+    agg_map: Dict[str, str] = {
+        "_name": "last",
+        "_category": "last",
+        "_m_sales": "sum",
+        "_m_ad_spend": "sum",
+        "_m_ad_sales": "sum",
+        "_m_orders": "sum",
+        "_m_sessions": "sum",
+        "_m_inventory": "last",
+        "_m_rating_count": "max",
+        "_m_rating": "last",
+    }
+    daily = pa.groupby(["_asin", "_date"], dropna=False, as_index=False).agg(agg_map)
+    if daily.empty:
+        return {}
+
+    # 1) ASIN 排序：优先 focus_score，再按销售额兜底。
+    asin_rank: List[str] = []
+    try:
+        ac = asin_cockpit.copy() if isinstance(asin_cockpit, pd.DataFrame) else pd.DataFrame()
+        if ac is not None and not ac.empty and "asin" in ac.columns:
+            ac["asin"] = ac["asin"].astype(str).fillna("").str.upper().str.strip()
+            ac["focus_score"] = pd.to_numeric(ac.get("focus_score", 0.0), errors="coerce").fillna(0.0)
+            ac = ac.sort_values(["focus_score", "asin"], ascending=[False, True]).drop_duplicates("asin")
+            asin_rank = [str(x) for x in ac["asin"].tolist() if str(x)]
+    except Exception:
+        asin_rank = []
+    if not asin_rank:
+        try:
+            s = (
+                daily.groupby("_asin", dropna=False, as_index=False)
+                .agg(sales_sum=("_m_sales", "sum"))
+                .sort_values(["sales_sum", "_asin"], ascending=[False, True])
+            )
+            asin_rank = [str(x) for x in s["_asin"].tolist() if str(x)]
+        except Exception:
+            asin_rank = sorted([str(x) for x in daily["_asin"].unique().tolist() if str(x)])
+    if int(max_asins or 0) > 0:
+        asin_rank = asin_rank[: int(max_asins)]
+
+    cockpit_meta_map: Dict[str, Dict[str, str]] = {}
+    try:
+        ac2 = asin_cockpit.copy() if isinstance(asin_cockpit, pd.DataFrame) else pd.DataFrame()
+        if ac2 is not None and not ac2.empty and "asin" in ac2.columns:
+            ac2["asin"] = ac2["asin"].astype(str).fillna("").str.upper().str.strip()
+            for _, r in ac2.iterrows():
+                a = str(r.get("asin", "") or "").strip().upper()
+                if not a or (a in cockpit_meta_map):
+                    continue
+                n = str(r.get("product_name", "") or "").strip()
+                c = str(r.get("product_category", "") or "").strip()
+                if n.lower() == "nan":
+                    n = ""
+                if c.lower() == "nan":
+                    c = ""
+                cockpit_meta_map[a] = {"name": n, "category": c}
+    except Exception:
+        cockpit_meta_map = {}
+
+    # 2) 生命周期阶段区间（用于背景标注）。
+    phase_map: Dict[str, List[Dict[str, str]]] = {}
+    try:
+        seg = lifecycle_segments.copy() if isinstance(lifecycle_segments, pd.DataFrame) else pd.DataFrame()
+        if seg is not None and not seg.empty and "asin" in seg.columns and "phase" in seg.columns:
+            seg["asin"] = seg["asin"].astype(str).fillna("").str.upper().str.strip()
+            seg["_phase"] = seg["phase"].map(_norm_phase)
+            seg["_start"] = pd.to_datetime(seg.get("date_start", ""), errors="coerce").dt.date
+            seg["_end"] = pd.to_datetime(seg.get("date_end", ""), errors="coerce").dt.date
+            seg = seg[seg["asin"].isin(set(asin_rank))].copy()
+            seg = seg[seg["_start"].notna() & seg["_end"].notna() & (seg["_end"] >= seg["_start"])].copy()
+            seg = seg.sort_values(["asin", "_start", "_end"])
+            for a, g in seg.groupby("asin", dropna=False):
+                arr: List[Dict[str, str]] = []
+                for _, r in g.iterrows():
+                    arr.append(
+                        {
+                            "phase": str(r.get("_phase", "unknown") or "unknown"),
+                            "start": r["_start"].isoformat(),
+                            "end": r["_end"].isoformat(),
+                        }
+                    )
+                phase_map[str(a)] = arr
+    except Exception:
+        phase_map = {}
+
+    # 3) 动作事件（用于散点标注）。
+    event_map: Dict[str, List[Dict[str, str]]] = {}
+    try:
+        ab = action_board.copy() if isinstance(action_board, pd.DataFrame) else pd.DataFrame()
+        asin_hint_col = _pick_col(ab, ["asin_hint", "asin", "ASIN"])
+        ev_date_col = _pick_col(ab, ["date_end", "date_start", "date", "Date"])
+        if (
+            ab is not None
+            and not ab.empty
+            and asin_hint_col
+            and ev_date_col
+        ):
+            ab["asin_hint"] = ab[asin_hint_col].astype(str).fillna("").str.upper().str.strip()
+            ab["_date"] = pd.to_datetime(ab[ev_date_col], errors="coerce").dt.date
+            ab = ab[ab["asin_hint"].isin(set(asin_rank))].copy()
+            ab = ab[ab["_date"].notna()].copy()
+            ab = ab.sort_values(["asin_hint", "_date"], ascending=[True, True])
+            for a, g in ab.groupby("asin_hint", dropna=False):
+                arr: List[Dict[str, str]] = []
+                for _, r in g.head(80).iterrows():
+                    action_type = str(r.get("action_type", "") or "").strip()
+                    object_name = str(r.get("object_name", "") or "").strip()
+                    reason = str(r.get("reason", "") or "").strip()
+                    pr = str(r.get("priority", "") or "").strip().upper()
+                    label = " ".join([x for x in [action_type, object_name] if x]).strip() or "动作事件"
+                    if reason:
+                        label = f"{label} | {reason}"
+                    arr.append(
+                        {
+                            "date": r["_date"].isoformat(),
+                            "priority": pr if pr in {"P0", "P1", "P2"} else "",
+                            "label": label[:180],
+                        }
+                    )
+                event_map[str(a)] = arr
+    except Exception:
+        event_map = {}
+
+    def _round_list(values: List[object], nd: int = 2) -> List[Optional[float]]:
+        out: List[Optional[float]] = []
+        for v in values:
+            try:
+                if pd.isna(v):
+                    out.append(None)
+                else:
+                    out.append(round(float(v), nd))
+            except Exception:
+                out.append(None)
+        return out
+
+    def _ratio_series(num: List[object], den: List[object], mul: float = 100.0, nd: int = 2) -> List[Optional[float]]:
+        out: List[Optional[float]] = []
+        for a, b in zip(num, den):
+            try:
+                aa = float(a) if (a is not None and (not pd.isna(a))) else 0.0
+                bb = float(b) if (b is not None and (not pd.isna(b))) else 0.0
+                if bb <= 0:
+                    out.append(None)
+                else:
+                    out.append(round((aa / bb) * float(mul), nd))
+            except Exception:
+                out.append(None)
+        return out
+
+    asin_payloads: List[Dict[str, object]] = []
+    for asin in asin_rank:
+        sub = daily[daily["_asin"] == asin].copy()
+        if sub.empty:
+            continue
+        sub = sub.sort_values("_date")
+        dates = [d.isoformat() for d in sub["_date"].tolist()]
+        if not dates:
+            continue
+
+        name = str(sub["_name"].dropna().astype(str).iloc[-1] if "_name" in sub.columns else "").strip()
+        if (not name) or (name.lower() == "nan") or (name.upper() == asin):
+            name = str((cockpit_meta_map.get(asin, {}) or {}).get("name", "") or "").strip()
+        if not name:
+            name = asin
+        category = str(sub["_category"].dropna().astype(str).iloc[-1] if "_category" in sub.columns else "").strip()
+        if (not category) or (category.lower() == "nan") or (category == "（未分类）"):
+            category = str((cockpit_meta_map.get(asin, {}) or {}).get("category", "") or "").strip()
+        category = category or "（未分类）"
+
+        sales = _round_list(sub["_m_sales"].tolist(), nd=2)
+        ad_spend = _round_list(sub["_m_ad_spend"].tolist(), nd=2)
+        ad_sales = _round_list(sub["_m_ad_sales"].tolist(), nd=2)
+        orders = _round_list(sub["_m_orders"].tolist(), nd=2)
+        sessions = _round_list(sub["_m_sessions"].tolist(), nd=2)
+        inventory = _round_list(sub["_m_inventory"].tolist(), nd=2)
+        rating_count = _round_list(sub["_m_rating_count"].tolist(), nd=0)
+        rating = _round_list(sub["_m_rating"].tolist(), nd=2)
+        acos = _ratio_series(ad_spend, ad_sales, mul=100.0, nd=2)
+        tacos = _ratio_series(ad_spend, sales, mul=100.0, nd=2)
+        cvr = _ratio_series(orders, sessions, mul=100.0, nd=2)
+        inv_cover = _ratio_series(inventory, orders, mul=1.0, nd=2)
+
+        asin_payloads.append(
+            {
+                "asin": asin,
+                "name": name,
+                "category": category,
+                "date_start": dates[0],
+                "date_end": dates[-1],
+                "dates": dates,
+                "series": {
+                    "sales": sales,
+                    "ad_spend": ad_spend,
+                    "acos": acos,
+                    "tacos": tacos,
+                    "orders": orders,
+                    "cvr": cvr,
+                    "inventory_cover": inv_cover,
+                    "rating_count": rating_count,
+                    "rating": rating,
+                },
+                "phase_ranges": phase_map.get(asin, []),
+                "events": event_map.get(asin, []),
+            }
+        )
+
+    if not asin_payloads:
+        return {}
+
+    payload = {
+        "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "asin_count": len(asin_payloads),
+        "metrics": {
+            "sales": "USD",
+            "ad_spend": "USD",
+            "acos": "%",
+            "tacos": "%",
+            "orders": "count",
+            "cvr": "%",
+            "inventory_cover": "days",
+            "rating_count": "count",
+            "rating": "score",
+        },
+        "asins": asin_payloads,
+    }
+    return payload
+
+
+def write_trend_explorer_md(
+    out_path: Path,
+    shop: str,
+    stage: str,
+    date_start: str,
+    date_end: str,
+    product_analysis_shop: Optional[pd.DataFrame],
+    lifecycle_segments: Optional[pd.DataFrame],
+    action_board: Optional[pd.DataFrame],
+    asin_cockpit: Optional[pd.DataFrame] = None,
+) -> None:
+    """
+    生成趋势图探索页（trend_explorer.md）。
+
+    Args:
+        out_path: 输出 Markdown 路径。
+        shop: 店铺。
+        stage: 阶段。
+        date_start: 开始日期。
+        date_end: 结束日期。
+        product_analysis_shop: 产品分析按日明细。
+        lifecycle_segments: 生命周期分段。
+        action_board: 动作建议（事件标注）。
+        asin_cockpit: ASIN 总览（用于排序）。
+    """
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = _build_trend_explorer_payload(
+            product_analysis_shop=product_analysis_shop,
+            lifecycle_segments=lifecycle_segments,
+            action_board=action_board,
+            asin_cockpit=asin_cockpit,
+            max_asins=80,
+        )
+
+        lines: List[str] = []
+        lines.append(f"# {shop} 趋势图分析")
+        lines.append("")
+        lines.append(f"- 阶段: `{stage}`")
+        lines.append(f"- 时间范围: `{date_start} ~ {date_end}`")
+        lines.append("- 说明：上图看 `Sales/AdSpend/ACOS/TACOS`，下图看 `订单量/CVR/库存覆盖/评分数`，并叠加生命周期阶段和动作事件。")
+        lines.append("- 视角建议：跨产品横向对比看甘特图；单 ASIN 纵向演进看本页趋势图。")
+        lines.append("")
+        lines.append("快速入口：[返回 Dashboard](./dashboard.md) | [生命周期时间轴](./lifecycle_overview.md) | [Action Board](../dashboard/action_board.csv)")
+        lines.append("")
+        lines.append("## 趋势探索（交互）")
+        lines.append("")
+        if not payload:
+            lines.append("> 暂无可用的趋势数据（请确认产品分析按日数据是否完整）。")
+        else:
+            payload_b64 = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
+            lines.append('<div class="trend-hint">可按类目/ASIN筛选，并联动查看阶段切换与动作事件点。</div>')
+            lines.append('<div id="trendControls" class="trend-controls"></div>')
+            lines.append(f'<div id="trendChartMain" class="trend-chart-main" data-trend="{payload_b64}"></div>')
+            lines.append('<div id="trendChartSub" class="trend-chart-sub"></div>')
+            lines.append('<div id="trendSummary" class="trend-summary"></div>')
+        lines.append("")
+        lines.append("[回到顶部](#top) | [返回 Dashboard](./dashboard.md)")
+        lines.append("")
+        out_path.write_text("\n".join(lines), encoding="utf-8")
+    except Exception:
+        return
+
+
 def write_lifecycle_overview_md(
     out_path: Path,
     shop: str,
@@ -19872,6 +20643,22 @@ def write_dashboard_outputs(
                     )
                 except Exception:
                     pass
+                # trend explorer：按单 ASIN 看时间趋势（多指标+阶段背景+动作事件）
+                try:
+                    trend_path = shop_dir / "reports" / "trend_explorer.md"
+                    write_trend_explorer_md(
+                        out_path=trend_path,
+                        shop=shop,
+                        stage=stage,
+                        date_start=date_start,
+                        date_end=date_end,
+                        product_analysis_shop=product_analysis_shop if isinstance(product_analysis_shop, pd.DataFrame) else None,
+                        lifecycle_segments=lifecycle_segments if isinstance(lifecycle_segments, pd.DataFrame) else None,
+                        action_board=action_board_all if isinstance(action_board_all, pd.DataFrame) else action_board,
+                        asin_cockpit=asin_cockpit if isinstance(asin_cockpit, pd.DataFrame) else None,
+                    )
+                except Exception:
+                    pass
                 # keyword_topics drilldown：用于从 dashboard 的关键词主题区块下钻
                 try:
                     kw_path = shop_dir / "reports" / "keyword_topics.md"
@@ -19930,6 +20717,7 @@ def write_dashboard_outputs(
                         "category_drilldown.md",
                         "phase_drilldown.md",
                         "lifecycle_overview.md",
+                        "trend_explorer.md",
                         "keyword_topics.md",
                     ):
                         md_p = reports_dir / name
