@@ -2241,6 +2241,8 @@ function _initPhaseLineChart(){
 
   if(controls){
     controls.innerHTML = [
+      '<div class="ctl"><label>类目</label><select id="phaseLineCategory"></select></div>',
+      '<div class="ctl"><label>阶段</label><select id="phaseLinePhase"></select></div>',
       '<div class="ctl"><label>ASIN</label><select id="phaseLineAsin"></select></div>',
       '<div class="ctl"><label>搜索</label><input id="phaseLineQuery" placeholder="产品名/ASIN" /></div>',
       '<div class="ctl"><button class="btn" id="phaseLinePrev" type="button">上一条</button></div>',
@@ -2249,27 +2251,76 @@ function _initPhaseLineChart(){
     ].join('');
   }
 
+  const selCategory = document.getElementById('phaseLineCategory');
+  const selPhase = document.getElementById('phaseLinePhase');
   const sel = document.getElementById('phaseLineAsin');
   const query = document.getElementById('phaseLineQuery');
   const btnPrev = document.getElementById('phaseLinePrev');
   const btnNext = document.getElementById('phaseLineNext');
   const btnReset = document.getElementById('phaseLineReset');
 
+  function _itemName(it){
+    return String(it.display_name || it.name || '').trim();
+  }
+  function _categoryName(it){
+    return String(it.category || '（未分类）').trim() || '（未分类）';
+  }
+  function _phaseValue(it){
+    return String(it.current_phase || it.phase || 'unknown').trim().toLowerCase() || 'unknown';
+  }
+  function _renderFacetOptions(){
+    if(selCategory){
+      const categorySet = new Set();
+      asinItems.forEach(it=>{ categorySet.add(_categoryName(it)); });
+      const categories = Array.from(categorySet.values()).sort((a,b)=>a.localeCompare(b,'zh'));
+      const current = String(selCategory.value || '').trim();
+      selCategory.innerHTML = ['<option value="">全部类目</option>'].concat(
+        categories.map(cat=>'<option value="'+_esc(cat)+'">'+_esc(cat)+'</option>')
+      ).join('');
+      selCategory.value = categories.some(cat=>cat===current) ? current : '';
+    }
+    if(selPhase){
+      const phaseSet = new Set();
+      asinItems.forEach(it=>{ phaseSet.add(_phaseValue(it)); });
+      const phaseRank = ['pre_launch','launch','growth','stable','mature','decline','inactive','unknown'];
+      const phases = Array.from(phaseSet.values()).sort((a,b)=>{
+        const ia = phaseRank.indexOf(a);
+        const ib = phaseRank.indexOf(b);
+        const va = ia >= 0 ? ia : 999;
+        const vb = ib >= 0 ? ib : 999;
+        if(va !== vb){ return va - vb; }
+        return String(a).localeCompare(String(b));
+      });
+      const current = String(selPhase.value || '').trim().toLowerCase();
+      selPhase.innerHTML = ['<option value="">全部阶段</option>'].concat(
+        phases.map(ph=>'<option value="'+_esc(ph)+'">'+_esc(_phaseLabel(ph))+'</option>')
+      ).join('');
+      selPhase.value = phases.some(ph=>ph===current) ? current : '';
+    }
+  }
+
   function _buildOptions(filterText){
     if(!sel) return;
+    const categoryFilter = selCategory ? String(selCategory.value||'').trim() : '';
+    const phaseFilter = selPhase ? String(selPhase.value||'').trim().toLowerCase() : '';
     const q = String(filterText||'').trim().toLowerCase();
     const options = asinItems.filter(it=>{
+      if(categoryFilter && _categoryName(it) !== categoryFilter){ return false; }
+      if(phaseFilter && _phaseValue(it) !== phaseFilter){ return false; }
       if(!q) return true;
-      const hay=(String(it.name||'')+' '+String(it._asin_display||'')+' '+String(it._key||'')).toLowerCase();
+      const hay=(
+        _itemName(it)+' '+String(it._asin_display||'')+' '+String(it._key||'')+' '+_categoryName(it)
+      ).toLowerCase();
       return hay.indexOf(q) >= 0;
     });
     const current=sel.value;
     sel.innerHTML = options.map(it=>{
       const key=String(it._key||'').trim();
       const asinShow=String(it._asin_display||'-').trim();
-      const nm=String(it.name||asinShow||key).trim();
-      const ph=_phaseLabel(it.current_phase||it.phase||'unknown');
-      return '<option value="'+_esc(key)+'">'+_esc(nm)+' ('+_esc(asinShow)+') · '+_esc(ph)+'</option>';
+      const nm=_itemName(it) || asinShow || key;
+      const ph=_phaseLabel(_phaseValue(it));
+      const cat=_categoryName(it);
+      return '<option value="'+_esc(key)+'">'+_esc(nm)+' ('+_esc(asinShow)+') · '+_esc(cat)+' · '+_esc(ph)+'</option>';
     }).join('');
     if(options.length===0){
       sel.innerHTML='<option value="">（无匹配）</option>';
@@ -2308,13 +2359,13 @@ function _initPhaseLineChart(){
     const item = _currentItem();
     if(!item){
       host.innerHTML='';
-      if(panel){ panel.innerHTML='<div class="label">提示</div><div>请选择 ASIN</div>'; }
+      if(panel){ panel.innerHTML='<div class="label">提示</div><div>请选择产品</div>'; }
       return;
     }
     const segs = _segmentRows(item);
     if(segs.length===0){
       host.innerHTML='<div class="hint" style="padding:12px;">该 ASIN 无可用阶段数据</div>';
-      if(panel){ panel.innerHTML='<div class="label">'+_esc(item.name||item.asin||item._key||'')+'</div><div>暂无可绘制的阶段序列。</div>'; }
+      if(panel){ panel.innerHTML='<div class="label">'+_esc(_itemName(item)||item.asin||item._key||'')+'</div><div>暂无可绘制的阶段序列。</div>'; }
       return;
     }
 
@@ -2386,19 +2437,33 @@ function _initPhaseLineChart(){
     if(panel){
       const detail = segs.map(s=>_phaseLabel(s.phase)+' '+String(s.days||0)+'d').join(' → ');
       panel.innerHTML = [
-        '<div class="label">'+_esc(item.name || item.asin || item._key || '')+'</div>',
+        '<div class="label">'+_esc(_itemName(item) || item.asin || item._key || '')+'</div>',
         '<div>ASIN：'+_esc(item.asin || item._asin_display || item._key || '-')+'</div>',
-        '<div>当前阶段：'+_esc(_phaseLabel(item.current_phase || item.phase || 'unknown'))+'</div>',
+        '<div>类目：'+_esc(_categoryName(item))+'</div>',
+        '<div>当前阶段：'+_esc(_phaseLabel(_phaseValue(item)))+'</div>',
         '<div>周期：'+_esc(_isoDay(start))+' ~ '+_esc(_isoDay(end))+'（'+String(totalDays)+'天）</div>',
         '<div>阶段序列：'+_esc(detail || '-')+'</div>',
-        '<div>说明：该图是“阶段时间维度解释图”，用于读懂阶段切换，不替代甘特图。</div>'
+        '<div>说明：该图用于单 ASIN 的阶段演进解读；跨产品横向对比请继续看上方甘特图。</div>'
       ].join('');
     }
   }
 
+  _renderFacetOptions();
   _buildOptions('');
   _render();
   if(sel){ sel.addEventListener('change', _render); }
+  if(selCategory){
+    selCategory.addEventListener('change', ()=>{
+      _buildOptions(query ? (query.value || '') : '');
+      _render();
+    });
+  }
+  if(selPhase){
+    selPhase.addEventListener('change', ()=>{
+      _buildOptions(query ? (query.value || '') : '');
+      _render();
+    });
+  }
   if(query){
     query.addEventListener('input', ()=>{
       _buildOptions(query.value || '');
@@ -2424,6 +2489,8 @@ function _initPhaseLineChart(){
   if(btnReset){
     btnReset.addEventListener('click', ()=>{
       if(query){ query.value=''; }
+      if(selCategory){ selCategory.value=''; }
+      if(selPhase){ selPhase.value=''; }
       _buildOptions('');
       _render();
     });
@@ -12716,6 +12783,24 @@ def write_dashboard_md(
                             if m:
                                 asin_val = str(m.group(1)).strip().upper()
                                 break
+                    display_name = product_display_val
+                    try:
+                        display_name = re.sub(
+                            r"\s*[\(（]\s*ASIN\s*[:：]\s*B[0-9A-Z]{9}\s*[\)）]\s*$",
+                            "",
+                            str(product_display_val or ""),
+                            flags=re.IGNORECASE,
+                        ).strip()
+                    except Exception:
+                        display_name = str(product_display_val or "").strip()
+                    if not display_name:
+                        display_name = str(product_display_val or "").strip()
+                    name_clean = str(name_val or "").strip()
+                    if name_clean and asin_val and name_clean.upper() == asin_val:
+                        name_clean = ""
+                    label = name_clean or display_name or asin_val
+                    if not label:
+                        label = f"ASIN_{idx+1}"
                     cat_val = str(r.get("product_category", "") or "（未分类）").strip() or "（未分类）"
                     phase_val = str(r.get("phase_label", "") or "unknown").strip().lower() or "unknown"
                     cycle = str(r.get("cycle_range", "") or "").strip()
@@ -12731,13 +12816,11 @@ def write_dashboard_md(
                             continue
                     if not end_dt:
                         end_dt = start_dt
-                    label = name_val or asin_val or product_display_val
-                    if not label:
-                        label = f"ASIN_{idx+1}"
                     label_short = label if len(label) <= 18 else (label[:16] + "…")
                     group_label = label
-                    if asin_val and name_val:
-                        group_label = f"{name_val} ({asin_val})"
+                    if asin_val and label:
+                        if asin_val not in str(label).upper():
+                            group_label = f"{label} ({asin_val})"
                     group_label_short = group_label if len(group_label) <= 26 else (group_label[:24] + "…")
                     prod_id = f"prod::{asin_val or idx}"
                     if cat_val not in category_groups:
@@ -12848,6 +12931,7 @@ def write_dashboard_md(
                             "category": cat_val,
                             "asin": asin_val,
                             "name": label,
+                            "display_name": label,
                             "label_short": label_short,
                             "score": score,
                             "cycle_start": start_dt.isoformat(),

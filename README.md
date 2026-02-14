@@ -156,7 +156,7 @@ python main.py --input-dir data/input --out-dir data/output --ai-prompt-only
 ### 广告执行优先级（本次增强）
 - `dashboard/action_execution_guide.csv` 新增“可执行版动作手册”：每条动作给出 `decision_basis / execution_style / operator_steps / expected_signal / rollback_guard`，方便运营按步骤执行而不是只看规则结论。
 - `reports/dashboard.md` 的“决策建议（Top5）/本周行动（Top3）”改为运营可读卡片：每条建议固定展示 `描述 / 证据 / 执行 / 观察 / 回滚 / 责任`，不再使用长串 `|` 拼接文本。
-- `reports/dashboard.md` 新增“生命周期阶段线（交互对比）”：按单个 ASIN 展示阶段随时间变化，作为甘特图的并行解释视图（不替代原时间轴）。
+- `reports/dashboard.md` 新增“生命周期阶段线（交互对比）”：按单个 ASIN 展示阶段随时间变化，作为甘特图的并行解释视图（不替代原时间轴）；支持按类目/阶段/关键词筛选后再下钻单品。
 - `reports/dashboard.md` 的 `Action Board（运营聚焦版）` 改为中文动作短语 + 执行风格（如“否定低意图词（先止损后保量）”），并清理链接噪音，便于运营一眼读懂。
 - `dashboard/action_board.csv` 与 `dashboard/action_execution_guide.csv` 增加 `strategy_context / action_intensity`，按“生命周期阶段 + 利润方向”输出不同话术和动作强度（L1谨慎/L2标准/L3强动作）。
 - `dashboard/keyword_topics_action_hints.csv` 新增 `hint_priority_score / owner / risk_level`，并补充 `execution_style / expected_signal / rollback_guard`，建议不再只有“规则判定”，而是“先做什么、观察什么、何时回滚”。
