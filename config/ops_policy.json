@@ -66,6 +66,26 @@
       "_comment_prefer_same_ad_type": "优先同广告类型迁移（SP→SP / SB→SB / SD→SD），更符合实际执行；true=先同类型匹配，再跨类型补齐。",
       "prefer_same_ad_type": true
     },
+    "placement_rebalance": {
+      "_comment": "广告位预算平移（placement_rebalance_plan.csv）：把同 Campaign 内低效 placement 的预算小步转到高效 placement。建议先小步试投，再按48h复盘结果加码。",
+      "enabled": true,
+      "_comment_min_shift_ratio": "单次最小平移比例（0~1），防止建议过小没有执行意义。",
+      "min_shift_ratio": 0.10,
+      "_comment_base_shift_ratio": "基础平移比例（0~1），在风险不高时也会执行的小步平移比例。",
+      "base_shift_ratio": 0.12,
+      "_comment_max_shift_ratio": "单次最大平移比例（0~1），防止一次性动作过猛。",
+      "max_shift_ratio": 0.35,
+      "_comment_severity_weight": "风险放大系数：from_acos 偏离目标越多，平移比例增长越快。",
+      "severity_weight": 0.10,
+      "_comment_fallback_severity": "缺少 from_acos 时的默认风险强度（0~2）。",
+      "fallback_severity": 0.60,
+      "_comment_min_shift_usd": "单次最小平移金额（美元）。",
+      "min_shift_usd": 5.0,
+      "_comment_stage_waste_floor_ratio": "阶段浪费阈值系数：最小平移金额还会与 stage_waste_spend*该系数比较，取更大值。",
+      "stage_waste_floor_ratio": 0.10,
+      "_comment_max_down_per_campaign": "每个 Campaign 最多输出多少条 from_placement 建议。",
+      "max_down_per_campaign": 12
+    },
     "unlock_tasks": {
       "_comment": "放量解锁任务（unlock_scale_tasks.csv）收敛策略：全量任务会很长，运营通常只需要 P0/P1 的 Top 列表；全量会另存为 unlock_scale_tasks_full.csv 便于追溯。",
       "_comment_top_n": "Top 表最多输出多少行（建议 20~50）。",

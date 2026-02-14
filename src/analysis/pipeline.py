@@ -463,6 +463,7 @@ def _write_start_here(
         lines.append(f"- {L('dashboard/keyword_topics_category_phase_summary.csv')}：关键词主题→类目/生命周期汇总（先按类目/阶段看主题，再下钻到 ASIN）")
         lines.append(f"- {L('dashboard/campaign_action_view.csv')}：Campaign 行动聚合（从 Action Board 归并，方便先按 campaign 排查）")
         lines.append(f"- {L('dashboard/action_board.csv')}：动作看板（去重后的运营视图；P0/P1 优先；可按类目/生命周期筛选）")
+        lines.append(f"- {L('dashboard/action_execution_guide.csv')}：动作执行手册（每条动作给出数据依据、执行步骤、观察信号与回滚护栏）")
         lines.append(f"- {L('dashboard/action_board_full.csv')}：动作看板全量（含重复，便于追溯）")
         lines.append(f"- {L('dashboard/shop_scorecard.json')}：店铺 KPI/诊断（结构化）")
         lines.append(f"- {L('ops/execution_log_template.xlsx')}：L0+ 执行回填模板（手工执行后回填，用于下次复盘）")

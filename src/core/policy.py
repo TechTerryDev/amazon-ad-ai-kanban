@@ -343,6 +343,33 @@ class BudgetTransferOpportunityPolicy:
 
 
 @dataclass(frozen=True)
+class PlacementRebalancePolicy:
+    """
+    广告位预算平移策略（placement_rebalance_plan.csv，支持配置化）。
+
+    目标：
+    - 让 placement 层 from->to 平移不再“写死阈值”，可按店铺风格校准；
+    - 保留“先小步试投、再复盘放大”的执行节奏，避免一次性过猛调整。
+    """
+
+    enabled: bool = True
+
+    # 平移比例：shift_ratio = clamp(base_shift_ratio + severity * severity_weight, min, max)
+    min_shift_ratio: float = 0.10
+    base_shift_ratio: float = 0.12
+    max_shift_ratio: float = 0.35
+    severity_weight: float = 0.10
+    fallback_severity: float = 0.60
+
+    # 最小平移金额：max(min_shift_usd, stage_waste_spend * stage_waste_floor_ratio)
+    min_shift_usd: float = 5.0
+    stage_waste_floor_ratio: float = 0.10
+
+    # 单个 Campaign 最多从多少个“低效广告位”发起平移建议
+    max_down_per_campaign: int = 12
+
+
+@dataclass(frozen=True)
 class UnlockTasksPolicy:
     """
     放量解锁任务（unlock_scale_tasks.csv）的收敛策略（可配置）。
@@ -479,6 +506,7 @@ class OpsPolicy:
     dashboard_inventory_sigmoid: InventorySigmoidPolicy = field(default_factory=InventorySigmoidPolicy)
     dashboard_profit_guard: ProfitGuardPolicy = field(default_factory=ProfitGuardPolicy)
     dashboard_budget_transfer_opportunity: BudgetTransferOpportunityPolicy = field(default_factory=BudgetTransferOpportunityPolicy)
+    dashboard_placement_rebalance: PlacementRebalancePolicy = field(default_factory=PlacementRebalancePolicy)
     dashboard_unlock_tasks: UnlockTasksPolicy = field(default_factory=UnlockTasksPolicy)
     dashboard_shop_alerts: ShopAlertsPolicy = field(default_factory=ShopAlertsPolicy)
     dashboard_keyword_topics: KeywordTopicsPolicy = field(default_factory=KeywordTopicsPolicy)
@@ -740,6 +768,7 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
             "inventory_sigmoid",
             "profit_guard",
             "budget_transfer_opportunity",
+            "placement_rebalance",
             "unlock_tasks",
             "shop_alerts",
             "keyword_topics",
@@ -968,6 +997,23 @@ def validate_ops_policy_dict(data: Dict[str, object]) -> List[str]:
     check_int(bto, "max_target_campaigns", base.dashboard_budget_transfer_opportunity.max_target_campaigns, "dashboard.budget_transfer_opportunity", min_v=1)
     check_float(bto, "min_target_opp_spend", base.dashboard_budget_transfer_opportunity.min_target_opp_spend, "dashboard.budget_transfer_opportunity", min_v=0.0)
 
+    # ===== dashboard.placement_rebalance =====
+    prb = dash.get("placement_rebalance")
+    if prb is not None and not isinstance(prb, dict):
+        warnings.append("类型不匹配：`dashboard.placement_rebalance` 期望为 object/dict；将使用默认策略。")
+        prb = {}
+    prb = prb if isinstance(prb, dict) else {}
+    warn_unknown_keys(prb, {f.name for f in fields(PlacementRebalancePolicy)}, "dashboard.placement_rebalance")
+    check_bool(prb, "enabled", base.dashboard_placement_rebalance.enabled, "dashboard.placement_rebalance")
+    check_float(prb, "min_shift_ratio", base.dashboard_placement_rebalance.min_shift_ratio, "dashboard.placement_rebalance", min_v=0.0, max_v=1.0)
+    check_float(prb, "base_shift_ratio", base.dashboard_placement_rebalance.base_shift_ratio, "dashboard.placement_rebalance", min_v=0.0, max_v=1.0)
+    check_float(prb, "max_shift_ratio", base.dashboard_placement_rebalance.max_shift_ratio, "dashboard.placement_rebalance", min_v=0.0, max_v=1.0)
+    check_float(prb, "severity_weight", base.dashboard_placement_rebalance.severity_weight, "dashboard.placement_rebalance", min_v=0.0, max_v=2.0)
+    check_float(prb, "fallback_severity", base.dashboard_placement_rebalance.fallback_severity, "dashboard.placement_rebalance", min_v=0.0, max_v=2.0)
+    check_float(prb, "min_shift_usd", base.dashboard_placement_rebalance.min_shift_usd, "dashboard.placement_rebalance", min_v=0.0)
+    check_float(prb, "stage_waste_floor_ratio", base.dashboard_placement_rebalance.stage_waste_floor_ratio, "dashboard.placement_rebalance", min_v=0.0, max_v=1.0)
+    check_int(prb, "max_down_per_campaign", base.dashboard_placement_rebalance.max_down_per_campaign, "dashboard.placement_rebalance", min_v=1, max_v=50)
+
     # ===== dashboard.unlock_tasks =====
     ut = dash.get("unlock_tasks")
     if ut is not None and not isinstance(ut, dict):
@@ -1078,6 +1124,7 @@ def ops_policy_effective_to_dict(policy: OpsPolicy) -> Dict[str, object]:
                 "inventory_sigmoid": asdict(policy.dashboard_inventory_sigmoid),
                 "profit_guard": asdict(policy.dashboard_profit_guard),
                 "budget_transfer_opportunity": asdict(policy.dashboard_budget_transfer_opportunity),
+                "placement_rebalance": asdict(policy.dashboard_placement_rebalance),
                 "unlock_tasks": asdict(policy.dashboard_unlock_tasks),
                 "shop_alerts": {
                     "phase_down_recent": asdict(policy.dashboard_shop_alerts.phase_down_recent),
@@ -1753,6 +1800,27 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
             prefer_same_ad_type=_to_bool(bto_data.get("prefer_same_ad_type"), bto_base.prefer_same_ad_type),
         )
 
+        # placement 层预算平移（可配置；没有则用默认）
+        prb_base = base.dashboard_placement_rebalance
+        prb_data = dash.get("placement_rebalance") if isinstance(dash.get("placement_rebalance"), dict) else {}
+        min_shift_ratio = max(0.0, min(1.0, _to_float(prb_data.get("min_shift_ratio"), prb_base.min_shift_ratio)))
+        base_shift_ratio = max(min_shift_ratio, min(1.0, _to_float(prb_data.get("base_shift_ratio"), prb_base.base_shift_ratio)))
+        max_shift_ratio = max(base_shift_ratio, min(1.0, _to_float(prb_data.get("max_shift_ratio"), prb_base.max_shift_ratio)))
+        placement_rebalance_policy = PlacementRebalancePolicy(
+            enabled=_to_bool(prb_data.get("enabled"), prb_base.enabled),
+            min_shift_ratio=min_shift_ratio,
+            base_shift_ratio=base_shift_ratio,
+            max_shift_ratio=max_shift_ratio,
+            severity_weight=max(0.0, _to_float(prb_data.get("severity_weight"), prb_base.severity_weight)),
+            fallback_severity=max(0.0, _to_float(prb_data.get("fallback_severity"), prb_base.fallback_severity)),
+            min_shift_usd=max(0.0, _to_float(prb_data.get("min_shift_usd"), prb_base.min_shift_usd)),
+            stage_waste_floor_ratio=max(
+                0.0,
+                min(1.0, _to_float(prb_data.get("stage_waste_floor_ratio"), prb_base.stage_waste_floor_ratio)),
+            ),
+            max_down_per_campaign=max(1, _to_int(prb_data.get("max_down_per_campaign"), prb_base.max_down_per_campaign)),
+        )
+
         # 放量解锁任务收敛策略（可配置；没有则用默认）
         ut_base = base.dashboard_unlock_tasks
         ut_data = dash.get("unlock_tasks") if isinstance(dash.get("unlock_tasks"), dict) else {}
@@ -1899,6 +1967,7 @@ def load_ops_policy_dict(data: Dict[str, object]) -> OpsPolicy:
             dashboard_inventory_sigmoid=inventory_sigmoid,
             dashboard_profit_guard=profit_guard,
             dashboard_budget_transfer_opportunity=budget_transfer_opportunity,
+            dashboard_placement_rebalance=placement_rebalance_policy,
             dashboard_unlock_tasks=unlock_tasks_policy,
             dashboard_shop_alerts=shop_alerts_policy,
             dashboard_keyword_topics=keyword_topics_policy,

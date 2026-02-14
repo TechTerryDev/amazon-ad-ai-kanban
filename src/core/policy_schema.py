@@ -179,6 +179,18 @@ class BudgetTransferOpportunitySchema(_BaseModel):
     prefer_same_ad_type: Optional[bool] = None
 
 
+class PlacementRebalanceSchema(_BaseModel):
+    enabled: Optional[bool] = None
+    min_shift_ratio: Optional[float] = None
+    base_shift_ratio: Optional[float] = None
+    max_shift_ratio: Optional[float] = None
+    severity_weight: Optional[float] = None
+    fallback_severity: Optional[float] = None
+    min_shift_usd: Optional[float] = None
+    stage_waste_floor_ratio: Optional[float] = None
+    max_down_per_campaign: Optional[int] = None
+
+
 class UnlockTasksSchema(_BaseModel):
     top_n: Optional[int] = None
     include_priorities: Optional[List[str]] = None
@@ -233,6 +245,7 @@ class DashboardSchema(_BaseModel):
     inventory_sigmoid: Optional[InventorySigmoidSchema] = None
     profit_guard: Optional[ProfitGuardSchema] = None
     budget_transfer_opportunity: Optional[BudgetTransferOpportunitySchema] = None
+    placement_rebalance: Optional[PlacementRebalanceSchema] = None
     unlock_tasks: Optional[UnlockTasksSchema] = None
     shop_alerts: Optional[ShopAlertsSchema] = None
     keyword_topics: Optional[KeywordTopicsSchema] = None

@@ -7243,6 +7243,7 @@ def build_profit_guard_watchlist(
 def build_placement_rebalance_plan(
     action_board_dedup_all: Optional[pd.DataFrame],
     stage: str,
+    policy: Optional[OpsPolicy] = None,
     max_rows: int = 200,
 ) -> pd.DataFrame:
     """
@@ -7263,7 +7264,12 @@ def build_placement_rebalance_plan(
         "to_acos",
         "from_action_priority_score",
         "to_action_priority_score",
+        "owner",
+        "execution_style",
         "reason",
+        "expected_signal",
+        "rollback_guard",
+        "next_step",
         "playbook_scene",
         "playbook_url",
     ]
@@ -7294,6 +7300,10 @@ def build_placement_rebalance_plan(
     if out.empty:
         return pd.DataFrame(columns=cols)
 
+    prb = getattr(policy, "dashboard_placement_rebalance", None) if isinstance(policy, OpsPolicy) else None
+    if prb is not None and (not bool(getattr(prb, "enabled", True))):
+        return pd.DataFrame(columns=cols)
+
     out["e_spend"] = pd.to_numeric(out.get("e_spend", 0.0), errors="coerce").fillna(0.0)
     out["action_priority_score"] = pd.to_numeric(out.get("action_priority_score", 0.0), errors="coerce").fillna(0.0)
 
@@ -7319,7 +7329,16 @@ def build_placement_rebalance_plan(
 
     cfg = get_stage_config(stage)
     target_acos = max(float(getattr(cfg, "target_acos", 0.0) or 0.0), 1e-6)
-    min_shift = max(5.0, float(getattr(cfg, "waste_spend", 0.0) or 0.0) * 0.1)
+    min_shift_ratio = max(0.0, min(1.0, float(getattr(prb, "min_shift_ratio", 0.10) or 0.10)))
+    base_shift_ratio = max(min_shift_ratio, min(1.0, float(getattr(prb, "base_shift_ratio", 0.12) or 0.12)))
+    max_shift_ratio = max(base_shift_ratio, min(1.0, float(getattr(prb, "max_shift_ratio", 0.35) or 0.35)))
+    severity_weight = max(0.0, float(getattr(prb, "severity_weight", 0.10) or 0.10))
+    fallback_severity = max(0.0, float(getattr(prb, "fallback_severity", 0.60) or 0.60))
+    min_shift = max(
+        max(0.0, float(getattr(prb, "min_shift_usd", 5.0) or 5.0)),
+        float(getattr(cfg, "waste_spend", 0.0) or 0.0) * max(0.0, float(getattr(prb, "stage_waste_floor_ratio", 0.10) or 0.10)),
+    )
+    max_down_per_campaign = max(1, int(getattr(prb, "max_down_per_campaign", 12) or 12))
 
     rows: List[Dict[str, object]] = []
     for (ad_type, campaign), gg in out.groupby(["ad_type", "campaign"], dropna=False):
@@ -7330,7 +7349,7 @@ def build_placement_rebalance_plan(
         ups = ups.sort_values(["action_priority_score", "e_spend"], ascending=[False, False]).copy()
         downs = downs.sort_values(["action_priority_score", "e_spend"], ascending=[False, False]).copy()
 
-        for _, d in downs.head(12).iterrows():
+        for _, d in downs.head(max_down_per_campaign).iterrows():
             from_placement = str(d.get("object_name", "") or "").strip()
             if not from_placement:
                 continue
@@ -7342,8 +7361,8 @@ def build_placement_rebalance_plan(
 
             from_spend = max(float(d.get("e_spend", 0.0) or 0.0), 0.0)
             from_acos = max(float(d.get("e_acos", 0.0) or 0.0), 0.0)
-            severity = max(0.0, safe_div(from_acos - target_acos, target_acos)) if from_acos > 0 else 0.6
-            shift_ratio = max(0.10, min(0.35, 0.12 + severity * 0.10))
+            severity = max(0.0, safe_div(from_acos - target_acos, target_acos)) if from_acos > 0 else fallback_severity
+            shift_ratio = max(min_shift_ratio, min(max_shift_ratio, base_shift_ratio + severity * severity_weight))
             amount = round(max(min_shift, from_spend * shift_ratio), 2)
 
             if to_row.empty:
@@ -7353,6 +7372,10 @@ def build_placement_rebalance_plan(
                 to_acos = 0.0
                 to_score = 0.0
                 reason = "同 Campaign 暂无明显优质广告位承接，先回收预算到 RESERVE。"
+                execution_style = "风险控制（先回收后观察）"
+                expected_signal = "24h 内 from_placement 花费下降，订单/CTR 基本稳定。"
+                rollback_guard = "若订单下滑>15%或CTR下滑>20%，下轮先减半回收比例。"
+                next_step = f"先回收约 ${amount:.2f} 到 RESERVE，不急着二次分配；明天复盘该 Campaign 的订单与CTR再决定去向。"
             else:
                 transfer_type = "transfer"
                 to_placement = str(to_row.get("object_name", "") or "").strip() or "RESERVE"
@@ -7360,6 +7383,13 @@ def build_placement_rebalance_plan(
                 to_acos = max(float(to_row.get("e_acos", 0.0) or 0.0), 0.0)
                 to_score = max(float(to_row.get("action_priority_score", 0.0) or 0.0), 0.0)
                 reason = "同 Campaign 广告位预算平移：从高损耗位置回收，向高效率位置倾斜。"
+                execution_style = "小步试投（先验证再放大）" if shift_ratio < 0.22 else "止损优先（强动作）"
+                expected_signal = "48h 内 to_placement 的转化率/订单占比提升，整体 ACoS 不劣化。"
+                rollback_guard = "若 to_placement 未改善且 from_placement 订单回撤明显，恢复最近一次平移金额。"
+                next_step = (
+                    f"先平移约 ${amount:.2f}（{from_placement} → {to_placement}），"
+                    "48h 复盘后再决定是否继续加码，避免一次性调太猛。"
+                )
 
             priority = str(d.get("priority", "") or "").strip().upper()
             if priority not in {"P0", "P1", "P2"}:
@@ -7382,7 +7412,12 @@ def build_placement_rebalance_plan(
                     "to_acos": round(float(to_acos), 4),
                     "from_action_priority_score": round(float(d.get("action_priority_score", 0.0) or 0.0), 2),
                     "to_action_priority_score": round(float(to_score), 2),
+                    "owner": "广告运营",
+                    "execution_style": execution_style,
                     "reason": reason,
+                    "expected_signal": expected_signal,
+                    "rollback_guard": rollback_guard,
+                    "next_step": next_step,
                     "playbook_scene": scene,
                     "playbook_url": f"{PB_DOC_REL}#{scene}",
                 }
@@ -9637,14 +9672,213 @@ def score_action_board(
             return "阻断:低库存"
         return "阻断"
 
+    def _phase_to_stage(phase: str) -> str:
+        p = str(phase or "").strip().lower()
+        if p in {"launch", "pre_launch"}:
+            return "launch"
+        if p in {"growth"}:
+            return "growth"
+        return "profit"
+
+    def _fmt_metric_usd(v: object) -> str:
+        x = _safe_float(v)
+        try:
+            if pd.isna(x):
+                x = 0.0
+        except Exception:
+            pass
+        return f"${x:.2f}"
+
+    def _fmt_metric_pct(v: object) -> str:
+        x = _safe_float(v)
+        try:
+            if pd.isna(x):
+                x = 0.0
+        except Exception:
+            pass
+        return f"{x * 100:.1f}%"
+
+    def _owner_for_action(act: str, blocked_reason: str, level: str) -> str:
+        br = str(blocked_reason or "")
+        lv = str(level or "").strip().lower()
+        if ("库存" in br) or ("断货" in br):
+            return "供应链/广告运营"
+        if act == "REVIEW" and lv == "asin":
+            return "运营/广告运营"
+        if act == "REVIEW":
+            return "广告运营/运营"
+        return "广告运营"
+
+    def _stage_label(stage_key: str) -> str:
+        s = str(stage_key or "").strip().lower()
+        if s == "launch":
+            return "新品期"
+        if s == "growth":
+            return "成长期"
+        return "利润期"
+
+    def _profit_label(pdir: str) -> str:
+        p = str(pdir or "").strip().lower()
+        if p == "reduce":
+            return "控量优先"
+        if p == "scale":
+            return "可放量"
+        return "稳态经营"
+
+    def _build_action_playbook_row(
+        act: str,
+        level: str,
+        phase: str,
+        blocked: int,
+        blocked_reason: str,
+        conf: float,
+        e_spend: float,
+        e_sales: float,
+        e_orders: float,
+        e_acos: float,
+        cover_days: float,
+        pdir: str,
+        low_conf_thr: float,
+    ) -> Tuple[str, str, str, str, str, str, str]:
+        """
+        基于动作与证据生成“更可执行”的运营建议五件套：
+        - decision_basis: 为什么触发
+        - execution_style: 执行风格
+        - operator_steps: 具体操作
+        - expected_signal: 观察信号
+        - rollback_guard: 回滚护栏
+        """
+        stage_key = _phase_to_stage(phase)
+        stage_label = _stage_label(stage_key)
+        profit_label = _profit_label(pdir)
+        target_acos = float(get_stage_config(stage_key).target_acos)
+        basis = (
+            f"spend={_fmt_metric_usd(e_spend)} | orders={int(round(max(0.0, e_orders)))} | "
+            f"sales={_fmt_metric_usd(e_sales)} | acos={_fmt_metric_pct(e_acos)} | "
+            f"target={_fmt_metric_pct(target_acos)} | stage={stage_label} | profit={profit_label} | hint_conf={conf:.2f}"
+        )
+        strategy_context = f"{stage_label}·{profit_label}"
+
+        if blocked > 0:
+            intensity = "L1谨慎"
+            style = f"{strategy_context}·{intensity}：先解锁再执行"
+            steps = "先处理阻断原因（库存/断货），阻断未解除前不执行放量动作。"
+            expected = "阻断解除后再执行加价/加预算，避免无货引流或低覆盖硬放量。"
+            rollback = "若阻断再次出现（库存跌破阈值/断货），立即暂停本轮放量动作。"
+            return basis, style, steps, expected, rollback, strategy_context, intensity
+
+        if act == "NEGATE":
+            if stage_key == "launch":
+                intensity = "L1谨慎"
+                style = f"{strategy_context}·{intensity}：轻量止损"
+                steps = "新品期先否定 1-3 个低意图词，并小幅降价 3%-5%，避免一次性大幅收口。"
+                expected = "无效点击下降，同时保留冷启动探索流量。"
+                rollback = "若曝光明显下降且转化未提升，回退最近一轮否词/降价。"
+            elif stage_key == "profit" or str(pdir or "").strip().lower() == "reduce":
+                intensity = "L3强动作"
+                style = f"{strategy_context}·{intensity}：强止损控量"
+                steps = "优先处理高花费无单词，单轮否定 5-8 个低意图词，并下调 8%-15% 出价。"
+                expected = "浪费花费快速下降，利润端压力缓解。"
+                rollback = "若订单下滑>12% 或销售下滑>18%，回滚最近一次强动作。"
+            else:
+                intensity = "L2标准"
+                style = f"{strategy_context}·{intensity}：先止损后保量"
+                steps = "先在该 campaign 中按花费排序处理高浪费词：先否定 3-5 个明显低意图词，再小步降价 5%-10%，48h 后复盘。"
+                expected = "waste_spend 下降，且订单/销售不出现明显下滑。"
+                rollback = "若订单下滑>15% 或销售下滑>20%，回滚最近一轮否词/降价。"
+            return basis, style, steps, expected, rollback, strategy_context, intensity
+
+        if act == "BID_DOWN":
+            if stage_key == "launch":
+                intensity = "L1谨慎"
+                style = f"{strategy_context}·{intensity}：温和效率修正"
+                steps = "优先下调高 ACoS 词 3%-5%，先保留探索流量，再逐步压缩低效流量。"
+                expected = "ACoS 回落，点击量不出现断崖式下滑。"
+                rollback = "若点击与订单同时明显下滑，回调到上一个出价档位。"
+            elif stage_key == "profit" or str(pdir or "").strip().lower() == "reduce":
+                intensity = "L3强动作"
+                style = f"{strategy_context}·{intensity}：利润导向降价"
+                steps = "对高 ACoS 且低转化投放位优先降价 10%-15%，把预算让给稳定出单词。"
+                expected = "48h 内 ACoS 明显改善，利润回收更快。"
+                rollback = "若核心订单显著下滑且 ACoS 未改善，回调一档并改小步降价。"
+            else:
+                intensity = "L2标准"
+                style = f"{strategy_context}·{intensity}：效率修正"
+                steps = "先对高 ACoS 投放位降价 5%-10%，保留已出单词；避免一次性大幅下调。"
+                expected = "48-72h 内 ACoS 回落并保持订单稳定。"
+                rollback = "若订单显著下滑且 ACoS 未改善，回调至上一个出价档位。"
+            return basis, style, steps, expected, rollback, strategy_context, intensity
+
+        if act in {"BID_UP", "BUDGET_UP"}:
+            if conf < float(low_conf_thr):
+                intensity = "L1谨慎"
+                style = f"{strategy_context}·{intensity}：先确认再放量"
+                steps = "先在 asin_hint_candidates 核对归因对象，确认后仅对高转化词/广告位小步加价或加预算。"
+            elif stage_key == "launch":
+                intensity = "L1谨慎"
+                style = f"{strategy_context}·{intensity}：冷启动试探放量"
+                steps = "新品期先对高点击且已转化对象小步加价 3%-5%，优先验证词包与 listing 匹配度。"
+            elif pdir == "reduce":
+                intensity = "L1谨慎"
+                style = f"{strategy_context}·{intensity}：利润保护型放量"
+                steps = "该 ASIN 利润方向偏控量，先优化结构再放量；如需加码，仅做小步测试。"
+            elif stage_key == "growth" and pdir == "scale":
+                intensity = "L3强动作"
+                style = f"{strategy_context}·{intensity}：成长期加速放量"
+                steps = "先加价 8%-12% 或加预算 10%-15%，集中投向高转化词与优质广告位。"
+            else:
+                intensity = "L2标准"
+                style = f"{strategy_context}·{intensity}：小步试投"
+                steps = "先加价 5%-10% 或小幅加预算，48h 看转化与 ACoS，再决定第二轮。"
+            if cover_days > 0:
+                steps += f" 当前 cover7d={cover_days:.1f}，放量时同步盯库存。"
+            expected = "订单/销售提升，且 ACoS 不劣化或可接受。"
+            rollback = "若连续两天 ACoS 高于目标且订单无提升，撤回最近一次加码。"
+            return basis, style, steps, expected, rollback, strategy_context, intensity
+
+        if act in {"BUDGET_DOWN", "PAUSE"}:
+            if stage_key == "profit" or str(pdir or "").strip().lower() == "reduce":
+                intensity = "L3强动作"
+                style = f"{strategy_context}·{intensity}：控损优先"
+                steps = "利润期优先收预算或暂停低效对象，再把预算让给高效率 campaign/placement。"
+            else:
+                intensity = "L2标准"
+                style = f"{strategy_context}·{intensity}：结构控损"
+                steps = "先收预算或暂停低效对象，再把预算让给高效率 campaign/placement。"
+            expected = "低效花费下降，整体转化效率提升。"
+            rollback = "若核心订单受影响明显，恢复部分预算并改为小步降价。"
+            return basis, style, steps, expected, rollback, strategy_context, intensity
+
+        # REVIEW/其他
+        intensity = "L1谨慎" if stage_key == "launch" else "L2标准"
+        style = f"{strategy_context}·{intensity}：诊断优先"
+        if str(level or "").strip().lower() in {"search_term", "targeting"}:
+            steps = "先查搜索词意图与匹配类型，再看出价和否词；必要时回看 Listing（主图/价格/评价）协同优化。"
+        elif str(level or "").strip().lower() == "placement":
+            steps = "先按广告位看 from->to 效率差，再做小步平移或系数调整。"
+        else:
+            steps = "先按 campaign 维度排查结构（词、投放位、预算分配），确认根因后再执行动作。"
+        expected = "定位出明确根因，并转化为可执行动作（否词/调价/预算平移）。"
+        rollback = "若首轮动作未见改善，回退并改用更保守策略。"
+        return basis, style, steps, expected, rollback, strategy_context, intensity
+
     scores: List[float] = []
     reasons: List[str] = []
     loop_avg_scores: List[float] = []
     loop_positive_rates: List[float] = []
     loop_samples: List[int] = []
+    owner_suggested_list: List[str] = []
+    decision_basis_list: List[str] = []
+    execution_style_list: List[str] = []
+    operator_steps_list: List[str] = []
+    expected_signal_list: List[str] = []
+    rollback_guard_list: List[str] = []
+    strategy_context_list: List[str] = []
+    action_intensity_list: List[str] = []
     for _, r in df.iterrows():
         priority = str(r.get("priority", "") or "")
         act = str(r.get("action_type", "") or "").strip().upper()
+        level = str(r.get("level", "") or "").strip().lower()
         phase = str(r.get("current_phase", "") or "").strip().lower()
 
         conf = _safe_float(r.get("asin_hint_confidence", 0.0))
@@ -9735,11 +9969,47 @@ def score_action_board(
         uniq = uniq[:3]
         reasons.append(";".join(uniq))
 
+        e_sales = _safe_float(r.get("e_sales", 0.0))
+        e_orders = _safe_float(r.get("e_orders", 0.0))
+        e_acos = _safe_float(r.get("e_acos", 0.0))
+        cover_days = _safe_float(r.get("asin_inventory_cover_days_7d", 0.0))
+        basis, style, steps, expected, rollback, strategy_context, action_intensity = _build_action_playbook_row(
+            act=act,
+            level=level,
+            phase=phase,
+            blocked=blocked,
+            blocked_reason=blocked_reason,
+            conf=conf,
+            e_spend=e_spend,
+            e_sales=e_sales,
+            e_orders=e_orders,
+            e_acos=e_acos,
+            cover_days=cover_days,
+            pdir=pdir,
+            low_conf_thr=float(ap.low_hint_confidence_threshold),
+        )
+        owner_suggested_list.append(_owner_for_action(act=act, blocked_reason=blocked_reason, level=level))
+        decision_basis_list.append(basis)
+        execution_style_list.append(style)
+        operator_steps_list.append(steps)
+        expected_signal_list.append(expected)
+        rollback_guard_list.append(rollback)
+        strategy_context_list.append(strategy_context)
+        action_intensity_list.append(action_intensity)
+
     df["action_priority_score"] = scores
     df["action_loop_avg_score"] = loop_avg_scores
     df["action_loop_positive_rate"] = loop_positive_rates
     df["action_loop_samples"] = loop_samples
     df["priority_reason"] = reasons
+    df["owner_suggested"] = owner_suggested_list
+    df["decision_basis"] = decision_basis_list
+    df["execution_style"] = execution_style_list
+    df["operator_steps"] = operator_steps_list
+    df["expected_signal"] = expected_signal_list
+    df["rollback_guard"] = rollback_guard_list
+    df["strategy_context"] = strategy_context_list
+    df["action_intensity"] = action_intensity_list
 
     # 3.1) needs_manual_confirm：弱关联动作的“人工确认”标记（便于运营一键筛选）
     # 说明：
@@ -9963,6 +10233,67 @@ def dedup_action_board(action_board: pd.DataFrame) -> pd.DataFrame:
 
     keep = keep.drop(columns=["_priority_rank", "_level_rank", "_dedup_bucket"], errors="ignore")
     return keep.reset_index(drop=True)
+
+
+def build_action_execution_guide(
+    action_board: Optional[pd.DataFrame],
+    max_rows: int = 300,
+) -> pd.DataFrame:
+    """
+    动作执行手册（action_execution_guide.csv）：
+    把 Action Board 的“规则结论”转换为运营可直接执行的步骤化清单。
+    """
+    cols = [
+        "priority",
+        "owner_suggested",
+        "ad_type",
+        "level",
+        "campaign",
+        "ad_group",
+        "match_type",
+        "object_name",
+        "action_type",
+        "action_value",
+        "blocked",
+        "blocked_reason",
+        "decision_basis",
+        "strategy_context",
+        "action_intensity",
+        "execution_style",
+        "operator_steps",
+        "expected_signal",
+        "rollback_guard",
+        "priority_reason",
+        "action_priority_score",
+        "playbook_scene",
+        "playbook_url",
+    ]
+    ab = action_board.copy() if isinstance(action_board, pd.DataFrame) else pd.DataFrame()
+    if ab is None or ab.empty:
+        return pd.DataFrame(columns=cols)
+
+    out = ab.copy()
+    if "action_priority_score" not in out.columns:
+        out["action_priority_score"] = 0.0
+    if "blocked" not in out.columns:
+        out["blocked"] = 0
+    out["action_priority_score"] = pd.to_numeric(out.get("action_priority_score", 0.0), errors="coerce").fillna(0.0)
+    out["blocked"] = pd.to_numeric(out.get("blocked", 0), errors="coerce").fillna(0).astype(int)
+    if "priority" not in out.columns:
+        out["priority"] = ""
+    rank = {"P0": 0, "P1": 1, "P2": 2}
+    out["_pr"] = out["priority"].astype(str).str.upper().map(lambda x: rank.get(x, 9))
+    try:
+        out = out.sort_values(
+            ["blocked", "_pr", "action_priority_score", "e_spend"],
+            ascending=[True, True, False, False],
+        ).copy()
+    except Exception:
+        out = out.sort_values(["blocked", "_pr", "action_priority_score"], ascending=[True, True, False]).copy()
+    out = out.drop(columns=["_pr"], errors="ignore")
+    out = out.head(max(1, int(max_rows or 1))).copy()
+    keep = [c for c in cols if c in out.columns]
+    return out[keep].reset_index(drop=True)
 
 
 def build_campaign_action_view(
@@ -11688,7 +12019,7 @@ def write_dashboard_md(
 
         def _strip_md_links(text: str) -> str:
             try:
-                return re.sub(r"\\[([^\\]]+)\\]\\([^\\)]+\\)", r"\\1", text)
+                return re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
             except Exception:
                 return text
 
@@ -11888,6 +12219,7 @@ def write_dashboard_md(
         quick_links.append("[本周行动](#weekly)")
         quick_links.append("[Campaign排查](#campaign)")
         quick_links.append("[Action Board](../dashboard/action_board.csv)")
+        quick_links.append("[动作执行手册](../dashboard/action_execution_guide.csv)")
         quick_links.append("[解锁任务表](../dashboard/unlock_scale_tasks.csv)")
         quick_links.append("[广告位预算平移](../dashboard/placement_rebalance_plan.csv)")
         quick_links.append("[任务汇总](../dashboard/task_summary.csv)")
@@ -12390,8 +12722,8 @@ def write_dashboard_md(
                     return 0.0
 
             def _evidence_text(parts: List[str]) -> str:
-                ps = [p for p in parts if str(p or "").strip()]
-                return f"证据: {' | '.join(ps)}" if ps else "证据: 见明细表"
+                ps = [str(p or "").strip() for p in parts if str(p or "").strip()]
+                return " ｜ ".join(ps) if ps else "见明细表"
 
             def _priority_rank(p: str) -> int:
                 pr = str(p or "").strip().upper()
@@ -12410,6 +12742,53 @@ def write_dashboard_md(
                 if g == "scale":
                     return "放量"
                 return "排查"
+
+            def _action_label(action_type: str) -> str:
+                t = str(action_type or "").strip().upper()
+                mapping = {
+                    "NEGATE": "否定低意图词",
+                    "BID_DOWN": "下调高成本词出价",
+                    "BID_UP": "提升高转化词出价",
+                    "BUDGET_UP": "提高高效活动预算",
+                    "REVIEW": "排查异常投放对象",
+                    "PAUSE": "暂停低效对象",
+                    "BUDGET_DOWN": "下调低效预算",
+                }
+                return mapping.get(t, t or "执行广告动作")
+
+            def _compact_basis_text(text: object) -> str:
+                raw = str(text or "").strip()
+                if not raw:
+                    return ""
+                parts = [p.strip() for p in raw.split("|") if p.strip()]
+                if not parts:
+                    return raw
+                keep: List[str] = []
+                for p in parts:
+                    if len(keep) >= 3:
+                        break
+                    keep.append(p)
+                return "；".join(keep)
+
+            def _build_weekly_line(
+                priority: str,
+                group: str,
+                title: str,
+                description: str,
+                evidence: str,
+                owner: str,
+            ) -> str:
+                head = f"`{priority}` `{_group_tag(group)}` {title}".strip()
+                if description:
+                    head = f"{head}：{description}"
+                tail: List[str] = []
+                if evidence:
+                    tail.append(f"证据:{evidence}")
+                if owner:
+                    tail.append(f"责任:{owner}")
+                if tail:
+                    head = f"{head} | {' | '.join(tail)}"
+                return head
 
             def _goal_rank(goal: str) -> int:
                 g = str(goal or "").strip()
@@ -12577,21 +12956,29 @@ def write_dashboard_md(
                     bg = _fmt_usd(r.get("budget_gap_usd_est"))
                     pg = _fmt_usd(r.get("profit_gap_usd_est"))
                     if spd7:
-                        ev_parts.append(f"日销7d=`{spd7}`")
+                        ev_parts.append(f"日销7d={spd7}")
                         delta_val = abs(_as_float(r.get("sales_per_day_7d")))
                     if bg and bg != "$0":
-                        ev_parts.append(f"预算缺口≈`{bg}`")
+                        ev_parts.append(f"预算缺口≈{bg}")
                         spend_val += abs(_as_float(r.get("budget_gap_usd_est")))
                     if pg and pg != "$0":
-                        ev_parts.append(f"利润缺口≈`{pg}`")
+                        ev_parts.append(f"利润缺口≈{pg}")
                         spend_val += abs(_as_float(r.get("profit_gap_usd_est")))
                     ev_txt = _evidence_text(ev_parts)
 
                     prefix = f"{cat} " if cat else ""
                     product_label = _format_product_label(asin, r.get("product_name", ""))
-                    title = f"{prefix}{product_label} {task_type}".strip()
+                    title = _strip_md_links(f"{prefix}{product_label} {task_type}".strip()).replace("**", "").strip()
                     if not title:
                         continue
+                    desc = "先收口低效预算和高 ACOS 出价，再把预算向已出单词迁移。"
+                    if ("库存" in task_type) or ("补货" in task_type) or ("断货" in task_type):
+                        desc = "先补货/控量，避免无货引流；库存恢复后再执行放量。"
+                    elif ("否词" in task_type) or ("收口" in task_type):
+                        desc = "先清理低意图流量，再做小步调价，优先保证订单稳定。"
+                    operator_steps = "按任务表优先级逐条执行；每次只改一轮，48h 后复盘。"
+                    expected_signal = "低效花费下降，核心订单不下滑。"
+                    rollback_guard = "若订单连续两天下滑明显，回滚最近一轮调价/否词。"
                     candidates.append(
                         {
                             "priority": p,
@@ -12599,7 +12986,22 @@ def write_dashboard_md(
                             "asin": asin,
                             "spend": float(spend_val),
                             "delta": float(delta_val),
-                            "line": f"`{p}` `{_group_tag(group)}` {title} | {ev_txt} | 责任:{owner}",
+                            "title": title,
+                            "description": desc,
+                            "evidence": ev_txt,
+                            "owner": owner,
+                            "operator_steps": operator_steps,
+                            "expected_signal": expected_signal,
+                            "rollback_guard": rollback_guard,
+                            "goal": _infer_goal_tag(f"{task_type} {ev_txt}"),
+                            "line": _build_weekly_line(
+                                priority=p,
+                                group=group,
+                                title=title,
+                                description=desc,
+                                evidence=ev_txt,
+                                owner=owner,
+                            ),
                         }
                     )
 
@@ -12614,8 +13016,46 @@ def write_dashboard_md(
                     owner = _owner_from_alert(title)
                     group = _group_from_alert(title)
                     ev_txt = _evidence_text([detail] if detail else [])
-                    line = f"`{p}` `{_group_tag(group)}` {title} | {ev_txt} | 责任:{owner}"
-                    candidates.append({"priority": p, "group": group, "asin": "", "spend": 0.0, "delta": 0.0, "line": line})
+                    if group == "stop":
+                        desc = "先止损再放量，避免预算继续流向低效对象。"
+                        op = "先冻结高浪费对象，再检查词包和匹配方式，确认后逐步恢复。"
+                        exp = "浪费花费下降，整体转化效率改善。"
+                        rb = "若核心订单受影响，恢复上一个可控档位并改小步执行。"
+                    elif group == "scale":
+                        desc = "可做小步加码，优先放量高转化对象。"
+                        op = "先在高转化对象加价/加预算 5%-10%，48h 后看转化再决定第二轮。"
+                        exp = "订单增长且 ACoS 不明显恶化。"
+                        rb = "若两天内 ACoS 明显走高且订单未增，回撤最近一次加码。"
+                    else:
+                        desc = "先排查根因，再执行动作，避免误操作。"
+                        op = "先看 listing/价格/评价与词包匹配，再决定否词、调价或预算平移。"
+                        exp = "定位到可执行根因并形成下一步动作。"
+                        rb = "若首轮动作无改善，回退并切换更保守方案。"
+                    candidates.append(
+                        {
+                            "priority": p,
+                            "group": group,
+                            "asin": "",
+                            "spend": 0.0,
+                            "delta": 0.0,
+                            "title": title,
+                            "description": desc,
+                            "evidence": ev_txt,
+                            "owner": owner,
+                            "operator_steps": op,
+                            "expected_signal": exp,
+                            "rollback_guard": rb,
+                            "goal": _infer_goal_tag(f"{title} {detail}"),
+                            "line": _build_weekly_line(
+                                priority=p,
+                                group=group,
+                                title=title,
+                                description=desc,
+                                evidence=ev_txt,
+                                owner=owner,
+                            ),
+                        }
+                    )
 
             # C) Action Board：广告端可直接执行（补齐“止损/放量/排查”）
             if isinstance(action_board, pd.DataFrame) and (not action_board.empty):
@@ -12668,26 +13108,35 @@ def write_dashboard_md(
 
                     ev_parts = []
                     if e_spend:
-                        ev_parts.append(f"花费=`{e_spend}`")
+                        ev_parts.append(f"花费={e_spend}")
                     if delta_sales:
-                        ev_parts.append(f"ΔSales=`{delta_sales}`")
+                        ev_parts.append(f"ΔSales={delta_sales}")
                     if delta_spend:
-                        ev_parts.append(f"ΔSpend=`{delta_spend}`")
+                        ev_parts.append(f"ΔSpend={delta_spend}")
                     if e_orders:
-                        ev_parts.append(f"订单=`{e_orders}`")
+                        ev_parts.append(f"订单={e_orders}")
                     if e_acos:
-                        ev_parts.append(f"ACOS=`{e_acos}`")
+                        ev_parts.append(f"ACOS={e_acos}")
                     if blocked > 0 and blocked_reason:
-                        ev_parts.append(f"阻断=`{blocked_reason}`")
+                        ev_parts.append(f"阻断={blocked_reason}")
                     ev_txt = _evidence_text(ev_parts)
 
-                    core = f"{action_type} {obj}".strip() if action_type or obj else "广告动作"
+                    action_label = _action_label(action_type)
+                    core = f"{action_label} {obj}".strip() if action_type or obj else "广告动作"
                     if product_label:
                         core = f"{product_label} {core}".strip()
                     if camp:
                         core += f" @ {camp}"
                     if needs_confirm:
                         core += " [需确认]"
+                    core = _strip_md_links(core).replace("**", "").strip()
+                    owner = str(r.get("owner_suggested", "") or "").strip() or owner
+                    desc = str(r.get("execution_style", "") or "").strip() or "先小步执行，再基于数据复盘。"
+                    operator_steps = str(r.get("operator_steps", "") or "").strip() or "按动作逐条执行，避免同日多项大改。"
+                    expected_signal = str(r.get("expected_signal", "") or "").strip() or "核心指标向目标收敛。"
+                    rollback_guard = str(r.get("rollback_guard", "") or "").strip() or "若核心指标劣化，回滚最近一次动作。"
+                    basis = _compact_basis_text(r.get("decision_basis", ""))
+                    evidence_compact = ev_txt if ev_txt and ev_txt != "见明细表" else basis
 
                     candidates.append(
                         {
@@ -12696,7 +13145,22 @@ def write_dashboard_md(
                             "asin": asin,
                             "spend": float(_as_float(r.get("e_spend"))),
                             "delta": float(abs(delta_sales_val) if delta_sales_val != 0 else abs(delta_spend_val)),
-                            "line": f"`{p}` `{_group_tag(group)}` {core} | {ev_txt} | 责任:{owner}",
+                            "title": core,
+                            "description": desc,
+                            "evidence": evidence_compact,
+                            "owner": owner,
+                            "operator_steps": operator_steps,
+                            "expected_signal": expected_signal,
+                            "rollback_guard": rollback_guard,
+                            "goal": _infer_goal_tag(f"{core} {evidence_compact} {desc}"),
+                            "line": _build_weekly_line(
+                                priority=p,
+                                group=group,
+                                title=core,
+                                description=desc,
+                                evidence=evidence_compact,
+                                owner=owner,
+                            ),
                         }
                     )
 
@@ -12739,11 +13203,36 @@ def write_dashboard_md(
                 p = str(c.get("priority", "P1") or "P1").strip().upper()
                 asin = str(c.get("asin", "") or "").strip().upper()
                 group = str(c.get("group", "") or "").strip().lower() or "review"
+                title = str(c.get("title", "") or "").strip()
+                desc = str(c.get("description", "") or "").strip()
+                evidence = str(c.get("evidence", "") or "").strip()
+                owner = str(c.get("owner", "") or "").strip()
+                operator_steps = str(c.get("operator_steps", "") or "").strip()
+                expected_signal = str(c.get("expected_signal", "") or "").strip()
+                rollback_guard = str(c.get("rollback_guard", "") or "").strip()
+                goal = str(c.get("goal", "") or "").strip()
+                if not goal:
+                    goal = _infer_goal_tag(f"{title} {desc} {evidence}")
                 used_lines.add(line)
                 if asin:
                     used_asins.add(asin)
                 used_groups.add(group)
-                picked.append({"priority": p, "line": line, "goal": _infer_goal_tag(line)})
+                picked.append(
+                    {
+                        "priority": p,
+                        "group": group,
+                        "asin": asin,
+                        "line": line,
+                        "title": title,
+                        "description": desc,
+                        "evidence": evidence,
+                        "owner": owner,
+                        "operator_steps": operator_steps,
+                        "expected_signal": expected_signal,
+                        "rollback_guard": rollback_guard,
+                        "goal": goal,
+                    }
+                )
 
             _pop_best(lambda c: True)
             while len(picked) < 3:
@@ -12910,38 +13399,54 @@ def write_dashboard_md(
                     ai_items.append(
                         {
                             "priority": it.get("priority", ""),
+                            "title": title,
                             "text": text,
                             "goal": it.get("goal", ""),
                             "evidence": str(it.get("evidence", "") or "").strip(),
+                            "owner": "",
                         }
                     )
             for it in (weekly_actions or [])[:3]:
-                raw = str(it.get("line", "") or "").strip()
-                if not raw:
+                p = str(it.get("priority", "") or "").strip().upper()
+                title = str(it.get("title", "") or "").strip()
+                desc = str(it.get("description", "") or "").strip()
+                evidence = str(it.get("evidence", "") or "").strip()
+                owner = str(it.get("owner", "") or "").strip()
+                text = title
+                if desc:
+                    text = f"{title}：{desc}" if title else desc
+                if not text:
+                    raw = str(it.get("line", "") or "").strip()
+                    if raw:
+                        raw = _strip_md_links(raw)
+                        raw = raw.replace("**", "").replace("`", "").strip()
+                    text = raw
+                if not text:
                     continue
-                p = ""
-                m = re.search(r"`(P[0-2])`", raw)
-                if m:
-                    p = m.group(1)
-                    raw = raw.replace(m.group(0), "").strip()
-                raw = _strip_md_links(raw)
-                raw = raw.replace("**", "").replace("`", "").strip()
-                if raw:
-                    rule_items.append({"priority": p, "text": raw, "goal": _infer_goal_tag(raw), "evidence": ""})
+                rule_items.append(
+                    {
+                        "priority": p,
+                        "title": title,
+                        "text": text,
+                        "goal": str(it.get("goal", "") or "").strip() or _infer_goal_tag(text),
+                        "evidence": evidence,
+                        "owner": owner,
+                    }
+                )
             for a in (picked_alerts or [])[:2]:
                 p = str(a.get("priority", "P1") or "P1").strip().upper()
                 title = str(a.get("title", "") or "").strip()
                 detail = str(a.get("detail", "") or "").strip()
                 if not title:
                     continue
-                text = f"{title}（{detail}）" if detail else title
-                rule_items.append({"priority": p, "text": text, "goal": _infer_goal_tag(text), "evidence": ""})
+                text = title
+                rule_items.append({"priority": p, "title": title, "text": text, "goal": _infer_goal_tag(text), "evidence": detail, "owner": ""})
 
             def _normalize_items(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
                 uniq: List[Dict[str, str]] = []
                 seen: set[str] = set()
                 for it in items:
-                    key = _norm_text(it.get("text", ""))
+                    key = _norm_text(f"{it.get('title', '')} {it.get('text', '')}")
                     if not key or key in seen:
                         continue
                     seen.add(key)
@@ -12967,6 +13472,8 @@ def write_dashboard_md(
                     p = it.get("priority", "")
                     text = it.get("text", "")
                     goal = it.get("goal", "")
+                    evidence = _short_text(_strip_md_links(str(it.get("evidence", "") or "")).replace("|", "｜"), 72)
+                    owner = _short_text(_strip_md_links(str(it.get("owner", "") or "")), 24)
                     tone = ""
                     if p == "P0":
                         tone = " tone-risk"
@@ -12976,7 +13483,15 @@ def write_dashboard_md(
                         tone = " tone-opp"
                     goal_tag = f' <span class="tag">目标:{html.escape(goal)}</span>' if goal else ""
                     badge = f"<code>{p}</code> " if p else ""
-                    lines.append(f"<div class=\"decision-item{tone}\">{badge}{html.escape(text)}{goal_tag}</div>")
+                    lines.append(f"<div class=\"decision-item{tone}\">{badge}{html.escape(text)}{goal_tag}")
+                    meta_parts: List[str] = []
+                    if evidence:
+                        meta_parts.append(f"依据: {evidence}")
+                    if owner:
+                        meta_parts.append(f"责任: {owner}")
+                    if meta_parts:
+                        lines.append(f"<div class=\"decision-meta\">{' · '.join([html.escape(x) for x in meta_parts])}</div>")
+                    lines.append("</div>")
                 lines.append("</div>")
 
             # AI 建议（弱提示、默认折叠）
@@ -12992,6 +13507,7 @@ def write_dashboard_md(
                     p = it.get("priority", "")
                     text = it.get("text", "")
                     goal = it.get("goal", "")
+                    evidence = _short_text(_strip_md_links(str(it.get("evidence", "") or "")).replace("|", "｜"), 60)
                     tone = ""
                     if p == "P0":
                         tone = " tone-risk"
@@ -13001,7 +13517,10 @@ def write_dashboard_md(
                         tone = " tone-opp"
                     goal_tag = f' <span class="tag">目标:{html.escape(goal)}</span>' if goal else ""
                     badge = f"<code>{p}</code> " if p else ""
-                    lines.append(f"<div class=\"decision-item{tone}\">{badge}{html.escape(text)}{goal_tag}</div>")
+                    lines.append(f"<div class=\"decision-item{tone}\">{badge}{html.escape(text)}{goal_tag}")
+                    if evidence:
+                        lines.append(f"<div class=\"decision-meta\">依据: {html.escape(evidence)}</div>")
+                    lines.append("</div>")
                 lines.append("</div>")
             lines.append("</details>")
             lines.append("<div class=\"hint\">更多见：<a href=\"../dashboard/task_summary.csv\">任务汇总</a> / <a href=\"../dashboard/action_board.csv\">Action Board</a></div>")
@@ -13249,12 +13768,28 @@ def write_dashboard_md(
             lines.append('<div class="action-grid">')
             for it in weekly_actions[:3]:
                 raw_line = str(it.get("line", "") or "").strip()
-                parsed = _parse_weekly_action_line(raw_line)
-                p = str(parsed.get("priority", "") or "").strip().upper()
-                group = str(parsed.get("group", "") or "").strip()
-                title = str(parsed.get("title", "") or "").strip()
-                evidence = str(parsed.get("evidence", "") or "").strip()
-                owner = str(parsed.get("owner", "") or "").strip()
+                p = str(it.get("priority", "") or "").strip().upper()
+                group_key = str(it.get("group", "") or "").strip().lower()
+                group = _group_tag(group_key) if group_key else ""
+                title = str(it.get("title", "") or "").strip()
+                desc = str(it.get("description", "") or "").strip()
+                evidence = str(it.get("evidence", "") or "").strip()
+                owner = str(it.get("owner", "") or "").strip()
+                operator_steps = str(it.get("operator_steps", "") or "").strip()
+                expected_signal = str(it.get("expected_signal", "") or "").strip()
+                rollback_guard = str(it.get("rollback_guard", "") or "").strip()
+                if (not p) or (not title):
+                    parsed = _parse_weekly_action_line(raw_line)
+                    if not p:
+                        p = str(parsed.get("priority", "") or "").strip().upper()
+                    if not group:
+                        group = str(parsed.get("group", "") or "").strip()
+                    if not title:
+                        title = str(parsed.get("title", "") or "").strip()
+                    if not evidence:
+                        evidence = str(parsed.get("evidence", "") or "").strip()
+                    if not owner:
+                        owner = str(parsed.get("owner", "") or "").strip()
 
                 tone = ""
                 if p == "P0":
@@ -13270,25 +13805,33 @@ def write_dashboard_md(
                     lines.append(f'<span class="badge badge-{p.lower()}">{html.escape(p)}</span>')
                 if group:
                     lines.append(f'<span class="tag">{html.escape(group)}</span>')
-                goal = _infer_goal_tag(f"{title} {evidence}")
+                goal = _infer_goal_tag(f"{title} {desc} {evidence} {operator_steps}")
                 if goal:
                     lines.append(f'<span class="tag">目标:{html.escape(goal)}</span>')
                 lines.append('</div>')
                 if title:
                     asin_guess = ""
                     try:
-                        m = re.search(r"\\bB0[A-Z0-9]{8}\\b", raw_line, flags=re.I)
+                        m = re.search(r"\\bB0[A-Z0-9]{8}\\b", f"{raw_line} {title}", flags=re.I)
                         if m:
                             asin_guess = m.group(0).upper()
                     except Exception:
                         asin_guess = ""
-                    prod_label = _compact_product_label(asin_guess, "")
+                    prod_label = _strip_md_links(_compact_product_label(asin_guess, ""))
                     if prod_label and prod_label not in title:
                         title = f"{prod_label} · {title}"
-                    title = _short_text(title, 80)
+                    title = _short_text(title, 72)
                     lines.append(f'<div class="action-title">{html.escape(title)}</div>')
+                if desc:
+                    lines.append(f'<div class="action-meta">描述: {html.escape(_short_text(desc, 64))}</div>')
                 if evidence:
                     lines.append(f'<div class="action-meta">证据: {html.escape(_short_text(evidence, 60))}</div>')
+                if operator_steps:
+                    lines.append(f'<div class="action-meta">执行: {html.escape(_short_text(operator_steps, 68))}</div>')
+                if expected_signal:
+                    lines.append(f'<div class="action-meta">观察: {html.escape(_short_text(expected_signal, 58))}</div>')
+                if rollback_guard:
+                    lines.append(f'<div class="action-meta">回滚: {html.escape(_short_text(rollback_guard, 58))}</div>')
                 if owner:
                     lines.append(f'<div class="action-owner">责任: {html.escape(owner)}</div>')
                 lines.append('</div>')
@@ -14357,13 +14900,7 @@ def write_dashboard_md(
                 pass
 
             view = action_board.head(20).copy()
-            # 链接跳转：类目/ASIN/生命周期 -> drilldown
-            if "product_category" in view.columns:
-                view["product_category"] = view["product_category"].map(lambda x: _cat_md_link(str(x or ""), "./category_drilldown.md"))
-            if "asin_hint" in view.columns:
-                view["asin_hint"] = view["asin_hint"].map(lambda x: _asin_md_link(str(x or ""), "./asin_drilldown.md"))
-            if "current_phase" in view.columns:
-                view["current_phase"] = view["current_phase"].map(lambda x: _phase_md_link(str(x or ""), "./phase_drilldown.md"))
+            # 运营聚焦版不再把 action 原始字段改成 Markdown 链接，避免行动文本出现链接噪音。
 
             # 操作手册联动：从动作表一键跳回“怎么查/怎么做”
             try:
@@ -14399,17 +14936,34 @@ def write_dashboard_md(
 
             # 运营聚焦：合并行动描述
             try:
+                def _human_action_label(action_type: object) -> str:
+                    act_raw = str(action_type or "").strip().upper()
+                    mapping = {
+                        "NEGATE": "否定低意图词",
+                        "BID_DOWN": "下调高成本词出价",
+                        "BID_UP": "提升高转化词出价",
+                        "BUDGET_UP": "提高高效活动预算",
+                        "REVIEW": "排查异常投放对象",
+                        "PAUSE": "暂停低效对象",
+                        "BUDGET_DOWN": "下调低效预算",
+                    }
+                    return mapping.get(act_raw, act_raw or "执行广告动作")
+
                 def _fmt_action_row(r: pd.Series) -> str:
                     p = str(r.get("priority", "") or "").strip().upper()
                     obj = str(r.get("object_name", "") or "").strip()
-                    act = str(r.get("action_type", "") or "").strip().upper()
+                    act = _human_action_label(r.get("action_type", ""))
                     val = str(r.get("action_value", "") or "").strip()
                     asin_hint = str(r.get("asin_hint", "") or "").strip().upper()
                     product_name = r.get("product_name", "")
                     product_label = _format_product_label(asin_hint, product_name) if (asin_hint or product_name) else ""
+                    product_label = _strip_md_links(str(product_label or "")).replace("**", "").strip()
+                    style = str(r.get("execution_style", "") or "").strip()
                     core = " ".join([x for x in [act, obj, val] if x]).strip()
                     if product_label:
                         core = f"{product_label} {core}".strip()
+                    if style:
+                        core = f"{core}（{style}）".strip()
                     if p:
                         core = f"`{p}` {core}".strip()
                     return core.strip()
@@ -14423,19 +14977,39 @@ def write_dashboard_md(
                 evid = []
                 for _, r in view.iterrows():
                     parts = []
+                    part_keys: set[str] = set()
+                    def _append_part(text: str) -> None:
+                        t = str(text or "").strip()
+                        if not t:
+                            return
+                        key = t.split("=", 1)[0].strip().lower() if "=" in t else t
+                        if key in part_keys:
+                            return
+                        part_keys.add(key)
+                        parts.append(t)
+
                     if "e_spend" in r and r.get("e_spend") is not None:
-                        parts.append(f"花费={_fmt_usd(r.get('e_spend'))}")
+                        _append_part(f"花费={_fmt_usd(r.get('e_spend'))}")
                     if "e_orders" in r and r.get("e_orders") is not None:
-                        parts.append(f"订单={_fmt_num(r.get('e_orders'), nd=0)}")
+                        e_orders = _fmt_num(r.get("e_orders"), nd=0)
+                        if e_orders:
+                            _append_part(f"订单={e_orders}")
                     if "e_acos" in r and r.get("e_acos") is not None:
-                        parts.append(f"ACOS={_fmt_num(r.get('e_acos'), nd=4)}")
+                        e_acos = _fmt_num(r.get("e_acos"), nd=4)
+                        if e_acos:
+                            _append_part(f"ACOS={e_acos}")
                     if "asin_delta_sales" in r and r.get("asin_delta_sales") is not None:
                         ds = _fmt_signed_usd(r.get("asin_delta_sales"))
                         if ds:
-                            parts.append(f"ΔSales={ds}")
+                            _append_part(f"ΔSales={ds}")
                     if "blocked_reason" in r and str(r.get("blocked_reason") or "").strip():
-                        parts.append(f"阻断={str(r.get('blocked_reason') or '').strip()}")
-                    evid.append(" | ".join([p for p in parts if p]))
+                        _append_part(f"阻断={str(r.get('blocked_reason') or '').strip()}")
+                    if "decision_basis" in r and str(r.get("decision_basis") or "").strip():
+                        basis_parts = [x.strip() for x in str(r.get("decision_basis") or "").split("|") if x.strip()]
+                        for bp in basis_parts[:2]:
+                            clean_bp = bp.replace("spend=", "花费=").replace("orders=", "订单=").replace("acos=", "ACOS=")
+                            _append_part(clean_bp)
+                    evid.append(" ｜ ".join([p for p in parts if p]))
                 view["evidence_brief"] = evid
             except Exception:
                 view["evidence_brief"] = ""
@@ -14519,11 +15093,11 @@ def write_dashboard_md(
                 view["action_brief"] = view.apply(
                     lambda r: _short_text(
                         f"{r.get('action_brief','')}" + (f" · 目标:{r.get('goal','')}" if r.get("goal","") else ""),
-                        80,
+                        96,
                     ),
                     axis=1,
                 )
-                view["evidence_brief"] = view["evidence_brief"].map(lambda x: _short_text(x, 72))
+                view["evidence_brief"] = view["evidence_brief"].map(lambda x: _short_text(x, 88))
             except Exception:
                 pass
 
@@ -17732,6 +18306,7 @@ def write_dashboard_outputs(
 
     同时写入：
     - dashboard/action_board_full.csv（全量含重复，便于追溯）
+    - dashboard/action_execution_guide.csv（动作执行手册：数据依据 + 可执行步骤 + 回滚护栏）
     - dashboard/asin_cockpit.csv（ASIN 总览：focus + drivers + 动作量汇总）
     - dashboard/keyword_topics.csv（关键词主题 n-gram：压缩 search_term 报表的海量搜索词）
     - dashboard/keyword_topics_segment_top.csv（Segment Top：类目×生命周期 → Top 浪费/贡献主题，各 TopN）
@@ -17860,6 +18435,41 @@ def write_dashboard_outputs(
             action_board.to_csv(action_board_path, index=False, encoding="utf-8-sig")
         else:
             pd.DataFrame(columns=["priority", "action_type"]).to_csv(action_board_path, index=False, encoding="utf-8-sig")
+
+        # 3.005) action_execution_guide.csv（动作执行手册：数据依据+操作步骤+回滚护栏）
+        action_execution_guide_path = dashboard_dir / "action_execution_guide.csv"
+        try:
+            action_execution_guide = build_action_execution_guide(
+                action_board=action_board_all if isinstance(action_board_all, pd.DataFrame) else action_board,
+                max_rows=500,
+            )
+        except Exception:
+            action_execution_guide = pd.DataFrame()
+        if action_execution_guide is not None and not action_execution_guide.empty:
+            action_execution_guide.to_csv(action_execution_guide_path, index=False, encoding="utf-8-sig")
+        else:
+            pd.DataFrame(
+                columns=[
+                    "priority",
+                    "owner_suggested",
+                    "ad_type",
+                    "level",
+                    "campaign",
+                    "object_name",
+                    "action_type",
+                    "blocked",
+                    "blocked_reason",
+                    "decision_basis",
+                    "strategy_context",
+                    "action_intensity",
+                    "execution_style",
+                    "operator_steps",
+                    "expected_signal",
+                    "rollback_guard",
+                    "action_priority_score",
+                    "playbook_url",
+                ]
+            ).to_csv(action_execution_guide_path, index=False, encoding="utf-8-sig")
 
         # 3.01) campaign_action_view.csv（按 campaign 聚合 Action Board）
         campaign_action_view = None
@@ -18134,6 +18744,7 @@ def write_dashboard_outputs(
             placement_rebalance_plan = build_placement_rebalance_plan(
                 action_board_dedup_all=action_board_all if isinstance(action_board_all, pd.DataFrame) else None,
                 stage=stage,
+                policy=policy if isinstance(policy, OpsPolicy) else None,
                 max_rows=300,
             )
         except Exception:
@@ -18157,7 +18768,12 @@ def write_dashboard_outputs(
                     "to_acos",
                     "from_action_priority_score",
                     "to_action_priority_score",
+                    "owner",
+                    "execution_style",
                     "reason",
+                    "expected_signal",
+                    "rollback_guard",
+                    "next_step",
                 ]
             ).to_csv(placement_rebalance_plan_path, index=False, encoding="utf-8-sig")
 
@@ -18500,6 +19116,9 @@ def write_dashboard_outputs(
             "top_campaigns",
             "top_ad_groups",
             "top_match_types",
+            "execution_style",
+            "expected_signal",
+            "rollback_guard",
             "context_asin_count",
             "context_top_asins",
             "context_profit_directions",
