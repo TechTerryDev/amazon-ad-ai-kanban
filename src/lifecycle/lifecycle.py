@@ -45,6 +45,8 @@ class LifecycleConfig:
     # 判定成熟/衰退阈值（相对峰值的比例）
     mature_ratio: float = 0.85
     decline_ratio: float = 0.65
+    # 阶段最短驻留天数（<=1 表示关闭；仅平滑阶段标签，不改任何指标口径）
+    phase_min_segment_days: int = 3
     # 库存阈值（用于 flag）
     low_inventory: int = 20
     # 品类差异化阈值（可选）：支持按 category/match 覆盖上述生命周期参数
@@ -567,6 +569,72 @@ def _rolling(series: pd.Series, n: int) -> pd.Series:
         return series
 
 
+def _phase_segments(phases: List[str]) -> List[Tuple[int, int, str]]:
+    """
+    把 phase 序列切成连续段：(start_idx, end_idx, phase)。
+    """
+    if not phases:
+        return []
+    out: List[Tuple[int, int, str]] = []
+    s = 0
+    cur = str(phases[0])
+    for i in range(1, len(phases)):
+        ph = str(phases[i])
+        if ph != cur:
+            out.append((s, i - 1, cur))
+            s = i
+            cur = ph
+    out.append((s, len(phases) - 1, cur))
+    return out
+
+
+def _smooth_cycle_phases(phases: List[str], min_days: int) -> List[str]:
+    """
+    对单个周期的 phase 做“最短驻留天数”平滑，减少 1 天抖动段。
+
+    规则（保守）：
+    - 仅处理中间短段（首段/尾段不改，避免破坏边界语义）；
+    - pre_launch 不平滑；
+    - 仅处理“夹心抖动”：A - x(短段) - A，短段直接并到 A。
+
+    这样做比“直接并到更长邻段”更稳，能显著降低抖动，同时避免把阶段语义改得过猛。
+    """
+    min_days2 = int(min_days or 0)
+    if min_days2 <= 1 or not phases:
+        return [str(x) for x in phases]
+
+    protected = {"pre_launch"}
+    out = [str(x) for x in phases]
+
+    changed = True
+    while changed:
+        changed = False
+        segs = _phase_segments(out)
+        if len(segs) <= 2:
+            break
+
+        for i in range(1, len(segs) - 1):
+            s, e, ph = segs[i]
+            seg_len = int(e - s + 1)
+            if seg_len >= min_days2 or ph in protected:
+                continue
+
+            _, _, lph = segs[i - 1]
+            _, _, rph = segs[i + 1]
+            if lph != rph:
+                continue
+            target = lph
+            if target == ph:
+                continue
+
+            for j in range(s, e + 1):
+                out[j] = target
+            changed = True
+            break
+
+    return out
+
+
 def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataFrame:
     """
     输入：单个 ASIN 的按日数据（必须包含 date）
@@ -618,6 +686,7 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
     phases: List[str] = []
     for cid, g in ts.groupby("cycle_id", dropna=False, sort=False):
         g = g.copy()
+        cycle_phases: List[str] = []
         # 累计口径（用于成熟期门槛）
         try:
             g["cum_sales"] = pd.to_numeric(g.get("销售额", 0.0), errors="coerce").fillna(0.0).cumsum()
@@ -654,53 +723,61 @@ def label_lifecycle_for_asin(ts: pd.DataFrame, cfg: LifecycleConfig) -> pd.DataF
             sales_r = float(r["sales_roll"] or 0.0)
             slope = float(r["sales_slope"] or 0.0)
 
-            if not is_active:
+            # 首单前：只要“在售（FBA可售>0）或有流量/广告行为”，都归为 pre_launch
+            # 这样可避免 pre_launch 被 1-2 天零活动切碎成 pre_launch→inactive→pre_launch。
+            if first_sale_date is None or d < first_sale_date:
+                in_stock_prelaunch = False
+                try:
+                    in_stock_prelaunch = float(r.get("FBA可售", 0.0) or 0.0) > 0
+                except Exception:
+                    in_stock_prelaunch = False
+                phase = "pre_launch" if (is_active or in_stock_prelaunch) else "inactive"
+            elif not is_active:
                 phase = "inactive"
             else:
-                # 正式开售/启动前：pre_launch（以“可售>0 且出单”的首单为主锚点）
-                if first_sale_date is None or d < first_sale_date:
-                    phase = "pre_launch"
+                # 相对峰值比例（动态周期）
+                ratio = 0.0 if peak <= 0 else sales_r / peak
+                days_since_first_sale = (d - first_sale_date).days if isinstance(first_sale_date, dt.date) else 0
+                days_since_first_stock = (d - first_stock_date).days if isinstance(first_stock_date, dt.date) else 0
+                cum_sales = float(r.get("cum_sales", 0.0) or 0.0)
+                cum_orders = float(r.get("cum_orders", 0.0) or 0.0)
+
+                # 成熟期门槛（避免新品/低体量误判）
+                mature_gate = True
+                min_days = int(cfg_eff.min_mature_days or 0)
+                if min_days > 0 and days_since_first_sale < min_days:
+                    mature_gate = False
+                if min_days > 0 and isinstance(first_stock_date, dt.date) and days_since_first_stock < min_days:
+                    mature_gate = False
+                min_orders = float(cfg_eff.min_mature_orders or 0.0)
+                if min_orders > 0 and cum_orders < min_orders:
+                    mature_gate = False
+                min_sales = float(cfg_eff.min_mature_sales or 0.0)
+                if min_sales > 0 and cum_sales < min_sales:
+                    mature_gate = False
+                min_peak = float(cfg_eff.min_peak_sales_roll or 0.0)
+                if min_peak > 0 and peak < min_peak:
+                    mature_gate = False
+
+                # launch：首单后的连续窗口（默认 14 天，可配置）
+                # 说明：这里不再附加 ratio 条件，避免出现 launch→mature→launch 的“阶段回跳”。
+                if days_since_first_sale <= int(cfg_eff.launch_days or 14):
+                    phase = "launch"
+                # growth：销售在爬坡（斜率为正），且未到成熟段
+                elif ratio < cfg_eff.mature_ratio and slope >= 0:
+                    phase = "growth"
+                # mature：接近峰值且变化不大
+                elif ratio >= cfg_eff.mature_ratio and abs(slope) < max(1e-6, peak * 0.02) and mature_gate:
+                    phase = "mature"
+                # decline：明显低于峰值且斜率为负
+                elif ratio <= cfg_eff.decline_ratio and slope < 0:
+                    phase = "decline"
                 else:
-                    # 相对峰值比例（动态周期）
-                    ratio = 0.0 if peak <= 0 else sales_r / peak
-                    days_since_first_sale = (d - first_sale_date).days if isinstance(first_sale_date, dt.date) else 0
-                    days_since_first_stock = (d - first_stock_date).days if isinstance(first_stock_date, dt.date) else 0
-                    cum_sales = float(r.get("cum_sales", 0.0) or 0.0)
-                    cum_orders = float(r.get("cum_orders", 0.0) or 0.0)
+                    phase = "stable"
 
-                    # 成熟期门槛（避免新品/低体量误判）
-                    mature_gate = True
-                    min_days = int(cfg_eff.min_mature_days or 0)
-                    if min_days > 0 and days_since_first_sale < min_days:
-                        mature_gate = False
-                    if min_days > 0 and isinstance(first_stock_date, dt.date) and days_since_first_stock < min_days:
-                        mature_gate = False
-                    min_orders = float(cfg_eff.min_mature_orders or 0.0)
-                    if min_orders > 0 and cum_orders < min_orders:
-                        mature_gate = False
-                    min_sales = float(cfg_eff.min_mature_sales or 0.0)
-                    if min_sales > 0 and cum_sales < min_sales:
-                        mature_gate = False
-                    min_peak = float(cfg_eff.min_peak_sales_roll or 0.0)
-                    if min_peak > 0 and peak < min_peak:
-                        mature_gate = False
+            cycle_phases.append(phase)
 
-                    # launch：刚开始出单的一段时间（默认 14 天，可配置）
-                    if days_since_first_sale <= int(cfg_eff.launch_days or 14) and ratio < cfg_eff.mature_ratio:
-                        phase = "launch"
-                    # growth：销售在爬坡（斜率为正），且未到成熟段
-                    elif ratio < cfg_eff.mature_ratio and slope >= 0:
-                        phase = "growth"
-                    # mature：接近峰值且变化不大
-                    elif ratio >= cfg_eff.mature_ratio and abs(slope) < max(1e-6, peak * 0.02) and mature_gate:
-                        phase = "mature"
-                    # decline：明显低于峰值且斜率为负
-                    elif ratio <= cfg_eff.decline_ratio and slope < 0:
-                        phase = "decline"
-                    else:
-                        phase = "stable"
-
-            phases.append(phase)
+        phases.extend(_smooth_cycle_phases(cycle_phases, int(cfg_eff.phase_min_segment_days or 0)))
 
     ts["lifecycle_phase"] = phases
 

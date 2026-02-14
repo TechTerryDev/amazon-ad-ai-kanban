@@ -1844,6 +1844,60 @@ tbody tr:hover td{background:rgba(37,99,235,.06);}
     color:var(--text);
     margin-bottom:6px;
   }
+  .phase-line-controls{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    margin:10px 0 12px;
+    font-size:12px;
+    color:var(--muted);
+  }
+  .phase-line-controls .ctl{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    padding:6px 10px;
+    border-radius:10px;
+    border:1px solid var(--border);
+    background:rgba(255,255,255,.7);
+  }
+  @media (prefers-color-scheme: dark){
+    .phase-line-controls .ctl{background:rgba(2,6,23,.4);}
+  }
+  .phase-line-controls input,
+  .phase-line-controls select{
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:4px 8px;
+    font:inherit;
+    color:var(--text);
+    background:transparent;
+  }
+  .phase-line-chart{
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    background:var(--card);
+    overflow:auto;
+  }
+  .phase-line-canvas{
+    min-width:760px;
+    width:100%;
+    height:280px;
+    display:block;
+  }
+  .phase-line-panel{
+    margin-top:10px;
+    padding:10px 12px;
+    border-radius:12px;
+    border:1px dashed var(--border);
+    color:var(--muted);
+    font-size:12px;
+  }
+  .phase-line-panel .label{
+    font-weight:700;
+    color:var(--text);
+    margin-bottom:6px;
+  }
   .vis-item.phase-launch{border-color:#22c55e;background:#dcfce7;}
   .vis-item.phase-growth{border-color:#16a34a;background:#bbf7d0;}
   .vis-item.phase-stable{border-color:#3b82f6;background:#dbeafe;}
@@ -2093,6 +2147,288 @@ function _initVisTimeline(){
 
   _applyFilters();
 }
+
+function _initPhaseLineChart(){
+  const host=_qs('#phaseLineChart');
+  if(!host){ return; }
+  const controls=_qs('#phaseLineControls');
+  const panel=_qs('#phaseLinePanel');
+  const b64 = host.getAttribute('data-vis') || (_qs('#visTimeline') ? (_qs('#visTimeline').getAttribute('data-vis') || '') : '');
+  if(!b64){
+    if(panel){ panel.innerHTML='<div class="label">提示</div><div>暂无可用数据</div>'; }
+    return;
+  }
+  let payload=null;
+  try{ payload = JSON.parse(_visDecode(b64) || '{}'); }catch(e){ payload=null; }
+  if(!payload || !Array.isArray(payload.items) || payload.items.length===0){
+    if(panel){ panel.innerHTML='<div class="label">提示</div><div>暂无可用数据</div>'; }
+    return;
+  }
+
+  function _esc(s){
+    return String(s||'')
+      .replace(/&/g,'&amp;')
+      .replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;')
+      .replace(/'/g,'&#39;');
+  }
+  function _toDate(s){
+    const d = new Date(String(s||''));
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  function _isoDay(d){
+    if(!(d instanceof Date) || Number.isNaN(d.getTime())) return '';
+    const y=d.getFullYear();
+    const m=String(d.getMonth()+1).padStart(2,'0');
+    const day=String(d.getDate()).padStart(2,'0');
+    return y+'-'+m+'-'+day;
+  }
+  function _addDays(d, n){
+    return new Date(d.getTime() + Number(n||0)*24*60*60*1000);
+  }
+  function _phaseLabel(p){
+    const map={
+      'pre_launch':'pre',
+      'launch':'launch',
+      'growth':'growth',
+      'stable':'stable',
+      'mature':'mature',
+      'decline':'decline',
+      'inactive':'inactive',
+      'unknown':'unknown'
+    };
+    return map[String(p||'').trim()] || String(p||'unknown');
+  }
+  function _phaseColor(p){
+    const map={
+      'pre_launch':'#a1a1aa',
+      'launch':'#22c55e',
+      'growth':'#16a34a',
+      'stable':'#3b82f6',
+      'mature':'#6366f1',
+      'decline':'#f97316',
+      'inactive':'#ef4444',
+      'unknown':'#94a3b8'
+    };
+    return map[String(p||'').trim()] || '#94a3b8';
+  }
+
+  const allItems = payload.items
+    .map((it, idx)=>{
+      const asin = String(it.asin||'').trim().toUpperCase();
+      const fallbackId = String(it.id||'').trim();
+      const key = asin || fallbackId || ('ITEM_'+String(idx+1));
+      return Object.assign({}, it, {
+        _key: key,
+        _asin_display: asin || fallbackId || '-'
+      });
+    })
+    .sort((a,b)=>Number(b.score||0)-Number(a.score||0));
+
+  if(allItems.length===0){
+    if(panel){ panel.innerHTML='<div class="label">提示</div><div>暂无可用商品数据</div>'; }
+    return;
+  }
+
+  const asinMap = new Map();
+  allItems.forEach(it=>{
+    const key=String(it._key||'').trim();
+    if(!key) return;
+    if(!asinMap.has(key)){ asinMap.set(key, it); }
+  });
+  const asinItems = Array.from(asinMap.values());
+
+  if(controls){
+    controls.innerHTML = [
+      '<div class="ctl"><label>ASIN</label><select id="phaseLineAsin"></select></div>',
+      '<div class="ctl"><label>搜索</label><input id="phaseLineQuery" placeholder="产品名/ASIN" /></div>',
+      '<div class="ctl"><button class="btn" id="phaseLinePrev" type="button">上一条</button></div>',
+      '<div class="ctl"><button class="btn" id="phaseLineNext" type="button">下一条</button></div>',
+      '<div class="ctl"><button class="btn" id="phaseLineReset" type="button">重置</button></div>'
+    ].join('');
+  }
+
+  const sel = document.getElementById('phaseLineAsin');
+  const query = document.getElementById('phaseLineQuery');
+  const btnPrev = document.getElementById('phaseLinePrev');
+  const btnNext = document.getElementById('phaseLineNext');
+  const btnReset = document.getElementById('phaseLineReset');
+
+  function _buildOptions(filterText){
+    if(!sel) return;
+    const q = String(filterText||'').trim().toLowerCase();
+    const options = asinItems.filter(it=>{
+      if(!q) return true;
+      const hay=(String(it.name||'')+' '+String(it._asin_display||'')+' '+String(it._key||'')).toLowerCase();
+      return hay.indexOf(q) >= 0;
+    });
+    const current=sel.value;
+    sel.innerHTML = options.map(it=>{
+      const key=String(it._key||'').trim();
+      const asinShow=String(it._asin_display||'-').trim();
+      const nm=String(it.name||asinShow||key).trim();
+      const ph=_phaseLabel(it.current_phase||it.phase||'unknown');
+      return '<option value="'+_esc(key)+'">'+_esc(nm)+' ('+_esc(asinShow)+') · '+_esc(ph)+'</option>';
+    }).join('');
+    if(options.length===0){
+      sel.innerHTML='<option value="">（无匹配）</option>';
+      return;
+    }
+    const hasCurrent = options.some(it=>String(it._key||'').trim()===String(current||'').trim());
+    sel.value = hasCurrent ? current : String(options[0]._key||'').trim();
+  }
+
+  function _currentItem(){
+    const key = sel ? String(sel.value||'').trim() : '';
+    if(!key) return null;
+    return asinMap.get(key) || null;
+  }
+
+  function _segmentRows(item){
+    const raw = Array.isArray(item.segments) ? item.segments : [];
+    const segs = raw
+      .map(s=>({
+        phase: String((s && s.phase) || '').trim() || 'unknown',
+        start: _toDate((s && s.start) || ''),
+        end: _toDate((s && s.end) || ''),
+        days: Number((s && s.days) || 0)
+      }))
+      .filter(s=>s.start && s.end && s.end >= s.start && s.days > 0);
+    if(segs.length>0) return segs;
+    const st = _toDate(item.cycle_start || item.start || '');
+    const ed = _toDate(item.cycle_end || item.end || '');
+    if(st && ed && ed>=st){
+      return [{phase: String(item.current_phase||item.phase||'unknown'), start: st, end: ed, days: Math.max(1, Math.round((ed-st)/(24*60*60*1000))+1)}];
+    }
+    return [];
+  }
+
+  function _render(){
+    const item = _currentItem();
+    if(!item){
+      host.innerHTML='';
+      if(panel){ panel.innerHTML='<div class="label">提示</div><div>请选择 ASIN</div>'; }
+      return;
+    }
+    const segs = _segmentRows(item);
+    if(segs.length===0){
+      host.innerHTML='<div class="hint" style="padding:12px;">该 ASIN 无可用阶段数据</div>';
+      if(panel){ panel.innerHTML='<div class="label">'+_esc(item.name||item.asin||item._key||'')+'</div><div>暂无可绘制的阶段序列。</div>'; }
+      return;
+    }
+
+    const phaseOrder=['inactive','pre_launch','launch','growth','stable','mature','decline'];
+    const yMap={};
+    phaseOrder.forEach((p,i)=>{ yMap[p]=i; });
+    const left=120, right=26, top=20, bottom=30;
+    const start=segs[0].start;
+    const end=segs[segs.length-1].end;
+    const totalDays=Math.max(1, Math.round((end-start)/(24*60*60*1000))+1);
+    const width=Math.max(900, totalDays*4);
+    const height=280;
+    const plotW=width-left-right;
+    const rowH=(height-top-bottom)/(phaseOrder.length-1);
+    function xOf(d){
+      const days=(d-start)/(24*60*60*1000);
+      return left + (days/Math.max(1,totalDays-1))*plotW;
+    }
+    function yOf(phase){
+      const idx = yMap.hasOwnProperty(phase) ? yMap[phase] : yMap['inactive'];
+      return top + idx*rowH;
+    }
+
+    const parts=[];
+    parts.push('<svg class="phase-line-canvas" viewBox="0 0 '+width+' '+height+'" preserveAspectRatio="none">');
+    parts.push('<rect x="0" y="0" width="'+width+'" height="'+height+'" fill="transparent" />');
+    for(let i=0;i<phaseOrder.length;i++){
+      const ph=phaseOrder[i];
+      const y=yOf(ph);
+      parts.push('<line x1="'+left+'" y1="'+y+'" x2="'+(width-right)+'" y2="'+y+'" stroke="rgba(148,163,184,.22)" stroke-width="1" />');
+      parts.push('<text x="'+(left-8)+'" y="'+(y+4)+'" text-anchor="end" font-size="11" fill="var(--muted)">'+_esc(_phaseLabel(ph))+'</text>');
+    }
+    parts.push('<line x1="'+left+'" y1="'+(height-bottom)+'" x2="'+(width-right)+'" y2="'+(height-bottom)+'" stroke="rgba(148,163,184,.35)" stroke-width="1.2" />');
+    const tickN = Math.min(8, Math.max(3, Math.floor(totalDays/30)+2));
+    for(let i=0;i<tickN;i++){
+      const ratio = tickN===1 ? 0 : i/(tickN-1);
+      const d = _addDays(start, Math.round((totalDays-1)*ratio));
+      const x = left + ratio*plotW;
+      parts.push('<line x1="'+x+'" y1="'+(height-bottom)+'" x2="'+x+'" y2="'+(height-bottom+5)+'" stroke="rgba(148,163,184,.4)" stroke-width="1" />');
+      parts.push('<text x="'+x+'" y="'+(height-8)+'" text-anchor="middle" font-size="10" fill="var(--muted)">'+_esc(_isoDay(d).slice(5))+'</text>');
+    }
+
+    for(let i=0;i<segs.length;i++){
+      const seg=segs[i];
+      const y=yOf(seg.phase);
+      const segStart = seg.start;
+      const segEndExclusive = _addDays(seg.end, 1);
+      const x0=xOf(segStart);
+      const x1=xOf(segEndExclusive);
+      const color=_phaseColor(seg.phase);
+      parts.push('<line x1="'+x0+'" y1="'+y+'" x2="'+x1+'" y2="'+y+'" stroke="'+color+'" stroke-width="4" stroke-linecap="round" />');
+      parts.push('<circle cx="'+x0+'" cy="'+y+'" r="2.8" fill="'+color+'" />');
+      if(i===segs.length-1){ parts.push('<circle cx="'+x1+'" cy="'+y+'" r="2.8" fill="'+color+'" />'); }
+      if((x1-x0) > 56){
+        const xm=(x0+x1)/2;
+        const txt=_phaseLabel(seg.phase)+' '+String(seg.days||0)+'d';
+        parts.push('<text x="'+xm+'" y="'+(y-7)+'" text-anchor="middle" font-size="10" fill="'+color+'">'+_esc(txt)+'</text>');
+      }
+      if(i < segs.length-1){
+        const next=segs[i+1];
+        const y2=yOf(next.phase);
+        const xJump=x1;
+        parts.push('<line x1="'+xJump+'" y1="'+y+'" x2="'+xJump+'" y2="'+y2+'" stroke="'+_phaseColor(next.phase)+'" stroke-width="2" stroke-dasharray="4 3" />');
+      }
+    }
+    parts.push('</svg>');
+    host.innerHTML=parts.join('');
+
+    if(panel){
+      const detail = segs.map(s=>_phaseLabel(s.phase)+' '+String(s.days||0)+'d').join(' → ');
+      panel.innerHTML = [
+        '<div class="label">'+_esc(item.name || item.asin || item._key || '')+'</div>',
+        '<div>ASIN：'+_esc(item.asin || item._asin_display || item._key || '-')+'</div>',
+        '<div>当前阶段：'+_esc(_phaseLabel(item.current_phase || item.phase || 'unknown'))+'</div>',
+        '<div>周期：'+_esc(_isoDay(start))+' ~ '+_esc(_isoDay(end))+'（'+String(totalDays)+'天）</div>',
+        '<div>阶段序列：'+_esc(detail || '-')+'</div>',
+        '<div>说明：该图是“阶段时间维度解释图”，用于读懂阶段切换，不替代甘特图。</div>'
+      ].join('');
+    }
+  }
+
+  _buildOptions('');
+  _render();
+  if(sel){ sel.addEventListener('change', _render); }
+  if(query){
+    query.addEventListener('input', ()=>{
+      _buildOptions(query.value || '');
+      _render();
+    });
+  }
+  if(btnPrev){
+    btnPrev.addEventListener('click', ()=>{
+      if(!sel || !sel.options || sel.options.length===0) return;
+      const idx=Math.max(0, sel.selectedIndex-1);
+      sel.selectedIndex=idx;
+      _render();
+    });
+  }
+  if(btnNext){
+    btnNext.addEventListener('click', ()=>{
+      if(!sel || !sel.options || sel.options.length===0) return;
+      const idx=Math.min(sel.options.length-1, sel.selectedIndex+1);
+      sel.selectedIndex=idx;
+      _render();
+    });
+  }
+  if(btnReset){
+    btnReset.addEventListener('click', ()=>{
+      if(query){ query.value=''; }
+      _buildOptions('');
+      _render();
+    });
+  }
+}
 """
         if extra_css:
             css = css + "\n" + extra_css
@@ -2104,6 +2440,9 @@ function _slugify(s){
   const cleaned=t.replace(/[^a-z0-9\u4e00-\u9fff_\-]+/g,'');
   return cleaned;
 }
+
+// 默认空实现：dashboard.html 会在 extra_js 中覆盖为真实交互逻辑
+function _initPhaseLineChart(){}
 
 // 轻量表格排序：点击表头即可按该列排序（数字/文本自动识别）
 function _parseNum(t){
@@ -3522,6 +3861,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   _safe(_decorateCardPriority);
   _safe(_renderTimelines);
   _safe(_initVisTimeline);
+  _safe(_initPhaseLineChart);
   _safe(_bindTimelineRerender);
   _safe(_autoStyleTables);
   _safe(_initToTop);
@@ -3537,6 +3877,7 @@ function _rehydrateCore(){
   _safe(_initTocActive);
   _safe(_renderTimelines);
   _safe(_bindTimelineRerender);
+  _safe(_initPhaseLineChart);
 }
 
 window.addEventListener('load', ()=>{
@@ -12367,6 +12708,14 @@ def write_dashboard_md(
                 for idx, r in lt_vis.iterrows():
                     asin_val = str(r.get("asin", "") or "").strip().upper()
                     name_val = str(r.get("product_name", "") or "").strip()
+                    product_display_val = str(r.get("product_display", "") or "").strip()
+                    if not asin_val:
+                        # 回退：部分历史/汇总表没有独立 asin 列，尝试从展示文本中抽取 ASIN。
+                        for source_text in (product_display_val, name_val):
+                            m = re.search(r"\b(B[0-9A-Z]{9})\b", str(source_text or "").upper())
+                            if m:
+                                asin_val = str(m.group(1)).strip().upper()
+                                break
                     cat_val = str(r.get("product_category", "") or "（未分类）").strip() or "（未分类）"
                     phase_val = str(r.get("phase_label", "") or "unknown").strip().lower() or "unknown"
                     cycle = str(r.get("cycle_range", "") or "").strip()
@@ -12382,7 +12731,7 @@ def write_dashboard_md(
                             continue
                     if not end_dt:
                         end_dt = start_dt
-                    label = name_val or asin_val or str(r.get("product_display", "") or "").strip()
+                    label = name_val or asin_val or product_display_val
                     if not label:
                         label = f"ASIN_{idx+1}"
                     label_short = label if len(label) <= 18 else (label[:16] + "…")
@@ -12450,6 +12799,26 @@ def write_dashboard_md(
                     phase_short_seq = [phase_short_map.get(ph, ph) for ph in phase_unique]
                     phase_list_text = "/".join([p for p in phase_short_seq if p])
                     phase_detail = "; ".join([f"{phase_short_map.get(ph, ph)} {int(days)}d" for ph, days in segments])
+                    seg_ranges: List[Dict[str, object]] = []
+                    try:
+                        cur_day = start_dt
+                        for ph, days in segments:
+                            d = int(days or 0)
+                            if d <= 0:
+                                continue
+                            seg_start = cur_day
+                            seg_end = seg_start + dt.timedelta(days=max(d - 1, 0))
+                            seg_ranges.append(
+                                {
+                                    "phase": ph,
+                                    "days": d,
+                                    "start": seg_start.isoformat(),
+                                    "end": seg_end.isoformat(),
+                                }
+                            )
+                            cur_day = seg_end + dt.timedelta(days=1)
+                    except Exception:
+                        seg_ranges = []
                     title_parts = [
                         f"{label}",
                         f"ASIN: {asin_val}" if asin_val else "",
@@ -12481,6 +12850,9 @@ def write_dashboard_md(
                             "name": label,
                             "label_short": label_short,
                             "score": score,
+                            "cycle_start": start_dt.isoformat(),
+                            "cycle_end": end_dt.isoformat(),
+                            "segments": seg_ranges,
                             "className": "phase-multi",
                             "style": f"background: {gradient}; border-color: {phase_color_map.get(phase_val, '#94a3b8')};",
                         }
@@ -13548,6 +13920,20 @@ def write_dashboard_md(
             lines.append('<div id="visTimelinePanel" class="timeline-panel"></div>')
         else:
             lines.append('<div class="hint">（暂无生命周期时间轴数据）</div>')
+        lines.append("</div>")
+
+        # 生命周期阶段线（交互版）：不替换甘特图，作为补充对比视图
+        lines.append('<div class="card-item">')
+        lines.append('<div class="hero-title">生命周期阶段线（交互对比）</div>')
+        lines.append('<div class="hint">按单个 ASIN 展示“阶段随时间变化”的折线视图，便于理解阶段切换顺序与持续时长。</div>')
+        if vis_timeline_b64:
+            lines.append('<div id="phaseLineControls" class="phase-line-controls"></div>')
+            lines.append(
+                f'<div id="phaseLineChart" class="phase-line-chart" data-vis="{vis_timeline_b64}"></div>'
+            )
+            lines.append('<div id="phaseLinePanel" class="phase-line-panel"></div>')
+        else:
+            lines.append('<div class="hint">（暂无可用于阶段线的生命周期数据）</div>')
         lines.append("</div>")
         lines.append("## 2) 阶段化指标（启动/成长/成熟）")
         lines.append("")

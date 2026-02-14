@@ -9,6 +9,7 @@
   "min_peak_sales_roll": 10,
   "mature_ratio": 0.85,
   "decline_ratio": 0.65,
+  "phase_min_segment_days": 3,
   "low_inventory": 20,
   "category_default": {},
   "category_overrides": []
