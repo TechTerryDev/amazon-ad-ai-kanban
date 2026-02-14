@@ -2213,6 +2213,24 @@ function _initPhaseLineChart(){
     };
     return map[String(p||'').trim()] || '#94a3b8';
   }
+  function _transitionReason(prevPhase, nextPhase, nextDays){
+    const prev = String(prevPhase||'').trim();
+    const next = String(nextPhase||'').trim();
+    const d = Number(nextDays||0);
+    const dd = d > 0 ? ('（'+String(d)+'d）') : '';
+    if(prev==='pre_launch' && next==='launch') return '首单/启动信号出现，进入 launch'+dd;
+    if(prev==='launch' && next==='growth') return '冷启动通过验证，进入 growth 放量观察'+dd;
+    if(prev==='launch' && next==='decline') return '启动转化偏弱，进入 decline 需先控量'+dd;
+    if(prev==='growth' && next==='stable') return '增速放缓，进入 stable 稳态运营'+dd;
+    if(prev==='growth' && next==='decline') return '增长走弱，转入 decline 修复'+dd;
+    if(prev==='stable' && next==='growth') return '效率/销量改善，重回 growth'+dd;
+    if(prev==='stable' && next==='decline') return '稳态转弱，进入 decline'+dd;
+    if(prev==='mature' && next==='decline') return '成熟段需求回落，进入 decline'+dd;
+    if(prev==='decline' && (next==='growth' || next==='stable' || next==='mature')) return '修复生效，阶段回升到 '+_phaseLabel(next)+dd;
+    if(next==='inactive') return '活动或供给中断，进入 inactive'+dd;
+    if(prev==='inactive' && next!=='inactive') return '恢复投放/供给后重启，进入 '+_phaseLabel(next)+dd;
+    return _phaseLabel(prev)+' → '+_phaseLabel(next)+' 阶段切换'+dd;
+  }
 
   const allItems = payload.items
     .map((it, idx)=>{
@@ -2436,6 +2454,13 @@ function _initPhaseLineChart(){
 
     if(panel){
       const detail = segs.map(s=>_phaseLabel(s.phase)+' '+String(s.days||0)+'d').join(' → ');
+      const transitions = [];
+      for(let i=1;i<segs.length;i++){
+        const prev = segs[i-1];
+        const cur = segs[i];
+        transitions.push(_transitionReason(prev.phase, cur.phase, cur.days));
+      }
+      const transitionText = transitions.length > 0 ? transitions.slice(-4).join('；') : '当前周期内无阶段切换';
       panel.innerHTML = [
         '<div class="label">'+_esc(_itemName(item) || item.asin || item._key || '')+'</div>',
         '<div>ASIN：'+_esc(item.asin || item._asin_display || item._key || '-')+'</div>',
@@ -2443,6 +2468,7 @@ function _initPhaseLineChart(){
         '<div>当前阶段：'+_esc(_phaseLabel(_phaseValue(item)))+'</div>',
         '<div>周期：'+_esc(_isoDay(start))+' ~ '+_esc(_isoDay(end))+'（'+String(totalDays)+'天）</div>',
         '<div>阶段序列：'+_esc(detail || '-')+'</div>',
+        '<div>切换解读：'+_esc(transitionText)+'</div>',
         '<div>说明：该图用于单 ASIN 的阶段演进解读；跨产品横向对比请继续看上方甘特图。</div>'
       ].join('');
     }
