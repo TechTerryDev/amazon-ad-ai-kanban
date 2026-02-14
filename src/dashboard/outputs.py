@@ -2592,6 +2592,21 @@ function _initPhaseLineChart(){
     color:var(--text);
     margin-bottom:6px;
   }
+  .trend-events{
+    margin-top:8px;
+    display:grid;
+    gap:6px;
+  }
+  .trend-event{
+    padding:6px 8px;
+    border:1px solid var(--border);
+    border-radius:8px;
+    background:rgba(148,163,184,.08);
+  }
+  .trend-event .k{
+    font-weight:600;
+    color:var(--text);
+  }
 """
             )
             extra_js = (
@@ -2642,6 +2657,8 @@ function _initTrendExplorer(){
   let payload=null;
   try{ payload=JSON.parse(_trendDecode(dataB64) || '{}'); }catch(e){ payload=null; }
   const allItems=(payload && Array.isArray(payload.asins)) ? payload.asins : [];
+  const eventTypeLabels=(payload && payload.event_type_labels && typeof payload.event_type_labels==='object') ? payload.event_type_labels : {};
+  const eventSourceLabels=(payload && payload.event_source_labels && typeof payload.event_source_labels==='object') ? payload.event_source_labels : {};
   if(!allItems.length){
     summary.innerHTML='<div class="label">提示</div><div>暂无趋势数据。</div>';
     return;
@@ -2650,6 +2667,9 @@ function _initTrendExplorer(){
   controls.innerHTML = [
     '<div class="ctl"><label>类目</label><select id="trendCategory"></select></div>',
     '<div class="ctl"><label>ASIN</label><select id="trendAsin"></select></div>',
+    '<div class="ctl"><label>事件来源</label><select id="trendEventSource"><option value="">全部</option><option value="action_board">规则动作</option><option value="inferred">智能识别</option></select></div>',
+    '<div class="ctl"><label>事件类型</label><select id="trendEventType"></select></div>',
+    '<div class="ctl"><label>置信度≥</label><select id="trendEventConf"><option value="0">全部</option><option value="0.65">0.65</option><option value="0.8">0.80</option><option value="0.9">0.90</option></select></div>',
     '<div class="ctl"><label>搜索</label><input id="trendQuery" placeholder="产品名/ASIN" /></div>',
     '<div class="ctl"><button class="btn" id="trendPrev" type="button">上一条</button></div>',
     '<div class="ctl"><button class="btn" id="trendNext" type="button">下一条</button></div>',
@@ -2658,6 +2678,9 @@ function _initTrendExplorer(){
 
   const selCategory=document.getElementById('trendCategory');
   const selAsin=document.getElementById('trendAsin');
+  const selEventSource=document.getElementById('trendEventSource');
+  const selEventType=document.getElementById('trendEventType');
+  const selEventConf=document.getElementById('trendEventConf');
   const query=document.getElementById('trendQuery');
   const btnPrev=document.getElementById('trendPrev');
   const btnNext=document.getElementById('trendNext');
@@ -2670,6 +2693,35 @@ function _initTrendExplorer(){
   }
   function _itemCategory(it){
     return String((it && it.category) || '（未分类）').trim() || '（未分类）';
+  }
+  function _eventTypeLabel(eventType){
+    const key=String(eventType||'').trim().toLowerCase();
+    if(!key){ return '未命名事件'; }
+    const m=(eventTypeLabels && eventTypeLabels[key]) ? String(eventTypeLabels[key]) : '';
+    return m || key;
+  }
+  function _eventSourceLabel(source){
+    const key=String(source||'').trim();
+    const m=(eventSourceLabels && eventSourceLabels[key]) ? String(eventSourceLabels[key]) : '';
+    if(m){ return m; }
+    if(key==='inferred'){ return '智能识别'; }
+    if(key==='action_board'){ return '规则动作'; }
+    return key || '未命名来源';
+  }
+  function _eventColor(ev){
+    const src=String((ev && ev.source) || '').trim();
+    const et=String((ev && ev.event_type) || '').trim().toLowerCase();
+    if(src==='action_board'){ return '#f59e0b'; }
+    if(et.indexOf('risk')>=0 || et.indexOf('drop')>=0){ return '#ef4444'; }
+    if(et.indexOf('recover')>=0 || et.indexOf('spike')>=0 || et.indexOf('up')>=0){ return '#22c55e'; }
+    return '#6366f1';
+  }
+  function _eventSymbol(ev){
+    const src=String((ev && ev.source) || '').trim();
+    const et=String((ev && ev.event_type) || '').trim().toLowerCase();
+    if(src==='action_board'){ return 'diamond'; }
+    if(et.indexOf('risk')>=0 || et.indexOf('drop')>=0){ return 'triangle'; }
+    return 'circle';
   }
   function _allCategories(){
     const set=new Set();
@@ -2715,6 +2767,34 @@ function _initTrendExplorer(){
     });
   }
 
+  function _collectEventTypes(items){
+    const set=new Set();
+    (Array.isArray(items)?items:[]).forEach(it=>{
+      const evs=(it && Array.isArray(it.events)) ? it.events : [];
+      evs.forEach(ev=>{
+        const t=String((ev && ev.event_type) || '').trim().toLowerCase();
+        if(t){ set.add(t); }
+      });
+    });
+    return Array.from(set.values()).sort((a,b)=>_eventTypeLabel(a).localeCompare(_eventTypeLabel(b), 'zh'));
+  }
+
+  function _refreshEventTypeOptions(){
+    if(!selEventType){ return; }
+    const list=_filteredItems();
+    const cur=String(selEventType.value || '').trim().toLowerCase();
+    const types=_collectEventTypes(list);
+    selEventType.innerHTML=['<option value="">全部类型</option>']
+      .concat(types.map(t=>'<option value="'+_trendEsc(t)+'">'+_trendEsc(_eventTypeLabel(t))+'</option>'))
+      .join('');
+    const hasCur=types.some(t=>String(t||'').trim().toLowerCase()===cur);
+    if(cur && hasCur){
+      selEventType.value=cur;
+    }else{
+      selEventType.value='';
+    }
+  }
+
   function _refreshAsinOptions(){
     const list=_filteredItems();
     const cur=String(selAsin ? (selAsin.value||'') : '').trim();
@@ -2758,6 +2838,7 @@ function _initTrendExplorer(){
   });
 
   function _render(){
+    _refreshEventTypeOptions();
     const list=_refreshAsinOptions();
     const item=_getCurrentItem(list);
     if(!item){
@@ -2780,12 +2861,33 @@ function _initTrendExplorer(){
     const ratingPairs=_toPairs(dates, s.rating);
 
     const maxMain=Math.max(1, _maxNum(s.sales), _maxNum(s.ad_spend));
-    const eventSeries=(Array.isArray(item.events) ? item.events : []).map(ev=>{
+    const allEvents=(Array.isArray(item.events) ? item.events : []);
+    const sourceFilter=String(selEventSource ? (selEventSource.value || '') : '').trim();
+    const typeFilter=String(selEventType ? (selEventType.value || '') : '').trim().toLowerCase();
+    const minConf=Number(selEventConf ? (selEventConf.value || '0') : '0');
+    const eventsFiltered=allEvents.filter(ev=>{
+      const src=String((ev && ev.source) || '').trim();
+      const et=String((ev && ev.event_type) || '').trim().toLowerCase();
+      const conf=Number((ev && ev.confidence) || 0);
+      if(sourceFilter && src!==sourceFilter){ return false; }
+      if(typeFilter && et!==typeFilter){ return false; }
+      if(Number.isFinite(minConf) && conf < minConf){ return false; }
+      return true;
+    });
+    const eventSeries=eventsFiltered.map(ev=>{
       const d=String((ev && ev.date) || '').trim();
+      const conf=Number((ev && ev.confidence) || 0);
       return {
         value:[d, maxMain*1.04],
         priority:String((ev && ev.priority) || '').trim(),
-        label:String((ev && ev.label) || '').trim()
+        label:String((ev && ev.label) || '').trim(),
+        source:String((ev && ev.source) || '').trim(),
+        event_type:String((ev && ev.event_type) || '').trim().toLowerCase(),
+        confidence: Number.isFinite(conf) ? conf : 0,
+        evidence:String((ev && ev.evidence) || '').trim(),
+        symbol:_eventSymbol(ev),
+        symbolSize:String((ev && ev.source) || '').trim()==='action_board' ? 9 : 8,
+        itemStyle:{color:_eventColor(ev)}
       };
     }).filter(x=>x.value[0]);
 
@@ -2801,16 +2903,24 @@ function _initTrendExplorer(){
     }).filter(Boolean);
 
     const eventByDate={};
-    eventSeries.forEach(ev=>{
-      const d=String(ev.value[0]||'');
+    eventsFiltered.forEach(ev=>{
+      const d=String((ev && ev.date) || '').trim();
+      if(!d){ return; }
       if(!eventByDate[d]){ eventByDate[d]=[]; }
-      eventByDate[d].push((ev.priority ? ('['+ev.priority+'] ') : '') + ev.label);
+      eventByDate[d].push({
+        source:String((ev && ev.source) || '').trim(),
+        event_type:String((ev && ev.event_type) || '').trim().toLowerCase(),
+        priority:String((ev && ev.priority) || '').trim(),
+        label:String((ev && ev.label) || '').trim(),
+        confidence:Number((ev && ev.confidence) || 0),
+        evidence:String((ev && ev.evidence) || '').trim()
+      });
     });
 
     mainChart.setOption({
       animation:false,
       grid:{left:58,right:58,top:34,bottom:46},
-      legend:{top:4,data:['Sales','AdSpend','ACOS','TACOS','动作事件']},
+      legend:{top:4,data:['Sales','AdSpend','ACOS','TACOS','动作/关键节点']},
       tooltip:{
         trigger:'axis',
         axisPointer:{type:'cross'},
@@ -2821,13 +2931,25 @@ function _initTrendExplorer(){
           const lines=['<div style="font-weight:700;margin-bottom:6px;">'+_trendEsc(d)+'</div>'];
           ps.forEach(function(p){
             if(!p || !p.seriesName){ return; }
-            if(p.seriesName==='动作事件'){ return; }
+            if(p.seriesName==='动作/关键节点'){ return; }
             const val=Array.isArray(p.value)?p.value[1]:p.value;
             lines.push('<div>'+_trendEsc(p.marker || '')+_trendEsc(p.seriesName)+': '+_trendEsc(_fmtNum(val,2))+'</div>');
           });
           const evs=eventByDate[d] || [];
           if(evs.length){
-            lines.push('<div style="margin-top:6px;color:#f59e0b;">事件：'+_trendEsc(evs.slice(0,3).join('；'))+'</div>');
+            lines.push('<div style="margin-top:6px;color:#f59e0b;">关键节点（'+String(evs.length)+'）</div>');
+            evs.slice(0,4).forEach(function(ev){
+              const src=_eventSourceLabel(ev.source);
+              const et=_eventTypeLabel(ev.event_type);
+              const conf=Number(ev.confidence);
+              const confText=Number.isFinite(conf) ? conf.toFixed(2) : '-';
+              const head=(ev.priority ? ('['+ev.priority+'] ') : '') + et + ' · ' + src + ' · conf=' + confText;
+              const detail=String(ev.evidence || ev.label || '').trim();
+              lines.push('<div style="padding-left:4px;">• '+_trendEsc(head)+'</div>');
+              if(detail){
+                lines.push('<div style="padding-left:14px;color:#94a3b8;">'+_trendEsc(detail)+'</div>');
+              }
+            });
           }
           return lines.join('');
         }
@@ -2849,7 +2971,7 @@ function _initTrendExplorer(){
         {name:'AdSpend',type:'line',smooth:true,symbol:'none',lineStyle:{width:2},data:adSpendPairs,color:'#f97316'},
         {name:'ACOS',type:'line',smooth:true,symbol:'none',lineStyle:{width:1.8},yAxisIndex:1,data:acosPairs,color:'#ef4444'},
         {name:'TACOS',type:'line',smooth:true,symbol:'none',lineStyle:{width:1.8},yAxisIndex:1,data:tacosPairs,color:'#14b8a6'},
-        {name:'动作事件',type:'scatter',yAxisIndex:0,data:eventSeries,symbolSize:8,color:'#f59e0b'}
+        {name:'动作/关键节点',type:'scatter',yAxisIndex:0,data:eventSeries,color:'#f59e0b'}
       ]
     }, true);
 
@@ -2884,19 +3006,51 @@ function _initTrendExplorer(){
     const latestTacos=(s.tacos||[])[latestIdx];
     const latestOrders=(s.orders||[])[latestIdx];
     const latestCvr=(s.cvr||[])[latestIdx];
+    const totalEventCount=allEvents.length;
+    const totalManualCount=allEvents.filter(ev=>String((ev && ev.source) || '').trim()==='action_board').length;
+    const totalInferCount=Math.max(0, totalEventCount-totalManualCount);
+    const shownManualCount=eventsFiltered.filter(ev=>String((ev && ev.source) || '').trim()==='action_board').length;
+    const shownInferCount=Math.max(0, eventsFiltered.length-shownManualCount);
+    const topNodes=eventsFiltered
+      .slice()
+      .sort((a,b)=>Number((b && b.confidence) || 0)-Number((a && a.confidence) || 0))
+      .slice(0,3);
+    const topNodesHtml=topNodes.length ? (
+      '<div class="trend-events">'
+      + topNodes.map(ev=>{
+        const d=String((ev && ev.date) || '').trim();
+        const et=_eventTypeLabel((ev && ev.event_type) || '');
+        const src=_eventSourceLabel((ev && ev.source) || '');
+        const conf=Number((ev && ev.confidence) || 0);
+        const confText=Number.isFinite(conf) ? conf.toFixed(2) : '-';
+        const detail=String((ev && ev.evidence) || (ev && ev.label) || '').trim();
+        const p=String((ev && ev.priority) || '').trim();
+        const title=(p ? ('['+p+'] ') : '') + et + ' · ' + src + ' · conf=' + confText;
+        return '<div class="trend-event"><div class="k">'+_trendEsc(d)+' ｜ '+_trendEsc(title)+'</div><div>'+_trendEsc(detail || '-')
+          +'</div></div>';
+      }).join('')
+      + '</div>'
+    ) : '<div class="trend-events"><div class="trend-event">当前筛选条件下无关键节点。</div></div>';
     summary.innerHTML = [
       '<div class="label">'+_trendEsc(_itemName(item))+' ('+_trendEsc(String(item.asin||''))+')</div>',
       '<div>类目：'+_trendEsc(_itemCategory(item))+' ｜ 观察区间：'+_trendEsc(String(item.date_start||''))+' ~ '+_trendEsc(String(item.date_end||''))+' ｜ 记录天数：'+_trendEsc(String(dates.length))+'</div>',
       '<div>最新点('+_trendEsc(latestDate)+')：Sales='+_trendEsc(_fmtNum(latestSales,2))+'，AdSpend='+_trendEsc(_fmtNum(latestSpend,2))+'，ACOS='+_trendEsc(_fmtNum(latestAcos,2))+'%，TACOS='+_trendEsc(_fmtNum(latestTacos,2))+'%，Orders='+_trendEsc(_fmtNum(latestOrders,2))+'，CVR='+_trendEsc(_fmtNum(latestCvr,2))+'%</div>',
-      '<div>阶段区间：'+_trendEsc(String((item.phase_ranges||[]).length))+' 段 ｜ 动作事件：'+_trendEsc(String((item.events||[]).length))+' 条</div>',
-      '<div>提示：本图是趋势探索视图，不改变任何业务口径；事件点用于定位操作时机，不替代 Action Board 明细。</div>'
+      '<div>阶段区间：'+_trendEsc(String((item.phase_ranges||[]).length))+' 段 ｜ 事件总数：'+_trendEsc(String(totalEventCount))+'（规则 '+_trendEsc(String(totalManualCount))+' / 智能 '+_trendEsc(String(totalInferCount))+'）</div>',
+      '<div>当前筛选事件：'+_trendEsc(String(eventsFiltered.length))+'（规则 '+_trendEsc(String(shownManualCount))+' / 智能 '+_trendEsc(String(shownInferCount))+'）</div>',
+      '<div>关键节点 Top3（按置信度）：</div>',
+      topNodesHtml,
+      '<div>提示：智能识别节点是基于数据表征的“动作推断”，用于辅助复盘，不替代最终业务判断。</div>'
     ].join('');
   }
 
+  _refreshEventTypeOptions();
   _refreshAsinOptions();
   _render();
   if(selCategory){ selCategory.addEventListener('change', _render); }
   if(selAsin){ selAsin.addEventListener('change', _render); }
+  if(selEventSource){ selEventSource.addEventListener('change', _render); }
+  if(selEventType){ selEventType.addEventListener('change', _render); }
+  if(selEventConf){ selEventConf.addEventListener('change', _render); }
   if(query){ query.addEventListener('input', _render); }
   if(btnPrev){
     btnPrev.addEventListener('click', ()=>{
@@ -2915,7 +3069,11 @@ function _initTrendExplorer(){
   if(btnReset){
     btnReset.addEventListener('click', ()=>{
       if(selCategory){ selCategory.value=''; }
+      if(selEventSource){ selEventSource.value=''; }
+      if(selEventType){ selEventType.value=''; }
+      if(selEventConf){ selEventConf.value='0'; }
       if(query){ query.value=''; }
+      _refreshEventTypeOptions();
       _refreshAsinOptions();
       _render();
     });
@@ -17635,8 +17793,8 @@ def _build_trend_explorer_payload(
     except Exception:
         phase_map = {}
 
-    # 3) 动作事件（用于散点标注）。
-    event_map: Dict[str, List[Dict[str, str]]] = {}
+    # 3) 规则动作事件（来自 action_board，用于散点标注）。
+    manual_event_map: Dict[str, List[Dict[str, object]]] = {}
     try:
         ab = action_board.copy() if isinstance(action_board, pd.DataFrame) else pd.DataFrame()
         asin_hint_col = _pick_col(ab, ["asin_hint", "asin", "ASIN"])
@@ -17653,7 +17811,7 @@ def _build_trend_explorer_payload(
             ab = ab[ab["_date"].notna()].copy()
             ab = ab.sort_values(["asin_hint", "_date"], ascending=[True, True])
             for a, g in ab.groupby("asin_hint", dropna=False):
-                arr: List[Dict[str, str]] = []
+                arr: List[Dict[str, object]] = []
                 for _, r in g.head(80).iterrows():
                     action_type = str(r.get("action_type", "") or "").strip()
                     object_name = str(r.get("object_name", "") or "").strip()
@@ -17662,16 +17820,285 @@ def _build_trend_explorer_payload(
                     label = " ".join([x for x in [action_type, object_name] if x]).strip() or "动作事件"
                     if reason:
                         label = f"{label} | {reason}"
+                    conf = 0.75
+                    if pr == "P0":
+                        conf = 0.95
+                    elif pr == "P1":
+                        conf = 0.85
                     arr.append(
                         {
                             "date": r["_date"].isoformat(),
                             "priority": pr if pr in {"P0", "P1", "P2"} else "",
                             "label": label[:180],
+                            "source": "action_board",
+                            "event_type": str(action_type or "action").strip().lower()[:40] or "action",
+                            "confidence": round(float(conf), 2),
+                            "evidence": reason[:180] if reason else "",
                         }
                     )
-                event_map[str(a)] = arr
+                manual_event_map[str(a)] = arr
     except Exception:
-        event_map = {}
+        manual_event_map = {}
+
+    def _norm_num(v: object) -> Optional[float]:
+        try:
+            x = float(pd.to_numeric(v, errors="coerce"))
+            if pd.isna(x) or math.isinf(x) or math.isnan(x):
+                return None
+            return float(x)
+        except Exception:
+            return None
+
+    def _rolling_median(values: List[Optional[float]], idx: int, window: int = 7) -> Optional[float]:
+        if idx <= 0:
+            return None
+        st = max(0, idx - int(max(2, window)))
+        arr = [float(v) for v in values[st:idx] if v is not None]
+        if not arr:
+            return None
+        arr = sorted(arr)
+        n = len(arr)
+        if n % 2 == 1:
+            return arr[n // 2]
+        return (arr[n // 2 - 1] + arr[n // 2]) / 2.0
+
+    def _clip_conf(x: float) -> float:
+        return round(min(0.98, max(0.55, float(x))), 2)
+
+    def _event_priority(confidence: float, risk: bool = False) -> str:
+        c = float(confidence)
+        if risk and c >= 0.92:
+            return "P0"
+        if c >= 0.8:
+            return "P1"
+        return "P2"
+
+    def _infer_behavior_events(
+        dates: List[str],
+        sales: List[Optional[float]],
+        ad_spend: List[Optional[float]],
+        acos: List[Optional[float]],
+        orders: List[Optional[float]],
+        cvr: List[Optional[float]],
+        inv_cover: List[Optional[float]],
+    ) -> List[Dict[str, object]]:
+        """
+        从日级曲线识别“关键节点”，用于替代人工日志中的部分动作回溯。
+        """
+        n = min(len(dates), len(sales), len(ad_spend), len(acos), len(orders), len(cvr), len(inv_cover))
+        if n < 6:
+            return []
+
+        sales_n = [_norm_num(x) for x in sales[:n]]
+        spend_n = [_norm_num(x) for x in ad_spend[:n]]
+        acos_n = [_norm_num(x) for x in acos[:n]]
+        orders_n = [_norm_num(x) for x in orders[:n]]
+        cvr_n = [_norm_num(x) for x in cvr[:n]]
+        inv_n = [_norm_num(x) for x in inv_cover[:n]]
+
+        events: List[Dict[str, object]] = []
+        last_emit_idx: Dict[str, int] = {}
+
+        def _push(
+            idx: int,
+            event_type: str,
+            label: str,
+            confidence: float,
+            evidence: str,
+            risk: bool = False,
+            cooldown_days: int = 2,
+        ) -> None:
+            if idx <= 0 or idx >= n:
+                return
+            last_idx = int(last_emit_idx.get(event_type, -999))
+            if int(idx) - last_idx <= int(max(0, cooldown_days)):
+                return
+            conf = _clip_conf(confidence)
+            events.append(
+                {
+                    "date": str(dates[idx]),
+                    "priority": _event_priority(confidence=conf, risk=risk),
+                    "label": str(label)[:180],
+                    "source": "inferred",
+                    "event_type": str(event_type)[:40],
+                    "confidence": conf,
+                    "evidence": str(evidence)[:180],
+                }
+            )
+            last_emit_idx[event_type] = int(idx)
+
+        for i in range(1, n):
+            d = str(dates[i])
+            s = sales_n[i]
+            sp = spend_n[i]
+            ac = acos_n[i]
+            od = orders_n[i]
+            cv = cvr_n[i]
+            inv = inv_n[i]
+            if not d:
+                continue
+
+            s_base = _rolling_median(sales_n, i, window=7)
+            sp_base = _rolling_median(spend_n, i, window=7)
+            ac_base = _rolling_median(acos_n, i, window=7)
+            od_base = _rolling_median(orders_n, i, window=7)
+            cv_base = _rolling_median(cvr_n, i, window=7)
+
+            # 疑似“加预算/提价”：花费明显抬升。
+            if sp is not None and sp_base is not None and sp >= 8 and sp_base >= 4:
+                diff = float(sp - sp_base)
+                ratio = float(sp / max(0.5, sp_base))
+                if diff >= 8 and ratio >= 1.55:
+                    conf = 0.62 + min(0.22, (ratio - 1.0) * 0.2) + min(0.12, diff / 80.0)
+                    _push(
+                        idx=i,
+                        event_type="spend_up",
+                        label="疑似加预算/提价（AdSpend 放量）",
+                        confidence=conf,
+                        evidence=f"{d} AdSpend {sp_base:.2f}→{sp:.2f}（+{diff:.2f}）",
+                    )
+
+            # 疑似“收紧流量”：花费明显回落。
+            if sp is not None and sp_base is not None and sp_base >= 8:
+                diff = float(sp - sp_base)
+                ratio = float(sp / max(0.5, sp_base))
+                if diff <= -8 and ratio <= 0.6:
+                    conf = 0.6 + min(0.18, (1.0 - ratio) * 0.25) + min(0.1, abs(diff) / 90.0)
+                    _push(
+                        idx=i,
+                        event_type="spend_down",
+                        label="疑似降预算/限流（AdSpend 回落）",
+                        confidence=conf,
+                        evidence=f"{d} AdSpend {sp_base:.2f}→{sp:.2f}（{diff:.2f}）",
+                    )
+
+            # 效率风险：ACOS 抬升明显且投入不低。
+            if ac is not None and ac_base is not None and sp is not None and sp >= 8:
+                ac_diff = float(ac - ac_base)
+                if ac >= 30 and ac_diff >= 10:
+                    conf = 0.66 + min(0.22, ac_diff / 45.0) + min(0.08, sp / 150.0)
+                    _push(
+                        idx=i,
+                        event_type="efficiency_risk",
+                        label="效率风险节点（ACOS 抬升）",
+                        confidence=conf,
+                        evidence=f"{d} ACOS {ac_base:.2f}%→{ac:.2f}%",
+                        risk=True,
+                        cooldown_days=1,
+                    )
+
+            # 效率修复：ACOS 回落且销售改善。
+            if ac is not None and ac_base is not None and s is not None and s_base is not None and s_base >= 10:
+                ac_diff = float(ac_base - ac)
+                s_ratio = float(s / max(1.0, s_base))
+                if ac_diff >= 8 and s_ratio >= 1.2:
+                    conf = 0.64 + min(0.2, ac_diff / 40.0) + min(0.1, (s_ratio - 1.0) * 0.25)
+                    _push(
+                        idx=i,
+                        event_type="efficiency_recover",
+                        label="效率修复节点（ACOS 回落 + Sales 回升）",
+                        confidence=conf,
+                        evidence=f"{d} ACOS {ac_base:.2f}%→{ac:.2f}% ｜ Sales {s_base:.2f}→{s:.2f}",
+                    )
+
+            # 需求放量。
+            if s is not None and s_base is not None and s_base >= 15:
+                diff = float(s - s_base)
+                ratio = float(s / max(1.0, s_base))
+                if diff >= 15 and ratio >= 1.45:
+                    conf = 0.62 + min(0.2, (ratio - 1.0) * 0.2) + min(0.12, diff / 120.0)
+                    _push(
+                        idx=i,
+                        event_type="sales_spike",
+                        label="需求放量节点（Sales 上冲）",
+                        confidence=conf,
+                        evidence=f"{d} Sales {s_base:.2f}→{s:.2f}（+{diff:.2f}）",
+                    )
+
+            # 需求走弱。
+            if s is not None and s_base is not None and s_base >= 20:
+                diff = float(s - s_base)
+                ratio = float(s / max(1.0, s_base))
+                if diff <= -15 and ratio <= 0.68:
+                    conf = 0.62 + min(0.18, (1.0 - ratio) * 0.28) + min(0.12, abs(diff) / 120.0)
+                    _push(
+                        idx=i,
+                        event_type="sales_drop",
+                        label="需求走弱节点（Sales 回落）",
+                        confidence=conf,
+                        evidence=f"{d} Sales {s_base:.2f}→{s:.2f}（{diff:.2f}）",
+                        risk=True,
+                    )
+
+            # 库存承压节点（结合订单）。
+            if inv is not None and od is not None and inv > 0 and od >= 2:
+                if inv <= 4:
+                    conf = 0.7 + min(0.2, (4.0 - inv) / 6.0) + min(0.08, od / 25.0)
+                    _push(
+                        idx=i,
+                        event_type="stock_risk",
+                        label="库存承压节点（覆盖天数偏低）",
+                        confidence=conf,
+                        evidence=f"{d} 库存覆盖≈{inv:.2f}天，订单={od:.2f}",
+                        risk=True,
+                        cooldown_days=3,
+                    )
+
+            # 转化下滑节点（CVR 突降）。
+            if cv is not None and cv_base is not None and od_base is not None and od_base >= 1:
+                if cv_base >= 4 and cv <= cv_base * 0.65:
+                    conf = 0.6 + min(0.2, (1.0 - (cv / max(0.1, cv_base))) * 0.3)
+                    _push(
+                        idx=i,
+                        event_type="cvr_drop",
+                        label="转化下滑节点（CVR 下降）",
+                        confidence=conf,
+                        evidence=f"{d} CVR {cv_base:.2f}%→{cv:.2f}%",
+                        risk=True,
+                    )
+
+        # 去重后再做“按置信度限流”，避免节点刷屏。
+        events = sorted(
+            events,
+            key=lambda x: (
+                str(x.get("date", "")),
+                -float(pd.to_numeric(x.get("confidence", 0.0), errors="coerce") if x.get("confidence", None) is not None else 0.0),
+            ),
+        )
+        dedup: List[Dict[str, object]] = []
+        seen: set = set()
+        for ev in events:
+            k = (
+                str(ev.get("date", "")),
+                str(ev.get("event_type", "")),
+                str(ev.get("label", "")),
+            )
+            if k in seen:
+                continue
+            seen.add(k)
+            dedup.append(ev)
+            if len(dedup) >= 160:
+                break
+        ranked = sorted(
+            dedup,
+            key=lambda x: (
+                -float(pd.to_numeric(x.get("confidence", 0.0), errors="coerce") if x.get("confidence", None) is not None else 0.0),
+                str(x.get("date", "")),
+            ),
+        )
+        out: List[Dict[str, object]] = []
+        per_type: Dict[str, int] = {}
+        for ev in ranked:
+            et = str(ev.get("event_type", "") or "unknown").strip().lower()
+            c = int(per_type.get(et, 0))
+            if c >= 3:
+                continue
+            per_type[et] = c + 1
+            out.append(ev)
+            if len(out) >= 16:
+                break
+        out = sorted(out, key=lambda x: str(x.get("date", "")))
+        return out
 
     def _round_list(values: List[object], nd: int = 2) -> List[Optional[float]]:
         out: List[Optional[float]] = []
@@ -17752,16 +18179,72 @@ def _build_trend_explorer_payload(
                     "rating": rating,
                 },
                 "phase_ranges": phase_map.get(asin, []),
-                "events": event_map.get(asin, []),
+                "events": [],
+                "event_stats": {},
             }
         )
 
     if not asin_payloads:
         return {}
 
+    event_type_labels = {
+        "action": "规则动作",
+        "spend_up": "投入放量",
+        "spend_down": "投入收紧",
+        "efficiency_risk": "效率风险",
+        "efficiency_recover": "效率修复",
+        "sales_spike": "需求放量",
+        "sales_drop": "需求走弱",
+        "stock_risk": "库存承压",
+        "cvr_drop": "转化下滑",
+    }
+
+    # 4) 合并“规则动作事件 + 智能识别关键节点”。
+    for item in asin_payloads:
+        asin = str(item.get("asin", "") or "").strip().upper()
+        s = item.get("series", {}) if isinstance(item.get("series", {}), dict) else {}
+        inferred = _infer_behavior_events(
+            dates=list(item.get("dates", [])) if isinstance(item.get("dates", []), list) else [],
+            sales=list(s.get("sales", [])) if isinstance(s.get("sales", []), list) else [],
+            ad_spend=list(s.get("ad_spend", [])) if isinstance(s.get("ad_spend", []), list) else [],
+            acos=list(s.get("acos", [])) if isinstance(s.get("acos", []), list) else [],
+            orders=list(s.get("orders", [])) if isinstance(s.get("orders", []), list) else [],
+            cvr=list(s.get("cvr", [])) if isinstance(s.get("cvr", []), list) else [],
+            inv_cover=list(s.get("inventory_cover", [])) if isinstance(s.get("inventory_cover", []), list) else [],
+        )
+        manual = list(manual_event_map.get(asin, []))
+        merged: List[Dict[str, object]] = []
+        merged.extend(manual)
+        merged.extend(inferred)
+        merged = sorted(
+            merged,
+            key=lambda x: (
+                str(x.get("date", "")),
+                0 if str(x.get("source", "")) == "action_board" else 1,
+                -float(pd.to_numeric(x.get("confidence", 0.0), errors="coerce") if x.get("confidence", None) is not None else 0.0),
+            ),
+        )
+        if len(merged) > 140:
+            merged = merged[:140]
+        item["events"] = merged
+        item["event_stats"] = {
+            "all": int(len(merged)),
+            "action_board": int(sum(1 for x in merged if str(x.get("source", "")) == "action_board")),
+            "inferred": int(sum(1 for x in merged if str(x.get("source", "")) == "inferred")),
+        }
+        for ev in merged:
+            et = str(ev.get("event_type", "") or "").strip().lower()
+            if et and et not in event_type_labels:
+                event_type_labels[et] = et
+
     payload = {
         "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "asin_count": len(asin_payloads),
+        "event_source_labels": {
+            "action_board": "规则动作",
+            "inferred": "智能识别",
+        },
+        "event_type_labels": event_type_labels,
         "metrics": {
             "sales": "USD",
             "ad_spend": "USD",
@@ -17818,7 +18301,8 @@ def write_trend_explorer_md(
         lines.append("")
         lines.append(f"- 阶段: `{stage}`")
         lines.append(f"- 时间范围: `{date_start} ~ {date_end}`")
-        lines.append("- 说明：上图看 `Sales/AdSpend/ACOS/TACOS`，下图看 `订单量/CVR/库存覆盖/评分数`，并叠加生命周期阶段和动作事件。")
+        lines.append("- 说明：上图看 `Sales/AdSpend/ACOS/TACOS`，下图看 `订单量/CVR/库存覆盖/评分数`，并叠加生命周期阶段与关键节点事件。")
+        lines.append("- 关键节点来源：`规则动作`（Action Board）+ `智能识别`（根据投入/效率/销量/库存等波动反推），可按来源、类型、置信度筛选。")
         lines.append("- 视角建议：跨产品横向对比看甘特图；单 ASIN 纵向演进看本页趋势图。")
         lines.append("")
         lines.append("快速入口：[返回 Dashboard](./dashboard.md) | [生命周期时间轴](./lifecycle_overview.md) | [Action Board](../dashboard/action_board.csv)")
@@ -17829,7 +18313,7 @@ def write_trend_explorer_md(
             lines.append("> 暂无可用的趋势数据（请确认产品分析按日数据是否完整）。")
         else:
             payload_b64 = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
-            lines.append('<div class="trend-hint">可按类目/ASIN筛选，并联动查看阶段切换与动作事件点。</div>')
+            lines.append('<div class="trend-hint">可按类目/ASIN/事件来源/事件类型/置信度筛选，并联动查看阶段切换与关键节点。</div>')
             lines.append('<div id="trendControls" class="trend-controls"></div>')
             lines.append(f'<div id="trendChartMain" class="trend-chart-main" data-trend="{payload_b64}"></div>')
             lines.append('<div id="trendChartSub" class="trend-chart-sub"></div>')
