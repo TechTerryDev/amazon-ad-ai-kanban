@@ -41,7 +41,7 @@ python main.py
 ### 4) 查看结果
 - 入口文件：`data/output/<时间戳>/START_HERE.html`
 - 每店铺聚焦版：`data/output/<时间戳>/<shop>/reports/dashboard.html`
-- 趋势探索页（单 ASIN 交互趋势图，含规则动作关键节点）：`data/output/<时间戳>/<shop>/reports/trend_explorer.html`
+- 趋势探索页（单 ASIN 交互趋势图，含规则动作+变化点识别关键节点）：`data/output/<时间戳>/<shop>/reports/trend_explorer.html`
 - 多店铺 Owner 轻量总览：`data/output/<时间戳>/OWNER_OVERVIEW.csv`
 - 多店铺 Owner 排序总览（含统一优先级分）：`data/output/<时间戳>/OWNER_OVERVIEW.md` / `.html`
 - 店铺环比（含促销/季节性校正列）：`data/output/<时间戳>/<shop>/dashboard/compare_summary.csv`

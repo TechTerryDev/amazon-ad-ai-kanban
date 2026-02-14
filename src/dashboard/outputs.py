@@ -2658,6 +2658,7 @@ function _initTrendExplorer(){
   try{ payload=JSON.parse(_trendDecode(dataB64) || '{}'); }catch(e){ payload=null; }
   const allItems=(payload && Array.isArray(payload.asins)) ? payload.asins : [];
   const eventTypeLabels=(payload && payload.event_type_labels && typeof payload.event_type_labels==='object') ? payload.event_type_labels : {};
+  const eventSourceLabels=(payload && payload.event_source_labels && typeof payload.event_source_labels==='object') ? payload.event_source_labels : {};
   if(!allItems.length){
     summary.innerHTML='<div class="label">提示</div><div>暂无趋势数据。</div>';
     return;
@@ -2666,6 +2667,7 @@ function _initTrendExplorer(){
   controls.innerHTML = [
     '<div class="ctl"><label>类目</label><select id="trendCategory"></select></div>',
     '<div class="ctl"><label>ASIN</label><select id="trendAsin"></select></div>',
+    '<div class="ctl"><label>事件来源</label><select id="trendEventSource"><option value="">全部</option><option value="action_board">规则动作</option><option value="change_point">变化点识别</option></select></div>',
     '<div class="ctl"><label>事件类型</label><select id="trendEventType"></select></div>',
     '<div class="ctl"><label>置信度≥</label><select id="trendEventConf"><option value="0">全部</option><option value="0.65">0.65</option><option value="0.8">0.80</option><option value="0.9">0.90</option></select></div>',
     '<div class="ctl"><label>搜索</label><input id="trendQuery" placeholder="产品名/ASIN" /></div>',
@@ -2676,6 +2678,7 @@ function _initTrendExplorer(){
 
   const selCategory=document.getElementById('trendCategory');
   const selAsin=document.getElementById('trendAsin');
+  const selEventSource=document.getElementById('trendEventSource');
   const selEventType=document.getElementById('trendEventType');
   const selEventConf=document.getElementById('trendEventConf');
   const query=document.getElementById('trendQuery');
@@ -2696,6 +2699,14 @@ function _initTrendExplorer(){
     if(!key){ return '未命名事件'; }
     const m=(eventTypeLabels && eventTypeLabels[key]) ? String(eventTypeLabels[key]) : '';
     return m || key;
+  }
+  function _eventSourceLabel(source){
+    const key=String(source||'').trim();
+    const m=(eventSourceLabels && eventSourceLabels[key]) ? String(eventSourceLabels[key]) : '';
+    if(m){ return m; }
+    if(key==='change_point'){ return '变化点识别'; }
+    if(key==='action_board'){ return '规则动作'; }
+    return key || '未命名来源';
   }
   function _eventColor(ev){
     const et=String((ev && ev.event_type) || '').trim().toLowerCase();
@@ -2849,11 +2860,14 @@ function _initTrendExplorer(){
 
     const maxMain=Math.max(1, _maxNum(s.sales), _maxNum(s.ad_spend));
     const allEvents=(Array.isArray(item.events) ? item.events : []);
+    const sourceFilter=String(selEventSource ? (selEventSource.value || '') : '').trim();
     const typeFilter=String(selEventType ? (selEventType.value || '') : '').trim().toLowerCase();
     const minConf=Number(selEventConf ? (selEventConf.value || '0') : '0');
     const eventsFiltered=allEvents.filter(ev=>{
+      const src=String((ev && ev.source) || '').trim();
       const et=String((ev && ev.event_type) || '').trim().toLowerCase();
       const conf=Number((ev && ev.confidence) || 0);
+      if(sourceFilter && src!==sourceFilter){ return false; }
       if(typeFilter && et!==typeFilter){ return false; }
       if(Number.isFinite(minConf) && conf < minConf){ return false; }
       return true;
@@ -2904,7 +2918,7 @@ function _initTrendExplorer(){
     mainChart.setOption({
       animation:false,
       grid:{left:58,right:58,top:34,bottom:46},
-      legend:{top:4,data:['Sales','AdSpend','ACOS','TACOS','规则动作']},
+      legend:{top:4,data:['Sales','AdSpend','ACOS','TACOS','动作/变化点']},
       tooltip:{
         trigger:'axis',
         axisPointer:{type:'cross'},
@@ -2915,19 +2929,20 @@ function _initTrendExplorer(){
           const lines=['<div style="font-weight:700;margin-bottom:6px;">'+_trendEsc(d)+'</div>'];
           ps.forEach(function(p){
             if(!p || !p.seriesName){ return; }
-            if(p.seriesName==='规则动作'){ return; }
+            if(p.seriesName==='动作/变化点'){ return; }
             const val=Array.isArray(p.value)?p.value[1]:p.value;
             const marker=String(p.marker || '');
             lines.push('<div>'+marker+_trendEsc(p.seriesName)+': '+_trendEsc(_fmtNum(val,2))+'</div>');
           });
           const evs=eventByDate[d] || [];
           if(evs.length){
-            lines.push('<div style="margin-top:6px;color:#f59e0b;">规则动作（'+String(evs.length)+'）</div>');
+            lines.push('<div style="margin-top:6px;color:#f59e0b;">关键节点（'+String(evs.length)+'）</div>');
             evs.slice(0,4).forEach(function(ev){
+              const src=_eventSourceLabel(ev.source);
               const et=_eventTypeLabel(ev.event_type);
               const conf=Number(ev.confidence);
               const confText=Number.isFinite(conf) ? conf.toFixed(2) : '-';
-              const head=(ev.priority ? ('['+ev.priority+'] ') : '') + et + ' · conf=' + confText;
+              const head=(ev.priority ? ('['+ev.priority+'] ') : '') + et + ' · ' + src + ' · conf=' + confText;
               const detail=String(ev.evidence || ev.label || '').trim();
               lines.push('<div style="padding-left:4px;">• '+_trendEsc(head)+'</div>');
               if(detail){
@@ -2955,7 +2970,7 @@ function _initTrendExplorer(){
         {name:'AdSpend',type:'line',smooth:true,symbol:'none',lineStyle:{width:2},data:adSpendPairs,color:'#f97316'},
         {name:'ACOS',type:'line',smooth:true,symbol:'none',lineStyle:{width:1.8},yAxisIndex:1,data:acosPairs,color:'#ef4444'},
         {name:'TACOS',type:'line',smooth:true,symbol:'none',lineStyle:{width:1.8},yAxisIndex:1,data:tacosPairs,color:'#14b8a6'},
-        {name:'规则动作',type:'scatter',yAxisIndex:0,data:eventSeries,color:'#f59e0b'}
+        {name:'动作/变化点',type:'scatter',yAxisIndex:0,data:eventSeries,color:'#f59e0b'}
       ]
     }, true);
 
@@ -2991,7 +3006,11 @@ function _initTrendExplorer(){
     const latestOrders=(s.orders||[])[latestIdx];
     const latestCvr=(s.cvr||[])[latestIdx];
     const totalEventCount=allEvents.length;
+    const totalRuleCount=allEvents.filter(ev=>String((ev && ev.source) || '').trim()==='action_board').length;
+    const totalChangeCount=allEvents.filter(ev=>String((ev && ev.source) || '').trim()==='change_point').length;
     const shownEventCount=eventsFiltered.length;
+    const shownRuleCount=eventsFiltered.filter(ev=>String((ev && ev.source) || '').trim()==='action_board').length;
+    const shownChangeCount=eventsFiltered.filter(ev=>String((ev && ev.source) || '').trim()==='change_point').length;
     const topNodes=eventsFiltered
       .slice()
       .sort((a,b)=>Number((b && b.confidence) || 0)-Number((a && a.confidence) || 0))
@@ -3001,11 +3020,12 @@ function _initTrendExplorer(){
       + topNodes.map(ev=>{
         const d=String((ev && ev.date) || '').trim();
         const et=_eventTypeLabel((ev && ev.event_type) || '');
+        const src=_eventSourceLabel((ev && ev.source) || '');
         const conf=Number((ev && ev.confidence) || 0);
         const confText=Number.isFinite(conf) ? conf.toFixed(2) : '-';
         const detail=String((ev && ev.evidence) || (ev && ev.label) || '').trim();
         const p=String((ev && ev.priority) || '').trim();
-        const title=(p ? ('['+p+'] ') : '') + et + ' · conf=' + confText;
+        const title=(p ? ('['+p+'] ') : '') + et + ' · ' + src + ' · conf=' + confText;
         return '<div class="trend-event"><div class="k">'+_trendEsc(d)+' ｜ '+_trendEsc(title)+'</div><div>'+_trendEsc(detail || '-')
           +'</div></div>';
       }).join('')
@@ -3015,11 +3035,11 @@ function _initTrendExplorer(){
       '<div class="label">'+_trendEsc(_itemName(item))+' ('+_trendEsc(String(item.asin||''))+')</div>',
       '<div>类目：'+_trendEsc(_itemCategory(item))+' ｜ 观察区间：'+_trendEsc(String(item.date_start||''))+' ~ '+_trendEsc(String(item.date_end||''))+' ｜ 记录天数：'+_trendEsc(String(dates.length))+'</div>',
       '<div>最新点('+_trendEsc(latestDate)+')：Sales='+_trendEsc(_fmtNum(latestSales,2))+'，AdSpend='+_trendEsc(_fmtNum(latestSpend,2))+'，ACOS='+_trendEsc(_fmtNum(latestAcos,2))+'%，TACOS='+_trendEsc(_fmtNum(latestTacos,2))+'%，Orders='+_trendEsc(_fmtNum(latestOrders,2))+'，CVR='+_trendEsc(_fmtNum(latestCvr,2))+'%</div>',
-      '<div>阶段区间：'+_trendEsc(String((item.phase_ranges||[]).length))+' 段 ｜ 规则动作总数：'+_trendEsc(String(totalEventCount))+'</div>',
-      '<div>当前筛选动作：'+_trendEsc(String(shownEventCount))+'</div>',
-      '<div>关键动作 Top3（按置信度）：</div>',
+      '<div>阶段区间：'+_trendEsc(String((item.phase_ranges||[]).length))+' 段 ｜ 事件总数：'+_trendEsc(String(totalEventCount))+'（规则 '+_trendEsc(String(totalRuleCount))+' / 变化点 '+_trendEsc(String(totalChangeCount))+'）</div>',
+      '<div>当前筛选事件：'+_trendEsc(String(shownEventCount))+'（规则 '+_trendEsc(String(shownRuleCount))+' / 变化点 '+_trendEsc(String(shownChangeCount))+'）</div>',
+      '<div>关键节点 Top3（按置信度）：</div>',
       topNodesHtml,
-      '<div>提示：当前页面仅展示规则动作事件，确保稳定可控；后续如需可再叠加 AI 解读层。</div>'
+      '<div>提示：变化点识别基于规则阈值与指标关系，不使用 AI 推理；用于辅助复盘，不替代最终业务判断。</div>'
     ].join('');
   }
 
@@ -3028,6 +3048,7 @@ function _initTrendExplorer(){
   _render();
   if(selCategory){ selCategory.addEventListener('change', _render); }
   if(selAsin){ selAsin.addEventListener('change', _render); }
+  if(selEventSource){ selEventSource.addEventListener('change', _render); }
   if(selEventType){ selEventType.addEventListener('change', _render); }
   if(selEventConf){ selEventConf.addEventListener('change', _render); }
   if(query){ query.addEventListener('input', _render); }
@@ -3048,6 +3069,7 @@ function _initTrendExplorer(){
   if(btnReset){
     btnReset.addEventListener('click', ()=>{
       if(selCategory){ selCategory.value=''; }
+      if(selEventSource){ selEventSource.value=''; }
       if(selEventType){ selEventType.value=''; }
       if(selEventConf){ selEventConf.value='0'; }
       if(query){ query.value=''; }
@@ -17906,7 +17928,7 @@ def _build_trend_explorer_payload(
                     "date": str(dates[idx]),
                     "priority": _event_priority(confidence=conf, risk=risk),
                     "label": str(label)[:180],
-                    "source": "inferred",
+                    "source": "change_point",
                     "event_type": str(event_type)[:40],
                     "confidence": conf,
                     "evidence": str(evidence)[:180],
@@ -18188,11 +18210,20 @@ def _build_trend_explorer_payload(
         "rebuild": "重建",
         "target_up": "扩量",
         "target_down": "收量",
+        "spend_up": "投入放量",
+        "spend_down": "投入收紧",
+        "efficiency_risk": "效率风险",
+        "efficiency_recover": "效率修复",
+        "sales_spike": "需求放量",
+        "sales_drop": "需求走弱",
+        "stock_risk": "库存承压",
+        "cvr_drop": "转化下滑",
     }
 
-    # 4) 仅保留“规则动作事件”（可视化稳定优先）。
+    # 4) 合并“规则动作事件 + 变化点识别事件”。
     for item in asin_payloads:
         asin = str(item.get("asin", "") or "").strip().upper()
+        s = item.get("series", {}) if isinstance(item.get("series", {}), dict) else {}
         manual = sorted(
             list(manual_event_map.get(asin, [])),
             key=lambda x: (
@@ -18200,25 +18231,65 @@ def _build_trend_explorer_payload(
                 -float(pd.to_numeric(x.get("confidence", 0.0), errors="coerce") if x.get("confidence", None) is not None else 0.0),
             ),
         )
-        # 限流：每个动作类型最多 6 条，总计最多 60 条（避免同类动作刷屏）。
-        limited: List[Dict[str, object]] = []
-        per_type: Dict[str, int] = {}
+        inferred = _infer_behavior_events(
+            dates=list(item.get("dates", [])) if isinstance(item.get("dates", []), list) else [],
+            sales=list(s.get("sales", [])) if isinstance(s.get("sales", []), list) else [],
+            ad_spend=list(s.get("ad_spend", [])) if isinstance(s.get("ad_spend", []), list) else [],
+            acos=list(s.get("acos", [])) if isinstance(s.get("acos", []), list) else [],
+            orders=list(s.get("orders", [])) if isinstance(s.get("orders", []), list) else [],
+            cvr=list(s.get("cvr", [])) if isinstance(s.get("cvr", []), list) else [],
+            inv_cover=list(s.get("inventory_cover", [])) if isinstance(s.get("inventory_cover", []), list) else [],
+        )
+
+        # 限流：规则动作每类型最多 6 条，变化点每类型最多 4 条，总计最多 80 条。
+        manual_limited: List[Dict[str, object]] = []
+        manual_per_type: Dict[str, int] = {}
         for ev in manual:
             et = str(ev.get("event_type", "") or "action").strip().lower()
-            c = int(per_type.get(et, 0))
+            c = int(manual_per_type.get(et, 0))
             if c >= 6:
                 continue
-            per_type[et] = c + 1
-            limited.append(ev)
-            if len(limited) >= 60:
+            manual_per_type[et] = c + 1
+            manual_limited.append(ev)
+            if len(manual_limited) >= 60:
                 break
-        item["events"] = limited
+
+        inferred_sorted = sorted(
+            inferred,
+            key=lambda x: (
+                str(x.get("date", "")),
+                -float(pd.to_numeric(x.get("confidence", 0.0), errors="coerce") if x.get("confidence", None) is not None else 0.0),
+            ),
+        )
+        inferred_limited: List[Dict[str, object]] = []
+        inferred_per_type: Dict[str, int] = {}
+        for ev in inferred_sorted:
+            et = str(ev.get("event_type", "") or "change_point").strip().lower()
+            c = int(inferred_per_type.get(et, 0))
+            if c >= 4:
+                continue
+            inferred_per_type[et] = c + 1
+            inferred_limited.append(ev)
+            if len(inferred_limited) >= 24:
+                break
+
+        merged = sorted(
+            (manual_limited + inferred_limited),
+            key=lambda x: (
+                str(x.get("date", "")),
+                0 if str(x.get("source", "")) == "action_board" else 1,
+                -float(pd.to_numeric(x.get("confidence", 0.0), errors="coerce") if x.get("confidence", None) is not None else 0.0),
+            ),
+        )
+        if len(merged) > 80:
+            merged = merged[:80]
+        item["events"] = merged
         item["event_stats"] = {
-            "all": int(len(limited)),
-            "action_board": int(len(limited)),
-            "inferred": 0,
+            "all": int(len(merged)),
+            "action_board": int(sum(1 for x in merged if str(x.get("source", "")) == "action_board")),
+            "change_point": int(sum(1 for x in merged if str(x.get("source", "")) == "change_point")),
         }
-        for ev in limited:
+        for ev in merged:
             et = str(ev.get("event_type", "") or "").strip().lower()
             if et and et not in event_type_labels:
                 event_type_labels[et] = et
@@ -18228,6 +18299,7 @@ def _build_trend_explorer_payload(
         "asin_count": len(asin_payloads),
         "event_source_labels": {
             "action_board": "规则动作",
+            "change_point": "变化点识别",
         },
         "event_type_labels": event_type_labels,
         "metrics": {
@@ -18286,8 +18358,8 @@ def write_trend_explorer_md(
         lines.append("")
         lines.append(f"- 阶段: `{stage}`")
         lines.append(f"- 时间范围: `{date_start} ~ {date_end}`")
-        lines.append("- 说明：上图看 `Sales/AdSpend/ACOS/TACOS`，下图看 `订单量/CVR/库存覆盖/评分数`，并叠加生命周期阶段与规则动作事件。")
-        lines.append("- 关键节点来源：当前仅使用 `规则动作`（Action Board），可按动作类型和置信度筛选。")
+        lines.append("- 说明：上图看 `Sales/AdSpend/ACOS/TACOS`，下图看 `订单量/CVR/库存覆盖/评分数`，并叠加生命周期阶段与关键节点。")
+        lines.append("- 关键节点来源：`规则动作`（Action Board）+ `变化点识别`（按指标显著变化自动识别），可按来源/类型/置信度筛选。")
         lines.append("- 视角建议：跨产品横向对比看甘特图；单 ASIN 纵向演进看本页趋势图。")
         lines.append("")
         lines.append("快速入口：[返回 Dashboard](./dashboard.md) | [生命周期时间轴](./lifecycle_overview.md) | [Action Board](../dashboard/action_board.csv)")
@@ -18298,7 +18370,7 @@ def write_trend_explorer_md(
             lines.append("> 暂无可用的趋势数据（请确认产品分析按日数据是否完整）。")
         else:
             payload_b64 = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
-            lines.append('<div class="trend-hint">可按类目/ASIN/动作类型/置信度筛选，并联动查看阶段切换与关键节点。</div>')
+            lines.append('<div class="trend-hint">可按类目/ASIN/事件来源/动作类型/置信度筛选，并联动查看阶段切换与关键节点。</div>')
             lines.append('<div id="trendControls" class="trend-controls"></div>')
             lines.append(f'<div id="trendChartMain" class="trend-chart-main" data-trend="{payload_b64}"></div>')
             lines.append('<div id="trendChartSub" class="trend-chart-sub"></div>')
